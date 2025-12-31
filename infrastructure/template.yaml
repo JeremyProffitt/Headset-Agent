@@ -166,13 +166,18 @@ Resources:
       Policies:
         - Version: '2012-10-17'
           Statement:
-            - Sid: BedrockAccess
+            - Sid: BedrockAgentRuntimeAccess
               Effect: Allow
               Action:
-                - bedrock:InvokeAgent
+                - bedrock-agent-runtime:InvokeAgent
+                - bedrock-agent-runtime:RetrieveAndGenerate
+                - bedrock-agent-runtime:Retrieve
+              Resource: '*'
+            - Sid: BedrockModelAccess
+              Effect: Allow
+              Action:
                 - bedrock:InvokeModel
-                - bedrock:RetrieveAndGenerate
-                - bedrock:Retrieve
+                - bedrock:InvokeModelWithResponseStream
               Resource: '*'
             - Sid: DynamoDBAccess
               Effect: Allow
