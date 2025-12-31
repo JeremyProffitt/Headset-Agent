@@ -158,8 +158,8 @@ Resources:
           PERSONA_TABLE_NAME: !Ref PersonaTable
           SESSION_TABLE_NAME: !Ref SessionTable
           KB_BUCKET_NAME: !Ref KnowledgeBaseBucket
-          SUPERVISOR_AGENT_ID: !Sub "{{resolve:ssm:/headset-agent/${Environment}/supervisor-agent-id:1}}"
-          SUPERVISOR_AGENT_ALIAS: !Sub "{{resolve:ssm:/headset-agent/${Environment}/supervisor-agent-alias:1}}"
+          SUPERVISOR_AGENT_ID_PARAM: !Sub "/headset-agent/${Environment}/supervisor-agent-id"
+          SUPERVISOR_AGENT_ALIAS_PARAM: !Sub "/headset-agent/${Environment}/supervisor-agent-alias"
           DEFAULT_PERSONA: !Ref DefaultPersona
           BEDROCK_MODEL_SUPERVISOR: !Ref BedrockModelSupervisor
           BEDROCK_MODEL_SUBAGENT: !Ref BedrockModelSubagent

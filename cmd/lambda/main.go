@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"sync"
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/headset-support-agent/internal/agents"
 	"github.com/headset-support-agent/internal/handlers"
 	"github.com/headset-support-agent/internal/persona"
@@ -16,6 +18,13 @@ import (
 var (
 	agentClient   *agents.BedrockClient
 	personaLoader *persona.Loader
+	ssmClient     *ssm.Client
+	agentConfig   struct {
+		sync.RWMutex
+		agentID    string
+		agentAlias string
+		loaded     bool
+	}
 )
 
 // LexV2Event represents the incoming Lex V2 event
@@ -43,12 +52,69 @@ func init() {
 	}
 
 	agentClient = agents.NewBedrockClient(cfg)
+	ssmClient = ssm.NewFromConfig(cfg)
 
 	tableName := os.Getenv("PERSONA_TABLE_NAME")
 	if tableName == "" {
 		tableName = "PersonaConfigurations"
 	}
 	personaLoader = persona.NewLoader(cfg, tableName)
+}
+
+// loadAgentConfig reads agent configuration from SSM Parameter Store
+func loadAgentConfig(ctx context.Context) (agentID, agentAlias string) {
+	agentConfig.RLock()
+	if agentConfig.loaded {
+		id, alias := agentConfig.agentID, agentConfig.agentAlias
+		agentConfig.RUnlock()
+		return id, alias
+	}
+	agentConfig.RUnlock()
+
+	agentConfig.Lock()
+	defer agentConfig.Unlock()
+
+	// Double-check after acquiring write lock
+	if agentConfig.loaded {
+		return agentConfig.agentID, agentConfig.agentAlias
+	}
+
+	agentIDParam := os.Getenv("SUPERVISOR_AGENT_ID_PARAM")
+	agentAliasParam := os.Getenv("SUPERVISOR_AGENT_ALIAS_PARAM")
+
+	if agentIDParam == "" || agentAliasParam == "" {
+		log.Printf("SSM parameter paths not configured")
+		return "", ""
+	}
+
+	// Read agent ID from SSM
+	idResult, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
+		Name: &agentIDParam,
+	})
+	if err != nil {
+		log.Printf("Failed to get agent ID from SSM: %v", err)
+		return "", ""
+	}
+	agentConfig.agentID = *idResult.Parameter.Value
+
+	// Read agent alias from SSM
+	aliasResult, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
+		Name: &agentAliasParam,
+	})
+	if err != nil {
+		log.Printf("Failed to get agent alias from SSM: %v", err)
+		return "", ""
+	}
+	agentConfig.agentAlias = *aliasResult.Parameter.Value
+
+	// Only mark as loaded if both values are valid (not PLACEHOLDER)
+	if agentConfig.agentID != "" && agentConfig.agentID != "PLACEHOLDER" &&
+		agentConfig.agentAlias != "" && agentConfig.agentAlias != "PLACEHOLDER" {
+		agentConfig.loaded = true
+	}
+
+	log.Printf("Loaded agent config from SSM: ID=%s, Alias=%s", agentConfig.agentID, agentConfig.agentAlias)
+	return agentConfig.agentID, agentConfig.agentAlias
 }
 
 func handleRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Response, error) {
@@ -91,9 +157,8 @@ func handleRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Respons
 		return handlers.BuildEscalationResponse(p, escalationDecision, event.SessionState.SessionAttributes)
 	}
 
-	// Check if supervisor agent is configured
-	agentID := os.Getenv("SUPERVISOR_AGENT_ID")
-	agentAlias := os.Getenv("SUPERVISOR_AGENT_ALIAS")
+	// Load supervisor agent configuration from SSM
+	agentID, agentAlias := loadAgentConfig(ctx)
 
 	if agentID == "" || agentID == "PLACEHOLDER" || agentAlias == "" || agentAlias == "PLACEHOLDER" {
 		// Agent not yet configured, return a helpful message
