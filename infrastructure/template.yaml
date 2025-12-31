@@ -204,12 +204,12 @@ Resources:
                 - polly:SynthesizeSpeech
               Resource: '*'
       Events:
-        LexInvocation:
-          Type: CloudWatchEvent
+        ChatApiPost:
+          Type: HttpApi
           Properties:
-            Pattern:
-              source:
-                - aws.lex
+            ApiId: !Ref ChatApi
+            Path: /chat
+            Method: POST
       Tags:
         Environment: !Ref Environment
         Project: HeadsetSupportAgent
@@ -316,194 +316,64 @@ Resources:
       RetentionInDays: !If [IsProd, 90, 14]
 
   # =============================================================
-  # LEX V2 BOT
+  # API GATEWAY FOR WEB CHAT
   # =============================================================
-  HeadsetTroubleshooterBot:
-    Type: AWS::Lex::Bot
+  ChatApi:
+    Type: AWS::Serverless::HttpApi
     Properties:
-      Name: !Sub "${LexBotName}-${Environment}"
-      Description: Voice-based headset troubleshooting assistant
-      RoleArn: !GetAtt LexServiceRole.Arn
-      DataPrivacy:
-        ChildDirected: false
-      IdleSessionTTLInSeconds: 300
-      AutoBuildBotLocales: true
-      BotLocales:
-        - LocaleId: en_US
-          NluConfidenceThreshold: 0.40
-          VoiceSettings:
-            VoiceId: Joanna
-            Engine: neural
-          Intents:
-            - Name: TroubleshootIntent
-              Description: Main troubleshooting intent
-              SampleUtterances:
-                - Utterance: "my headset is not working"
-                - Utterance: "I can't hear anything"
-                - Utterance: "the microphone is broken"
-                - Utterance: "help me fix my headset"
-                - Utterance: "audio problems"
-                - Utterance: "no sound"
-                - Utterance: "bluetooth won't connect"
-                - Utterance: "headset won't pair"
-                - Utterance: "I need help with my headset"
-                - Utterance: "troubleshoot my headphones"
-              FulfillmentCodeHook:
-                Enabled: true
-              DialogCodeHook:
-                Enabled: true
-            - Name: FallbackIntent
-              Description: Fallback when no intent matches
-              ParentIntentSignature: "AMAZON.FallbackIntent"
-              FulfillmentCodeHook:
-                Enabled: true
-      BotTags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: HeadsetSupportAgent
+      StageName: !Ref Environment
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - X-Session-Id
+          - X-Persona-Id
 
-  HeadsetBotVersion:
-    Type: AWS::Lex::BotVersion
+  # Lambda permission for API Gateway
+  ApiGatewayPermission:
+    Type: AWS::Lambda::Permission
     Properties:
-      BotId: !Ref HeadsetTroubleshooterBot
-      BotVersionLocaleSpecification:
-        - LocaleId: en_US
-          BotVersionLocaleDetails:
-            SourceBotVersion: DRAFT
-
-  HeadsetBotAlias:
-    Type: AWS::Lex::BotAlias
-    Properties:
-      BotId: !Ref HeadsetTroubleshooterBot
-      BotAliasName: !Sub "live-${Environment}"
-      BotVersion: !GetAtt HeadsetBotVersion.BotVersion
-      BotAliasLocaleSettings:
-        - LocaleId: en_US
-          BotAliasLocaleSetting:
-            Enabled: true
-            CodeHookSpecification:
-              LambdaCodeHook:
-                CodeHookInterfaceVersion: "1.0"
-                LambdaArn: !GetAtt TroubleshootingFunction.Arn
+      FunctionName: !Ref TroubleshootingFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatApi}/*"
 
   # =============================================================
-  # AMAZON CONNECT INSTANCE
+  # S3 BUCKET FOR STATIC WEBSITE
   # =============================================================
-  ConnectInstance:
-    Type: AWS::Connect::Instance
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
     Properties:
-      InstanceAlias: !Sub "headset-support-${Environment}"
-      IdentityManagementType: CONNECT_MANAGED
-      Attributes:
-        InboundCalls: true
-        OutboundCalls: false
-        ContactflowLogs: true
-        AutoResolveBestVoices: true
-        UseCustomTTSVoices: false
-        EarlyMedia: true
-
-  # =============================================================
-  # CONNECT INTEGRATION ASSOCIATION (Lex Bot)
-  # =============================================================
-  ConnectLexIntegration:
-    Type: AWS::Connect::IntegrationAssociation
-    Properties:
-      InstanceId: !Ref ConnectInstance
-      IntegrationType: LEX_BOT
-      IntegrationArn: !GetAtt HeadsetBotAlias.Arn
-
-  # =============================================================
-  # CONNECT CONTACT FLOW
-  # =============================================================
-  HeadsetSupportContactFlow:
-    Type: AWS::Connect::ContactFlow
-    DependsOn: ConnectLexIntegration
-    Properties:
-      InstanceArn: !GetAtt ConnectInstance.Arn
-      Name: !Sub "HeadsetSupport-${Environment}"
-      Type: CONTACT_FLOW
-      Description: Main contact flow for headset troubleshooting
-      Content: !Sub
-        - |
-          {
-            "Version": "2019-10-30",
-            "StartAction": "welcome-prompt",
-            "Metadata": {
-              "entryPointPosition": {"x": 20, "y": 20}
-            },
-            "Actions": [
-              {
-                "Identifier": "welcome-prompt",
-                "Type": "MessageParticipant",
-                "Parameters": {
-                  "Text": "Welcome to Headset Support. I'm here to help you troubleshoot your headset. Please describe the issue you're experiencing."
-                },
-                "Transitions": {
-                  "NextAction": "get-customer-input",
-                  "Errors": [
-                    {"NextAction": "disconnect", "ErrorType": "NoMatchingError"}
-                  ]
-                }
-              },
-              {
-                "Identifier": "get-customer-input",
-                "Type": "ConnectParticipantWithLexBot",
-                "Parameters": {
-                  "LexV2Bot": {
-                    "AliasArn": "${BotAliasArn}"
-                  }
-                },
-                "Transitions": {
-                  "NextAction": "disconnect",
-                  "Errors": [
-                    {"NextAction": "error-handler", "ErrorType": "NoMatchingError"},
-                    {"NextAction": "error-handler", "ErrorType": "NoMatchingCondition"}
-                  ]
-                }
-              },
-              {
-                "Identifier": "error-handler",
-                "Type": "MessageParticipant",
-                "Parameters": {
-                  "Text": "I'm sorry, I'm having trouble understanding. Let me transfer you to a human agent."
-                },
-                "Transitions": {
-                  "NextAction": "disconnect",
-                  "Errors": [
-                    {"NextAction": "disconnect", "ErrorType": "NoMatchingError"}
-                  ]
-                }
-              },
-              {
-                "Identifier": "disconnect",
-                "Type": "DisconnectParticipant",
-                "Parameters": {},
-                "Transitions": {}
-              }
-            ]
-          }
-        - BotAliasArn: !GetAtt HeadsetBotAlias.Arn
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-
-  # =============================================================
-  # CONNECT PHONE NUMBER
-  # =============================================================
-  ConnectPhoneNumber:
-    Type: AWS::Connect::PhoneNumber
-    DependsOn: HeadsetSupportContactFlow
-    Properties:
-      TargetArn: !GetAtt ConnectInstance.Arn
-      Type: DID
-      CountryCode: US
-      Description: !Sub "Headset Support Line - ${Environment}"
+      BucketName: !Sub "headset-chat-${AWS::AccountId}-${Environment}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
       Tags:
         - Key: Environment
           Value: !Ref Environment
         - Key: Project
           Value: HeadsetSupportAgent
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${WebsiteBucket.Arn}/*"
 
   # =============================================================
   # SSM PARAMETERS (Placeholders - Updated by agent creation script)
@@ -563,32 +433,18 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-LexServiceRole"
 
-  LexBotId:
-    Description: Lex V2 Bot ID
-    Value: !Ref HeadsetTroubleshooterBot
-
-  LexBotAliasId:
-    Description: Lex V2 Bot Alias ID
-    Value: !GetAtt HeadsetBotAlias.BotAliasId
-
-  ConnectInstanceId:
-    Description: Amazon Connect Instance ID
-    Value: !Ref ConnectInstance
-
-  ConnectInstanceArn:
-    Description: Amazon Connect Instance ARN
-    Value: !GetAtt ConnectInstance.Arn
-
-  ContactFlowArn:
-    Description: Contact Flow ARN
-    Value: !GetAtt HeadsetSupportContactFlow.ContactFlowArn
-
-  PhoneNumber:
-    Description: Phone number for the headset support line
-    Value: !GetAtt ConnectPhoneNumber.Address
+  ChatApiUrl:
+    Description: API Gateway URL for chat endpoint
+    Value: !Sub "https://${ChatApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/chat"
     Export:
-      Name: !Sub "${AWS::StackName}-PhoneNumber"
+      Name: !Sub "${AWS::StackName}-ChatApiUrl"
 
-  PhoneNumberArn:
-    Description: Phone number ARN
-    Value: !GetAtt ConnectPhoneNumber.PhoneNumberArn
+  WebsiteUrl:
+    Description: Static website URL for chat interface
+    Value: !Sub "http://${WebsiteBucket}.s3-website-${AWS::Region}.amazonaws.com"
+    Export:
+      Name: !Sub "${AWS::StackName}-WebsiteUrl"
+
+  WebsiteBucketName:
+    Description: S3 bucket name for static website
+    Value: !Ref WebsiteBucket

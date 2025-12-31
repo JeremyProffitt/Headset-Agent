@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -37,6 +38,23 @@ type LexV2Event struct {
 // SessionState represents session state from Lex
 type SessionState struct {
 	SessionAttributes map[string]string `json:"sessionAttributes"`
+}
+
+// ChatRequest represents the incoming chat API request
+type ChatRequest struct {
+	SessionID       string       `json:"sessionId"`
+	InputTranscript string       `json:"inputTranscript"`
+	SessionState    SessionState `json:"sessionState"`
+}
+
+// ChatResponse represents the outgoing chat API response
+type ChatResponse struct {
+	Messages []ChatMessage `json:"messages"`
+}
+
+// ChatMessage represents a single message in the response
+type ChatMessage struct {
+	Content string `json:"content"`
 }
 
 func init() {
@@ -117,7 +135,86 @@ func loadAgentConfig(ctx context.Context) (agentID, agentAlias string) {
 	return agentConfig.agentID, agentConfig.agentAlias
 }
 
-func handleRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Response, error) {
+// handleAPIRequest handles HTTP API Gateway requests
+func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
+	log.Printf("Received API request: path=%s, method=%s", request.RawPath, request.RequestContext.HTTP.Method)
+
+	// Parse the request body
+	var chatReq ChatRequest
+	if err := json.Unmarshal([]byte(request.Body), &chatReq); err != nil {
+		log.Printf("Error parsing request body: %v", err)
+		return events.APIGatewayV2HTTPResponse{
+			StatusCode: 400,
+			Headers:    map[string]string{"Content-Type": "application/json"},
+			Body:       `{"error": "Invalid request body"}`,
+		}, nil
+	}
+
+	// Get persona from request headers or body
+	personaID := request.Headers["x-persona-id"]
+	if personaID == "" && chatReq.SessionState.SessionAttributes != nil {
+		personaID = chatReq.SessionState.SessionAttributes["persona_id"]
+	}
+	if personaID == "" {
+		personaID = os.Getenv("DEFAULT_PERSONA")
+		if personaID == "" {
+			personaID = "tangerine"
+		}
+	}
+
+	// Load persona configuration
+	p, err := personaLoader.Load(ctx, personaID)
+	if err != nil {
+		log.Printf("Error loading persona %s: %v, using default", personaID, err)
+		p = persona.DefaultPersona()
+	}
+
+	// Load supervisor agent configuration from SSM
+	agentID, agentAlias := loadAgentConfig(ctx)
+
+	var responseMessage string
+	if agentID == "" || agentID == "PLACEHOLDER" || agentAlias == "" || agentAlias == "PLACEHOLDER" {
+		log.Printf("Supervisor agent not configured (ID: %s, Alias: %s)", agentID, agentAlias)
+		responseMessage = "Hello! I'm setting up right now. The system is being configured. Please try again in a few minutes."
+	} else {
+		// Invoke Bedrock supervisor agent
+		response, err := agentClient.InvokeAgent(ctx, agents.InvokeAgentInput{
+			AgentID:      agentID,
+			AgentAliasID: agentAlias,
+			SessionID:    chatReq.SessionID,
+			InputText:    chatReq.InputTranscript,
+			Persona:      p,
+		})
+		if err != nil {
+			log.Printf("Error invoking Bedrock agent: %v", err)
+			responseMessage = "I'm having a bit of trouble connecting. Let me try that again."
+		} else {
+			responseMessage = response.OutputText
+		}
+	}
+
+	// Build response
+	chatResp := ChatResponse{
+		Messages: []ChatMessage{
+			{Content: responseMessage},
+		},
+	}
+
+	respBody, _ := json.Marshal(chatResp)
+	return events.APIGatewayV2HTTPResponse{
+		StatusCode: 200,
+		Headers: map[string]string{
+			"Content-Type":                 "application/json",
+			"Access-Control-Allow-Origin":  "*",
+			"Access-Control-Allow-Methods": "POST, OPTIONS",
+			"Access-Control-Allow-Headers": "Content-Type, X-Session-Id, X-Persona-Id",
+		},
+		Body: string(respBody),
+	}, nil
+}
+
+// handleLexRequest handles Lex V2 requests
+func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Response, error) {
 	log.Printf("Received Lex event: sessionId=%s, transcript=%s", event.SessionID, event.InputTranscript)
 
 	// Initialize session attributes if nil
@@ -184,6 +281,25 @@ func handleRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Respons
 	}
 
 	return handlers.BuildSuccessResponse(p, response.OutputText, event.SessionState.SessionAttributes), nil
+}
+
+// handleRequest is a unified handler that routes to the appropriate handler
+func handleRequest(ctx context.Context, event json.RawMessage) (interface{}, error) {
+	// Try to detect event type by unmarshaling into different structures
+	var apiEvent events.APIGatewayV2HTTPRequest
+	if err := json.Unmarshal(event, &apiEvent); err == nil && apiEvent.RequestContext.HTTP.Method != "" {
+		log.Printf("Detected API Gateway V2 HTTP event")
+		return handleAPIRequest(ctx, apiEvent)
+	}
+
+	// Fall back to Lex V2 event
+	var lexEvent LexV2Event
+	if err := json.Unmarshal(event, &lexEvent); err != nil {
+		log.Printf("Error parsing event: %v", err)
+		return nil, err
+	}
+	log.Printf("Detected Lex V2 event")
+	return handleLexRequest(ctx, lexEvent)
 }
 
 func getIntAttr(attrs map[string]string, key string) int {
