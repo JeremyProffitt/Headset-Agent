@@ -411,7 +411,7 @@ Resources:
     Properties:
       InstanceId: !Ref ConnectInstance
       IntegrationType: LEX_BOT
-      IntegrationArn: !Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${HeadsetTroubleshooterBot}/${HeadsetBotAlias}"
+      IntegrationArn: !GetAtt HeadsetBotAlias.Arn
 
   # =============================================================
   # CONNECT CONTACT FLOW
@@ -424,66 +424,66 @@ Resources:
       Name: !Sub "HeadsetSupport-${Environment}"
       Type: CONTACT_FLOW
       Description: Main contact flow for headset troubleshooting
-      Content: !Sub |
-        {
-          "Version": "2019-10-30",
-          "StartAction": "welcome-prompt",
-          "Metadata": {
-            "entryPointPosition": {"x": 20, "y": 20}
-          },
-          "Actions": [
-            {
-              "Identifier": "welcome-prompt",
-              "Type": "MessageParticipant",
-              "Parameters": {
-                "Text": "Welcome to Headset Support. I'm here to help you troubleshoot your headset. Please describe the issue you're experiencing."
-              },
-              "Transitions": {
-                "NextAction": "get-customer-input",
-                "Errors": [
-                  {"NextAction": "disconnect", "ErrorType": "NoMatchingError"}
-                ]
-              }
+      Content: !Sub
+        - |
+          {
+            "Version": "2019-10-30",
+            "StartAction": "welcome-prompt",
+            "Metadata": {
+              "entryPointPosition": {"x": 20, "y": 20}
             },
-            {
-              "Identifier": "get-customer-input",
-              "Type": "ConnectParticipantWithLexBot",
-              "Parameters": {
-                "LexBot": {
-                  "Name": "${LexBotName}-${Environment}",
-                  "Region": "${AWS::Region}",
-                  "AliasArn": "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${HeadsetTroubleshooterBot}/${HeadsetBotAlias}"
+            "Actions": [
+              {
+                "Identifier": "welcome-prompt",
+                "Type": "MessageParticipant",
+                "Parameters": {
+                  "Text": "Welcome to Headset Support. I'm here to help you troubleshoot your headset. Please describe the issue you're experiencing."
+                },
+                "Transitions": {
+                  "NextAction": "get-customer-input",
+                  "Errors": [
+                    {"NextAction": "disconnect", "ErrorType": "NoMatchingError"}
+                  ]
                 }
               },
-              "Transitions": {
-                "NextAction": "disconnect",
-                "Errors": [
-                  {"NextAction": "error-handler", "ErrorType": "NoMatchingError"},
-                  {"NextAction": "error-handler", "ErrorType": "NoMatchingCondition"}
-                ]
-              }
-            },
-            {
-              "Identifier": "error-handler",
-              "Type": "MessageParticipant",
-              "Parameters": {
-                "Text": "I'm sorry, I'm having trouble understanding. Let me transfer you to a human agent."
+              {
+                "Identifier": "get-customer-input",
+                "Type": "ConnectParticipantWithLexBot",
+                "Parameters": {
+                  "LexV2Bot": {
+                    "AliasArn": "${BotAliasArn}"
+                  }
+                },
+                "Transitions": {
+                  "NextAction": "disconnect",
+                  "Errors": [
+                    {"NextAction": "error-handler", "ErrorType": "NoMatchingError"},
+                    {"NextAction": "error-handler", "ErrorType": "NoMatchingCondition"}
+                  ]
+                }
               },
-              "Transitions": {
-                "NextAction": "disconnect",
-                "Errors": [
-                  {"NextAction": "disconnect", "ErrorType": "NoMatchingError"}
-                ]
+              {
+                "Identifier": "error-handler",
+                "Type": "MessageParticipant",
+                "Parameters": {
+                  "Text": "I'm sorry, I'm having trouble understanding. Let me transfer you to a human agent."
+                },
+                "Transitions": {
+                  "NextAction": "disconnect",
+                  "Errors": [
+                    {"NextAction": "disconnect", "ErrorType": "NoMatchingError"}
+                  ]
+                }
+              },
+              {
+                "Identifier": "disconnect",
+                "Type": "DisconnectParticipant",
+                "Parameters": {},
+                "Transitions": {}
               }
-            },
-            {
-              "Identifier": "disconnect",
-              "Type": "DisconnectParticipant",
-              "Parameters": {},
-              "Transitions": {}
-            }
-          ]
-        }
+            ]
+          }
+        - BotAliasArn: !GetAtt HeadsetBotAlias.Arn
       Tags:
         - Key: Environment
           Value: !Ref Environment
