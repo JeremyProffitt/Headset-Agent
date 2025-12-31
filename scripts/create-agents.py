@@ -122,17 +122,32 @@ def prepare_agent(client, agent_id: str):
         raise
 
 
-def create_agent_alias(client, agent_id: str, alias_name: str = "prod") -> str:
-    """Create an alias for the agent"""
-    print(f"  Creating alias '{alias_name}' for agent {agent_id}...")
+def create_or_update_agent_alias(client, agent_id: str, alias_name: str = "prod", force_update: bool = False) -> str:
+    """Create or update an alias for the agent to point to latest prepared version"""
+    print(f"  Managing alias '{alias_name}' for agent {agent_id}...")
 
     try:
         # Check if alias exists
         aliases = client.list_agent_aliases(agentId=agent_id)
         for alias in aliases.get('agentAliasSummaries', []):
             if alias['agentAliasName'] == alias_name:
-                print(f"  Alias already exists: {alias['agentAliasId']}")
-                return alias['agentAliasId']
+                alias_id = alias['agentAliasId']
+                print(f"  Alias already exists: {alias_id}")
+
+                if force_update:
+                    # Update the alias to point to the latest prepared version
+                    print(f"  Updating alias to point to latest agent version...")
+                    client.update_agent_alias(
+                        agentId=agent_id,
+                        agentAliasId=alias_id,
+                        agentAliasName=alias_name,
+                        description=f"Production alias for agent (updated)"
+                    )
+                    # Wait for alias to be ready
+                    wait_for_alias(client, agent_id, alias_id)
+                    print(f"  Alias updated successfully")
+
+                return alias_id
 
         response = client.create_agent_alias(
             agentId=agent_id,
@@ -142,11 +157,37 @@ def create_agent_alias(client, agent_id: str, alias_name: str = "prod") -> str:
 
         alias_id = response['agentAlias']['agentAliasId']
         print(f"  Created alias: {alias_id}")
+
+        # Wait for alias to be ready
+        wait_for_alias(client, agent_id, alias_id)
+
         return alias_id
 
     except ClientError as e:
-        print(f"  Error creating alias: {e}")
+        print(f"  Error managing alias: {e}")
         raise
+
+
+def wait_for_alias(client, agent_id: str, alias_id: str, timeout: int = 120):
+    """Wait for agent alias to be in PREPARED status"""
+    print(f"  Waiting for alias {alias_id} to be ready...")
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        response = client.get_agent_alias(agentId=agent_id, agentAliasId=alias_id)
+        status = response['agentAlias']['agentAliasStatus']
+
+        if status == 'PREPARED':
+            print(f"  Alias status: {status}")
+            return
+
+        if status == 'FAILED':
+            raise Exception(f"Alias {alias_id} failed to prepare")
+
+        print(f"  Current alias status: {status}, waiting...")
+        time.sleep(5)
+
+    raise TimeoutError(f"Alias {alias_id} did not become ready within {timeout} seconds")
 
 
 def update_ssm_parameter(param_name: str, value: str, region: str):
@@ -305,8 +346,12 @@ ESCALATION PROTOCOL:
     if not supervisor.get('exists'):
         prepare_agent(client, supervisor['agentId'])
 
-    # Create alias for supervisor
-    alias_id = create_agent_alias(client, supervisor['agentId'])
+    # Create or update alias for supervisor (force update if agent was updated)
+    alias_id = create_or_update_agent_alias(
+        client,
+        supervisor['agentId'],
+        force_update=supervisor.get('updated', False)
+    )
 
     # Update SSM parameters
     update_ssm_parameter(
@@ -337,7 +382,12 @@ ESCALATION PROTOCOL:
 
             if not agent.get('exists'):
                 prepare_agent(client, agent['agentId'])
-                create_agent_alias(client, agent['agentId'])
+            # Create or update alias (force update if agent was updated)
+            create_or_update_agent_alias(
+                client,
+                agent['agentId'],
+                force_update=agent.get('updated', False)
+            )
 
     print(f"\n{'='*60}")
     print("  AGENT CREATION COMPLETE")
