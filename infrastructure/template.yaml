@@ -255,11 +255,12 @@ Resources:
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
                 Resource:
-                  # Inference profiles for newer Claude models
-                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelSupervisor}"
-                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelSubagent}"
+                  # Cross-region inference profiles (no account ID in ARN)
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::inference-profile/us.anthropic.claude-*"
                   # Foundation models for fallback
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*"
+                  # All Bedrock models as fallback
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*"
               - Sid: KnowledgeBase
                 Effect: Allow
                 Action:
