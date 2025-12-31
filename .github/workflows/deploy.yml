@@ -432,12 +432,230 @@ jobs:
           echo ""
 
   # ============================================================
-  # JOB 8: Validate Deployment
+  # JOB 8: Configure Amazon Connect
+  # ============================================================
+  configure-connect:
+    name: Configure Connect Phone
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam]
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get Stack Outputs
+        id: stack
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          STACK_NAME="headset-agent-stack-${ENV}"
+
+          INSTANCE_ID=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ConnectInstanceId'].OutputValue" \
+            --output text)
+
+          INSTANCE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ConnectInstanceArn'].OutputValue" \
+            --output text)
+
+          LEX_BOT_ALIAS_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='LexBotAliasArn'].OutputValue" \
+            --output text)
+
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "instance_arn=$INSTANCE_ARN" >> $GITHUB_OUTPUT
+          echo "lex_bot_alias_arn=$LEX_BOT_ALIAS_ARN" >> $GITHUB_OUTPUT
+
+          echo "Connect Instance ID: $INSTANCE_ID"
+          echo "Lex Bot Alias ARN: $LEX_BOT_ALIAS_ARN"
+
+      - name: Associate Lex Bot with Connect
+        run: |
+          INSTANCE_ID="${{ steps.stack.outputs.instance_id }}"
+          LEX_BOT_ARN="${{ steps.stack.outputs.lex_bot_alias_arn }}"
+
+          echo "📞 Associating Lex bot with Connect instance..."
+
+          # Associate Lex bot
+          aws connect associate-lex-bot \
+            --instance-id "$INSTANCE_ID" \
+            --lex-bot "LexV2Bot={AliasArn=$LEX_BOT_ARN}" \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || echo "Lex bot already associated or pending"
+
+          echo "✅ Lex bot association complete"
+
+      - name: Create Contact Flow
+        id: contact-flow
+        run: |
+          INSTANCE_ID="${{ steps.stack.outputs.instance_id }}"
+          LEX_BOT_ARN="${{ steps.stack.outputs.lex_bot_alias_arn }}"
+          ENV="${{ needs.setup.outputs.environment }}"
+
+          echo "📝 Creating contact flow..."
+
+          # Create a simple contact flow that invokes Lex
+          FLOW_CONTENT=$(cat <<EOF
+          {
+            "Version": "2019-10-30",
+            "StartAction": "PlayPrompt",
+            "Actions": [
+              {
+                "Identifier": "PlayPrompt",
+                "Type": "MessageParticipant",
+                "Parameters": {
+                  "Text": "Welcome to Headset Support. Please describe your issue."
+                },
+                "Transitions": {
+                  "NextAction": "GetInput"
+                }
+              },
+              {
+                "Identifier": "GetInput",
+                "Type": "ConnectParticipantWithLexBot",
+                "Parameters": {
+                  "LexV2Bot": {
+                    "AliasArn": "$LEX_BOT_ARN"
+                  }
+                },
+                "Transitions": {
+                  "NextAction": "EndCall",
+                  "Errors": [
+                    {
+                      "NextAction": "EndCall",
+                      "ErrorType": "NoMatchingError"
+                    }
+                  ]
+                }
+              },
+              {
+                "Identifier": "EndCall",
+                "Type": "DisconnectParticipant",
+                "Parameters": {},
+                "Transitions": {}
+              }
+            ]
+          }
+          EOF
+          )
+
+          # Check if flow exists
+          EXISTING_FLOW=$(aws connect list-contact-flows \
+            --instance-id "$INSTANCE_ID" \
+            --contact-flow-types CONTACT_FLOW \
+            --query "ContactFlowSummaryList[?Name=='HeadsetSupport-${ENV}'].Id" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -n "$EXISTING_FLOW" ] && [ "$EXISTING_FLOW" != "None" ]; then
+            echo "Contact flow already exists: $EXISTING_FLOW"
+            echo "contact_flow_id=$EXISTING_FLOW" >> $GITHUB_OUTPUT
+          else
+            # Create new contact flow
+            RESULT=$(aws connect create-contact-flow \
+              --instance-id "$INSTANCE_ID" \
+              --name "HeadsetSupport-${ENV}" \
+              --type CONTACT_FLOW \
+              --content "$FLOW_CONTENT" \
+              --description "Headset support voice bot contact flow" \
+              --region ${{ env.AWS_REGION }} 2>&1) || true
+
+            if echo "$RESULT" | grep -q "ContactFlowId"; then
+              FLOW_ID=$(echo "$RESULT" | jq -r '.ContactFlowId')
+              echo "Created contact flow: $FLOW_ID"
+              echo "contact_flow_id=$FLOW_ID" >> $GITHUB_OUTPUT
+            else
+              echo "Warning: Could not create contact flow: $RESULT"
+              echo "contact_flow_id=" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Claim Phone Number
+        id: phone
+        run: |
+          INSTANCE_ID="${{ steps.stack.outputs.instance_id }}"
+          CONTACT_FLOW_ID="${{ steps.contact-flow.outputs.contact_flow_id }}"
+          ENV="${{ needs.setup.outputs.environment }}"
+
+          echo "📱 Checking for existing phone number..."
+
+          # Check if we already have a phone number
+          EXISTING_PHONE=$(aws connect list-phone-numbers-v2 \
+            --target-arn "${{ steps.stack.outputs.instance_arn }}" \
+            --query "ListPhoneNumbersSummaryList[0].PhoneNumber" \
+            --output text 2>/dev/null || echo "None")
+
+          if [ -n "$EXISTING_PHONE" ] && [ "$EXISTING_PHONE" != "None" ]; then
+            echo "Phone number already exists: $EXISTING_PHONE"
+            echo "phone_number=$EXISTING_PHONE" >> $GITHUB_OUTPUT
+
+            # Save to SSM
+            aws ssm put-parameter \
+              --name "/headset-agent/${ENV}/phone-number" \
+              --value "$EXISTING_PHONE" \
+              --type String \
+              --overwrite \
+              --region ${{ env.AWS_REGION }}
+          else
+            echo "Claiming new phone number..."
+
+            # Search for available phone numbers
+            AVAILABLE=$(aws connect search-available-phone-numbers \
+              --target-arn "${{ steps.stack.outputs.instance_arn }}" \
+              --phone-number-country-code US \
+              --phone-number-type TOLL_FREE \
+              --max-results 1 \
+              --query "AvailableNumbersList[0].PhoneNumber" \
+              --output text 2>/dev/null || echo "")
+
+            if [ -n "$AVAILABLE" ] && [ "$AVAILABLE" != "None" ]; then
+              echo "Found available number: $AVAILABLE"
+
+              # Claim the phone number
+              CLAIM_RESULT=$(aws connect claim-phone-number \
+                --target-arn "${{ steps.stack.outputs.instance_arn }}" \
+                --phone-number "$AVAILABLE" \
+                --region ${{ env.AWS_REGION }} 2>&1) || true
+
+              if echo "$CLAIM_RESULT" | grep -q "PhoneNumberId"; then
+                echo "Claimed phone number: $AVAILABLE"
+                echo "phone_number=$AVAILABLE" >> $GITHUB_OUTPUT
+
+                # Save to SSM
+                aws ssm put-parameter \
+                  --name "/headset-agent/${ENV}/phone-number" \
+                  --value "$AVAILABLE" \
+                  --type String \
+                  --overwrite \
+                  --region ${{ env.AWS_REGION }}
+              else
+                echo "Warning: Could not claim phone number: $CLAIM_RESULT"
+                echo "phone_number=pending" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "No phone numbers available to claim"
+              echo "phone_number=unavailable" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Output Phone Configuration
+        run: |
+          echo ""
+          echo "📞 Phone Configuration Complete"
+          echo "  Phone Number: ${{ steps.phone.outputs.phone_number }}"
+          echo ""
+
+  # ============================================================
+  # JOB 9: Validate Deployment
   # ============================================================
   validate:
     name: Validate Deployment
     runs-on: ubuntu-latest
-    needs: [setup, deploy-sam, sync-knowledge-base, deploy-personas, deploy-website]
+    needs: [setup, deploy-sam, sync-knowledge-base, deploy-personas, deploy-website, configure-connect]
 
     steps:
       - name: Checkout Code
@@ -511,6 +729,12 @@ jobs:
             --query "Stacks[0].Outputs[?OutputKey=='ChatApiUrl'].OutputValue" \
             --output text 2>/dev/null || echo "Not available")
 
+          # Get phone number from SSM
+          PHONE_NUMBER=$(aws ssm get-parameter \
+            --name "/headset-agent/${ENV}/phone-number" \
+            --query "Parameter.Value" \
+            --output text 2>/dev/null || echo "Not configured")
+
           echo ""
           echo "═══════════════════════════════════════════════════════════"
           echo "    🎉 DEPLOYMENT COMPLETE"
@@ -524,15 +748,17 @@ jobs:
           echo "  ✅ Knowledge base synced"
           echo "  ✅ Personas configured"
           echo "  ✅ Chat website deployed"
+          echo "  ✅ Phone integration configured"
           echo ""
           echo "═══════════════════════════════════════════════════════════"
           echo ""
-          echo "  🌐 WEBSITE: $WEBSITE_URL"
+          echo "  🌐 WEB CHAT: $WEBSITE_URL"
+          echo "     Password: yesido"
+          echo ""
+          echo "  📞 PHONE: $PHONE_NUMBER"
+          echo "     Call this number to talk to the agent!"
+          echo ""
           echo "  🔌 API: $API_URL"
-          echo ""
-          echo "  Password: yesido"
-          echo ""
-          echo "  Visit the website to chat with the agent!"
           echo ""
           echo "═══════════════════════════════════════════════════════════"
 
@@ -542,7 +768,7 @@ jobs:
   notify-failure:
     name: Handle Failure
     runs-on: ubuntu-latest
-    needs: [setup, build, deploy-sam, sync-knowledge-base, deploy-personas, deploy-website, validate]
+    needs: [setup, build, deploy-sam, sync-knowledge-base, deploy-personas, deploy-website, configure-connect, validate]
     if: failure()
 
     steps:

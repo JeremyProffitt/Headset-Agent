@@ -38,7 +38,7 @@ def get_agent_role_arn(environment: str, region: str) -> str:
 
 
 def create_agent(client, name: str, role_arn: str, model_id: str, instruction: str) -> dict:
-    """Create a Bedrock agent"""
+    """Create or update a Bedrock agent"""
     print(f"Creating agent: {name}")
 
     try:
@@ -46,8 +46,27 @@ def create_agent(client, name: str, role_arn: str, model_id: str, instruction: s
         agents = client.list_agents()
         for agent in agents.get('agentSummaries', []):
             if agent['agentName'] == name:
-                print(f"  Agent {name} already exists with ID: {agent['agentId']}")
-                return {'agentId': agent['agentId'], 'exists': True}
+                agent_id = agent['agentId']
+                print(f"  Agent {name} already exists with ID: {agent_id}")
+
+                # Update the agent with new model/instruction
+                print(f"  Updating agent with model: {model_id}")
+                client.update_agent(
+                    agentId=agent_id,
+                    agentName=name,
+                    agentResourceRoleArn=role_arn,
+                    foundationModel=model_id,
+                    instruction=instruction,
+                    idleSessionTTLInSeconds=600,
+                    description=f"Headset Support Agent - {name}"
+                )
+
+                # Re-prepare the agent after update
+                print(f"  Re-preparing agent after update...")
+                client.prepare_agent(agentId=agent_id)
+                wait_for_agent(client, agent_id)
+
+                return {'agentId': agent_id, 'exists': True, 'updated': True}
 
         response = client.create_agent(
             agentName=name,
@@ -165,9 +184,10 @@ def main():
 
     print(f"Using role ARN: {role_arn}\n")
 
-    # Model IDs - use Haiku for sub-agents (cost optimization)
-    supervisor_model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
-    subagent_model = "anthropic.claude-3-5-haiku-20241022-v1:0"
+    # Inference Profile IDs - required for newer Claude models
+    # Note: Models like claude-3-5-sonnet-v2 require inference profiles, not direct model IDs
+    supervisor_model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+    subagent_model = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
 
     # Agent instructions
     agents_config = {

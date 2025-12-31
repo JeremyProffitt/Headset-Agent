@@ -44,13 +44,13 @@ Parameters:
 
   BedrockModelSupervisor:
     Type: String
-    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
-    Description: Foundation model for supervisor agent
+    Default: us.anthropic.claude-3-5-sonnet-20241022-v2:0
+    Description: Inference profile for supervisor agent
 
   BedrockModelSubagent:
     Type: String
-    Default: anthropic.claude-3-5-haiku-20241022-v1:0
-    Description: Foundation model for sub-agents (cost optimized)
+    Default: us.anthropic.claude-3-5-haiku-20241022-v1:0
+    Description: Inference profile for sub-agents (cost optimized)
 
   LogLevel:
     Type: String
@@ -251,8 +251,11 @@ Resources:
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
                 Resource:
-                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelSupervisor}"
-                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelSubagent}"
+                  # Inference profiles for newer Claude models
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelSupervisor}"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelSubagent}"
+                  # Foundation models for fallback
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*"
               - Sid: KnowledgeBase
                 Effect: Allow
                 Action:
@@ -376,6 +379,98 @@ Resources:
             Resource: !Sub "${WebsiteBucket.Arn}/*"
 
   # =============================================================
+  # LEX V2 BOT FOR VOICE INTERFACE
+  # =============================================================
+  HeadsetBot:
+    Type: AWS::Lex::Bot
+    Properties:
+      Name: !Sub "${LexBotName}-${Environment}"
+      Description: Headset troubleshooting voice bot
+      RoleArn: !GetAtt LexServiceRole.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300
+      AutoBuildBotLocales: true
+      BotLocales:
+        - LocaleId: en_US
+          NluConfidenceThreshold: 0.40
+          VoiceSettings:
+            VoiceId: Joanna
+          Intents:
+            - Name: TroubleshootIntent
+              Description: Main troubleshooting intent
+              SampleUtterances:
+                - Utterance: "I need help with my headset"
+                - Utterance: "My headset isn't working"
+                - Utterance: "I have a problem"
+                - Utterance: "Help me fix my headset"
+                - Utterance: "Audio not working"
+                - Utterance: "Can't hear anything"
+                - Utterance: "Microphone not working"
+                - Utterance: "Bluetooth won't connect"
+                - Utterance: "How do I pair my headset"
+              FulfillmentCodeHook:
+                Enabled: true
+              DialogCodeHook:
+                Enabled: false
+            - Name: FallbackIntent
+              Description: Fallback intent
+              ParentIntentSignature: "AMAZON.FallbackIntent"
+              FulfillmentCodeHook:
+                Enabled: true
+      BotTags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  HeadsetBotVersion:
+    Type: AWS::Lex::BotVersion
+    Properties:
+      BotId: !Ref HeadsetBot
+      BotVersionLocaleSpecification:
+        - LocaleId: en_US
+          BotVersionLocaleDetails:
+            SourceBotVersion: DRAFT
+
+  HeadsetBotAlias:
+    Type: AWS::Lex::BotAlias
+    Properties:
+      BotId: !Ref HeadsetBot
+      BotAliasName: !Sub "live-${Environment}"
+      BotVersion: !GetAtt HeadsetBotVersion.BotVersion
+      BotAliasLocaleSettings:
+        - LocaleId: en_US
+          BotAliasLocaleSetting:
+            Enabled: true
+            CodeHookSpecification:
+              LambdaCodeHook:
+                CodeHookInterfaceVersion: "1.0"
+                LambdaArn: !GetAtt TroubleshootingFunction.Arn
+      SentimentAnalysisSettings:
+        DetectSentiment: true
+
+  # =============================================================
+  # AMAZON CONNECT INSTANCE
+  # =============================================================
+  ConnectInstance:
+    Type: AWS::Connect::Instance
+    Properties:
+      InstanceAlias: !Sub "headset-support-${Environment}"
+      IdentityManagementType: CONNECT_MANAGED
+      Attributes:
+        InboundCalls: true
+        OutboundCalls: false
+        AutoResolveBestVoices: true
+        UseCustomTTSVoices: false
+        EarlyMedia: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  # =============================================================
   # SSM PARAMETERS (Placeholders - Updated by agent creation script)
   # =============================================================
   SupervisorAgentIdParam:
@@ -448,3 +543,33 @@ Outputs:
   WebsiteBucketName:
     Description: S3 bucket name for static website
     Value: !Ref WebsiteBucket
+
+  LexBotId:
+    Description: Lex V2 Bot ID
+    Value: !Ref HeadsetBot
+    Export:
+      Name: !Sub "${AWS::StackName}-LexBotId"
+
+  LexBotAliasId:
+    Description: Lex V2 Bot Alias ID
+    Value: !GetAtt HeadsetBotAlias.BotAliasId
+    Export:
+      Name: !Sub "${AWS::StackName}-LexBotAliasId"
+
+  LexBotAliasArn:
+    Description: Lex V2 Bot Alias ARN
+    Value: !GetAtt HeadsetBotAlias.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LexBotAliasArn"
+
+  ConnectInstanceId:
+    Description: Amazon Connect Instance ID
+    Value: !Ref ConnectInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-ConnectInstanceId"
+
+  ConnectInstanceArn:
+    Description: Amazon Connect Instance ARN
+    Value: !GetAtt ConnectInstance.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ConnectInstanceArn"
