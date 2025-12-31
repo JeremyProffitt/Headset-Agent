@@ -71,7 +71,6 @@ Parameters:
 
 Conditions:
   IsProd: !Equals [!Ref Environment, prod]
-  IsNotDev: !Not [!Equals [!Ref Environment, dev]]
 
 Resources:
   # =============================================================
