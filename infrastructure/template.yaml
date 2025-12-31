@@ -254,13 +254,7 @@ Resources:
                 Action:
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
-                Resource:
-                  # Cross-region inference profiles (no account ID in ARN)
-                  - !Sub "arn:aws:bedrock:${AWS::Region}::inference-profile/us.anthropic.claude-*"
-                  # Foundation models for fallback
-                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*"
-                  # All Bedrock models as fallback
-                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*"
+                Resource: '*'
               - Sid: KnowledgeBase
                 Effect: Allow
                 Action:
