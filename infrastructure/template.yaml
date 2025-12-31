@@ -316,6 +316,196 @@ Resources:
       RetentionInDays: !If [IsProd, 90, 14]
 
   # =============================================================
+  # LEX V2 BOT
+  # =============================================================
+  HeadsetTroubleshooterBot:
+    Type: AWS::Lex::Bot
+    Properties:
+      Name: !Sub "${LexBotName}-${Environment}"
+      Description: Voice-based headset troubleshooting assistant
+      RoleArn: !GetAtt LexServiceRole.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300
+      AutoBuildBotLocales: true
+      BotLocales:
+        - LocaleId: en_US
+          NluConfidenceThreshold: 0.40
+          VoiceSettings:
+            VoiceId: Joanna
+            Engine: neural
+          Intents:
+            - Name: TroubleshootIntent
+              Description: Main troubleshooting intent
+              SampleUtterances:
+                - Utterance: "my headset is not working"
+                - Utterance: "I can't hear anything"
+                - Utterance: "the microphone is broken"
+                - Utterance: "help me fix my headset"
+                - Utterance: "audio problems"
+                - Utterance: "no sound"
+                - Utterance: "bluetooth won't connect"
+                - Utterance: "headset won't pair"
+                - Utterance: "I need help with my headset"
+                - Utterance: "troubleshoot my headphones"
+              FulfillmentCodeHook:
+                Enabled: true
+              DialogCodeHook:
+                Enabled: true
+            - Name: FallbackIntent
+              Description: Fallback when no intent matches
+              ParentIntentSignature: "AMAZON.FallbackIntent"
+              FulfillmentCodeHook:
+                Enabled: true
+      BotTags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  HeadsetBotVersion:
+    Type: AWS::Lex::BotVersion
+    Properties:
+      BotId: !Ref HeadsetTroubleshooterBot
+      BotVersionLocaleSpecification:
+        - LocaleId: en_US
+          BotVersionLocaleDetails:
+            SourceBotVersion: DRAFT
+
+  HeadsetBotAlias:
+    Type: AWS::Lex::BotAlias
+    Properties:
+      BotId: !Ref HeadsetTroubleshooterBot
+      BotAliasName: !Sub "live-${Environment}"
+      BotVersion: !GetAtt HeadsetBotVersion.BotVersion
+      BotAliasLocaleSettings:
+        - LocaleId: en_US
+          BotAliasLocaleSetting:
+            Enabled: true
+            CodeHookSpecification:
+              LambdaCodeHook:
+                CodeHookInterfaceVersion: "1.0"
+                LambdaArn: !GetAtt TroubleshootingFunction.Arn
+
+  # =============================================================
+  # AMAZON CONNECT INSTANCE
+  # =============================================================
+  ConnectInstance:
+    Type: AWS::Connect::Instance
+    Properties:
+      InstanceAlias: !Sub "headset-support-${Environment}"
+      IdentityManagementType: CONNECT_MANAGED
+      Attributes:
+        InboundCalls: true
+        OutboundCalls: false
+        ContactflowLogs: true
+        AutoResolveBestVoices: true
+        UseCustomTTSVoices: false
+        EarlyMedia: true
+
+  # =============================================================
+  # CONNECT INTEGRATION ASSOCIATION (Lex Bot)
+  # =============================================================
+  ConnectLexIntegration:
+    Type: AWS::Connect::IntegrationAssociation
+    Properties:
+      InstanceId: !Ref ConnectInstance
+      IntegrationType: LEX_BOT
+      IntegrationArn: !Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${HeadsetTroubleshooterBot}/${HeadsetBotAlias}"
+
+  # =============================================================
+  # CONNECT CONTACT FLOW
+  # =============================================================
+  HeadsetSupportContactFlow:
+    Type: AWS::Connect::ContactFlow
+    DependsOn: ConnectLexIntegration
+    Properties:
+      InstanceArn: !GetAtt ConnectInstance.Arn
+      Name: !Sub "HeadsetSupport-${Environment}"
+      Type: CONTACT_FLOW
+      Description: Main contact flow for headset troubleshooting
+      Content: !Sub |
+        {
+          "Version": "2019-10-30",
+          "StartAction": "welcome-prompt",
+          "Metadata": {
+            "entryPointPosition": {"x": 20, "y": 20}
+          },
+          "Actions": [
+            {
+              "Identifier": "welcome-prompt",
+              "Type": "MessageParticipant",
+              "Parameters": {
+                "Text": "Welcome to Headset Support. I'm here to help you troubleshoot your headset. Please describe the issue you're experiencing."
+              },
+              "Transitions": {
+                "NextAction": "get-customer-input",
+                "Errors": [
+                  {"NextAction": "disconnect", "ErrorType": "NoMatchingError"}
+                ]
+              }
+            },
+            {
+              "Identifier": "get-customer-input",
+              "Type": "ConnectParticipantWithLexBot",
+              "Parameters": {
+                "LexBot": {
+                  "Name": "${LexBotName}-${Environment}",
+                  "Region": "${AWS::Region}",
+                  "AliasArn": "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/${HeadsetTroubleshooterBot}/${HeadsetBotAlias}"
+                }
+              },
+              "Transitions": {
+                "NextAction": "disconnect",
+                "Errors": [
+                  {"NextAction": "error-handler", "ErrorType": "NoMatchingError"},
+                  {"NextAction": "error-handler", "ErrorType": "NoMatchingCondition"}
+                ]
+              }
+            },
+            {
+              "Identifier": "error-handler",
+              "Type": "MessageParticipant",
+              "Parameters": {
+                "Text": "I'm sorry, I'm having trouble understanding. Let me transfer you to a human agent."
+              },
+              "Transitions": {
+                "NextAction": "disconnect",
+                "Errors": [
+                  {"NextAction": "disconnect", "ErrorType": "NoMatchingError"}
+                ]
+              }
+            },
+            {
+              "Identifier": "disconnect",
+              "Type": "DisconnectParticipant",
+              "Parameters": {},
+              "Transitions": {}
+            }
+          ]
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================
+  # CONNECT PHONE NUMBER
+  # =============================================================
+  ConnectPhoneNumber:
+    Type: AWS::Connect::PhoneNumber
+    DependsOn: HeadsetSupportContactFlow
+    Properties:
+      TargetArn: !GetAtt ConnectInstance.Arn
+      Type: DID
+      CountryCode: US
+      Description: !Sub "Headset Support Line - ${Environment}"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  # =============================================================
   # SSM PARAMETERS (Placeholders - Updated by agent creation script)
   # =============================================================
   SupervisorAgentIdParam:
@@ -372,3 +562,33 @@ Outputs:
     Value: !GetAtt LexServiceRole.Arn
     Export:
       Name: !Sub "${AWS::StackName}-LexServiceRole"
+
+  LexBotId:
+    Description: Lex V2 Bot ID
+    Value: !Ref HeadsetTroubleshooterBot
+
+  LexBotAliasId:
+    Description: Lex V2 Bot Alias ID
+    Value: !GetAtt HeadsetBotAlias.BotAliasId
+
+  ConnectInstanceId:
+    Description: Amazon Connect Instance ID
+    Value: !Ref ConnectInstance
+
+  ConnectInstanceArn:
+    Description: Amazon Connect Instance ARN
+    Value: !GetAtt ConnectInstance.Arn
+
+  ContactFlowArn:
+    Description: Contact Flow ARN
+    Value: !GetAtt HeadsetSupportContactFlow.ContactFlowArn
+
+  PhoneNumber:
+    Description: Phone number for the headset support line
+    Value: !GetAtt ConnectPhoneNumber.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-PhoneNumber"
+
+  PhoneNumberArn:
+    Description: Phone number ARN
+    Value: !GetAtt ConnectPhoneNumber.PhoneNumberArn

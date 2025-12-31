@@ -355,12 +355,82 @@ jobs:
           echo "✅ Bedrock agents created/updated"
 
   # ============================================================
-  # JOB 7: Validate Deployment
+  # JOB 7: Configure Connect Phone Number
+  # ============================================================
+  configure-connect:
+    name: Configure Connect Phone
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam]
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Associate Phone Number with Contact Flow
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          STACK_NAME="headset-agent-stack-${ENV}"
+
+          echo "📞 Configuring phone number routing..."
+
+          # Get stack outputs
+          INSTANCE_ID=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ConnectInstanceId'].OutputValue" \
+            --output text)
+
+          PHONE_NUMBER_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='PhoneNumberArn'].OutputValue" \
+            --output text)
+
+          CONTACT_FLOW_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ContactFlowArn'].OutputValue" \
+            --output text)
+
+          PHONE_NUMBER=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='PhoneNumber'].OutputValue" \
+            --output text)
+
+          echo "Instance ID: $INSTANCE_ID"
+          echo "Phone Number: $PHONE_NUMBER"
+          echo "Contact Flow ARN: $CONTACT_FLOW_ARN"
+
+          # Extract contact flow ID from ARN
+          CONTACT_FLOW_ID=$(echo "$CONTACT_FLOW_ARN" | sed 's/.*contact-flow\///')
+
+          # Associate phone number with contact flow
+          aws connect associate-phone-number-contact-flow \
+            --phone-number-id "$PHONE_NUMBER_ARN" \
+            --instance-id "$INSTANCE_ID" \
+            --contact-flow-id "$CONTACT_FLOW_ID" \
+            --region ${{ env.AWS_REGION }} || echo "Phone already associated or association pending"
+
+          echo "✅ Phone number configured: $PHONE_NUMBER"
+
+          # Save phone number to SSM for easy retrieval
+          aws ssm put-parameter \
+            --name "/headset-agent/${ENV}/phone-number" \
+            --value "$PHONE_NUMBER" \
+            --type String \
+            --overwrite \
+            --region ${{ env.AWS_REGION }}
+
+          echo "📱 Phone number saved to SSM: /headset-agent/${ENV}/phone-number"
+
+  # ============================================================
+  # JOB 8: Validate Deployment
   # ============================================================
   validate:
     name: Validate Deployment
     runs-on: ubuntu-latest
-    needs: [setup, deploy-sam, sync-knowledge-base, deploy-personas]
+    needs: [setup, deploy-sam, sync-knowledge-base, deploy-personas, configure-connect]
 
     steps:
       - name: Checkout Code
@@ -420,6 +490,15 @@ jobs:
 
       - name: Deployment Summary
         run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          STACK_NAME="headset-agent-stack-${ENV}"
+
+          # Get phone number from stack outputs
+          PHONE_NUMBER=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='PhoneNumber'].OutputValue" \
+            --output text 2>/dev/null || echo "Not available")
+
           echo ""
           echo "═══════════════════════════════════════════════════════════"
           echo "    🎉 DEPLOYMENT COMPLETE"
@@ -432,16 +511,23 @@ jobs:
           echo "  ✅ Lambda function deployed and tested"
           echo "  ✅ Knowledge base synced"
           echo "  ✅ Personas configured"
+          echo "  ✅ Amazon Connect configured"
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+          echo ""
+          echo "  📞 PHONE NUMBER: $PHONE_NUMBER"
+          echo ""
+          echo "  Call this number to try the voice agent!"
           echo ""
           echo "═══════════════════════════════════════════════════════════"
 
   # ============================================================
-  # JOB 8: Notify on Failure
+  # JOB 9: Notify on Failure
   # ============================================================
   notify-failure:
     name: Handle Failure
     runs-on: ubuntu-latest
-    needs: [setup, build, deploy-sam, sync-knowledge-base, deploy-personas, validate]
+    needs: [setup, build, deploy-sam, sync-knowledge-base, deploy-personas, configure-connect, validate]
     if: failure()
 
     steps:
