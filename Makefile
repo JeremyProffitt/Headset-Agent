@@ -1,4 +1,4 @@
-.PHONY: build test clean deploy validate lint deps
+.PHONY: build test clean deploy validate lint deps build-TroubleshootingFunction
 
 # Variables
 BINARY_NAME := bootstrap
@@ -104,6 +104,14 @@ mocks:
 	else \
 		echo "mockgen not installed, skipping..."; \
 	fi
+
+# SAM build target - uses pre-built binary
+# SAM calls this when BuildMethod: makefile is used
+build-TroubleshootingFunction:
+	@echo "Packaging pre-built Lambda binary for SAM..."
+	mkdir -p $(ARTIFACTS_DIR)
+	cp $(LAMBDA_DIR)/$(BINARY_NAME) $(ARTIFACTS_DIR)/$(BINARY_NAME)
+	chmod +x $(ARTIFACTS_DIR)/$(BINARY_NAME)
 
 # Help
 help:

@@ -168,7 +168,8 @@ jobs:
       - name: SAM Build
         run: |
           echo "📦 Building SAM application..."
-          sam build --template infrastructure/template.yaml --use-container
+          # Using makefile BuildMethod which copies the pre-built binary
+          sam build --template infrastructure/template.yaml
 
       - name: SAM Deploy
         run: |

@@ -146,7 +146,7 @@ Resources:
   TroubleshootingFunction:
     Type: AWS::Serverless::Function
     Metadata:
-      BuildMethod: go1.x
+      BuildMethod: makefile
     Properties:
       FunctionName: !Sub "headset-agent-orchestrator-${Environment}"
       Handler: bootstrap
