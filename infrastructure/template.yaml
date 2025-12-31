@@ -1,0 +1,375 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Headset Support Agent - Voice-based troubleshooting with programmable personas
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: provided.al2023
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        LOG_LEVEL: !Ref LogLevel
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  SupervisorAgentName:
+    Type: String
+    Default: TroubleshootingOrchestrator
+    Description: Name of the Bedrock supervisor agent
+
+  KBBucketName:
+    Type: String
+    Description: S3 bucket name for knowledge base documents
+
+  PersonaTableName:
+    Type: String
+    Default: PersonaConfigurations
+    Description: DynamoDB table name for persona configurations
+
+  LexBotName:
+    Type: String
+    Default: HeadsetTroubleshooterBot
+    Description: Name of the Lex V2 bot
+
+  BedrockModelSupervisor:
+    Type: String
+    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
+    Description: Foundation model for supervisor agent
+
+  BedrockModelSubagent:
+    Type: String
+    Default: anthropic.claude-3-5-haiku-20241022-v1:0
+    Description: Foundation model for sub-agents (cost optimized)
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARN
+      - ERROR
+
+  DefaultPersona:
+    Type: String
+    Default: tangerine
+    AllowedValues:
+      - tangerine
+      - joseph
+      - jennifer
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  IsNotDev: !Not [!Equals [!Ref Environment, dev]]
+
+Resources:
+  # =============================================================
+  # S3 BUCKET FOR KNOWLEDGE BASE
+  # =============================================================
+  KnowledgeBaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${KBBucketName}-${Environment}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  # =============================================================
+  # DYNAMODB TABLE FOR PERSONAS
+  # =============================================================
+  PersonaTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${PersonaTableName}-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: persona_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: persona_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  # =============================================================
+  # DYNAMODB TABLE FOR SESSION STATE
+  # =============================================================
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "HeadsetAgentSessions-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================
+  # LAMBDA FUNCTION - LEX FULFILLMENT
+  # =============================================================
+  TroubleshootingFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: !Sub "headset-agent-orchestrator-${Environment}"
+      Handler: bootstrap
+      CodeUri: ../cmd/lambda/
+      Description: Headset troubleshooting agent - Lex fulfillment handler
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PERSONA_TABLE_NAME: !Ref PersonaTable
+          SESSION_TABLE_NAME: !Ref SessionTable
+          KB_BUCKET_NAME: !Ref KnowledgeBaseBucket
+          SUPERVISOR_AGENT_ID: !Sub "{{resolve:ssm:/headset-agent/${Environment}/supervisor-agent-id:1}}"
+          SUPERVISOR_AGENT_ALIAS: !Sub "{{resolve:ssm:/headset-agent/${Environment}/supervisor-agent-alias:1}}"
+          DEFAULT_PERSONA: !Ref DefaultPersona
+          BEDROCK_MODEL_SUPERVISOR: !Ref BedrockModelSupervisor
+          BEDROCK_MODEL_SUBAGENT: !Ref BedrockModelSubagent
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: BedrockAccess
+              Effect: Allow
+              Action:
+                - bedrock:InvokeAgent
+                - bedrock:InvokeModel
+                - bedrock:RetrieveAndGenerate
+                - bedrock:Retrieve
+              Resource: '*'
+            - Sid: DynamoDBAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+              Resource:
+                - !GetAtt PersonaTable.Arn
+                - !GetAtt SessionTable.Arn
+            - Sid: S3Access
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource:
+                - !GetAtt KnowledgeBaseBucket.Arn
+                - !Sub "${KnowledgeBaseBucket.Arn}/*"
+            - Sid: SSMAccess
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/headset-agent/${Environment}/*"
+            - Sid: PollyAccess
+              Effect: Allow
+              Action:
+                - polly:SynthesizeSpeech
+              Resource: '*'
+      Events:
+        LexInvocation:
+          Type: CloudWatchEvent
+          Properties:
+            Pattern:
+              source:
+                - aws.lex
+      Tags:
+        Environment: !Ref Environment
+        Project: HeadsetSupportAgent
+
+  # Lambda permission for Lex
+  LexInvocationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TroubleshootingFunction
+      Action: lambda:InvokeFunction
+      Principal: lexv2.amazonaws.com
+      SourceArn: !Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/*"
+
+  # =============================================================
+  # IAM ROLE FOR BEDROCK AGENTS
+  # =============================================================
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "BedrockAgentRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: BedrockAgentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeModel
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelSupervisor}"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelSubagent}"
+              - Sid: KnowledgeBase
+                Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: '*'
+              - Sid: S3KnowledgeBase
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt KnowledgeBaseBucket.Arn
+                  - !Sub "${KnowledgeBaseBucket.Arn}/*"
+              - Sid: LambdaInvoke
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TroubleshootingFunction.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================
+  # IAM ROLE FOR LEX BOT
+  # =============================================================
+  LexServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "LexServiceRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lexv2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LexServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - polly:SynthesizeSpeech
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TroubleshootingFunction.Arn
+
+  # =============================================================
+  # CLOUDWATCH LOG GROUP
+  # =============================================================
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${TroubleshootingFunction}"
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # =============================================================
+  # SSM PARAMETERS (Placeholders - Updated by agent creation script)
+  # =============================================================
+  SupervisorAgentIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/supervisor-agent-id"
+      Type: String
+      Value: "PLACEHOLDER"
+      Description: Bedrock Supervisor Agent ID (updated by create-agents script)
+
+  SupervisorAgentAliasParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/supervisor-agent-alias"
+      Type: String
+      Value: "PLACEHOLDER"
+      Description: Bedrock Supervisor Agent Alias (updated by create-agents script)
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt TroubleshootingFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaArn"
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref TroubleshootingFunction
+
+  KnowledgeBaseBucketName:
+    Description: S3 bucket for knowledge base documents
+    Value: !Ref KnowledgeBaseBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-KBBucket"
+
+  PersonaTableName:
+    Description: DynamoDB table for persona configurations
+    Value: !Ref PersonaTable
+    Export:
+      Name: !Sub "${AWS::StackName}-PersonaTable"
+
+  SessionTableName:
+    Description: DynamoDB table for session state
+    Value: !Ref SessionTable
+
+  BedrockAgentRoleArn:
+    Description: IAM role ARN for Bedrock agents
+    Value: !GetAtt BedrockAgentRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BedrockAgentRole"
+
+  LexServiceRoleArn:
+    Description: IAM role ARN for Lex bot
+    Value: !GetAtt LexServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LexServiceRole"

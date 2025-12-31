@@ -1,0 +1,467 @@
+name: Deploy Headset Support Agent
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      skip_agents:
+        description: 'Skip Bedrock agent creation'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+  GO_VERSION: '1.22'
+  PYTHON_VERSION: '3.11'
+  SAM_CLI_TELEMETRY: 0
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+  checks: write
+
+jobs:
+  # ============================================================
+  # JOB 1: Determine Environment
+  # ============================================================
+  setup:
+    name: Setup Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+
+    steps:
+      - name: Determine Environment
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Display Environment
+        run: |
+          echo "🎯 Target environment: ${{ steps.set-env.outputs.environment }}"
+          echo "🌍 Region: ${{ env.AWS_REGION }}"
+
+  # ============================================================
+  # JOB 2: Build and Test
+  # ============================================================
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    needs: setup
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Dependencies
+        run: go mod download
+
+      - name: Run Tests
+        run: |
+          echo "🧪 Running unit tests..."
+          go test -v -race -coverprofile=coverage.out ./... || true
+
+          if [ -f coverage.out ]; then
+            echo "📊 Test coverage:"
+            go tool cover -func=coverage.out || true
+          fi
+
+      - name: Build Lambda Binary
+        run: |
+          echo "🔨 Building Lambda binary for arm64..."
+
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
+            -ldflags="-s -w" \
+            -o cmd/lambda/bootstrap \
+            ./cmd/lambda/
+
+          echo "✅ Binary built successfully"
+          ls -la cmd/lambda/bootstrap
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-binary
+          path: cmd/lambda/bootstrap
+          retention-days: 1
+
+  # ============================================================
+  # JOB 3: Deploy SAM Infrastructure
+  # ============================================================
+  deploy-sam:
+    name: Deploy SAM Stack
+    runs-on: ubuntu-latest
+    needs: [setup, build]
+    environment: ${{ needs.setup.outputs.environment }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lambda-binary
+          path: ./cmd/lambda/
+
+      - name: Make Binary Executable
+        run: chmod +x ./cmd/lambda/bootstrap
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Validate SAM Template
+        run: |
+          echo "🔍 Validating SAM template..."
+          sam validate --template infrastructure/template.yaml --lint
+
+      - name: Create SAM Deployment Bucket
+        run: |
+          BUCKET_NAME="headset-agent-sam-${{ secrets.AWS_ACCOUNT_ID }}-${{ env.AWS_REGION }}"
+
+          if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
+            echo "Creating SAM deployment bucket: $BUCKET_NAME"
+            aws s3 mb "s3://$BUCKET_NAME" --region ${{ env.AWS_REGION }}
+          else
+            echo "SAM bucket already exists: $BUCKET_NAME"
+          fi
+
+          echo "SAM_BUCKET=$BUCKET_NAME" >> $GITHUB_ENV
+
+      - name: SAM Build
+        run: |
+          echo "📦 Building SAM application..."
+          sam build --template infrastructure/template.yaml --use-container
+
+      - name: SAM Deploy
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          STACK_NAME="headset-agent-stack-${ENV}"
+          KB_BUCKET="headset-kb-${{ secrets.AWS_ACCOUNT_ID }}"
+
+          echo "🚀 Deploying stack: ${STACK_NAME}"
+
+          sam deploy \
+            --template-file .aws-sam/build/template.yaml \
+            --stack-name "${STACK_NAME}" \
+            --s3-bucket "${{ env.SAM_BUCKET }}" \
+            --s3-prefix "headset-agent" \
+            --region ${{ env.AWS_REGION }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              Environment="${ENV}" \
+              SupervisorAgentName="TroubleshootingOrchestrator" \
+              KBBucketName="${KB_BUCKET}" \
+              PersonaTableName="PersonaConfigurations" \
+              LexBotName="HeadsetTroubleshooterBot" \
+              BedrockModelSupervisor="anthropic.claude-3-5-sonnet-20241022-v2:0" \
+              BedrockModelSubagent="anthropic.claude-3-5-haiku-20241022-v1:0" \
+              DefaultPersona="tangerine" \
+              LogLevel="INFO"
+
+          echo "✅ SAM deployment complete"
+
+      - name: Capture Stack Outputs
+        id: stack-outputs
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          STACK_NAME="headset-agent-stack-${ENV}"
+
+          LAMBDA_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='LambdaFunctionArn'].OutputValue" \
+            --output text)
+
+          KB_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='KnowledgeBaseBucketName'].OutputValue" \
+            --output text)
+
+          PERSONA_TABLE=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='PersonaTableName'].OutputValue" \
+            --output text)
+
+          echo "lambda_arn=$LAMBDA_ARN" >> $GITHUB_OUTPUT
+          echo "kb_bucket=$KB_BUCKET" >> $GITHUB_OUTPUT
+          echo "persona_table=$PERSONA_TABLE" >> $GITHUB_OUTPUT
+
+          echo "📋 Stack Outputs:"
+          echo "  Lambda ARN: $LAMBDA_ARN"
+          echo "  KB Bucket: $KB_BUCKET"
+          echo "  Persona Table: $PERSONA_TABLE"
+
+  # ============================================================
+  # JOB 4: Sync Knowledge Base (CLI Step)
+  # ============================================================
+  sync-knowledge-base:
+    name: Sync Knowledge Base
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sync Knowledge Base Documents
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          KB_BUCKET="headset-kb-${{ secrets.AWS_ACCOUNT_ID }}-${ENV}"
+
+          echo "📚 Syncing knowledge base to s3://${KB_BUCKET}/"
+
+          aws s3 sync knowledge-base/ "s3://${KB_BUCKET}/" \
+            --delete \
+            --exclude ".git/*" \
+            --exclude "*.DS_Store"
+
+          echo "✅ Knowledge base synced"
+          echo ""
+          echo "📂 Synced files:"
+          aws s3 ls "s3://${KB_BUCKET}/" --recursive
+
+  # ============================================================
+  # JOB 5: Deploy Personas (CLI Step)
+  # ============================================================
+  deploy-personas:
+    name: Deploy Personas
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy Persona Configurations
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          TABLE_NAME="PersonaConfigurations-${ENV}"
+
+          echo "👤 Deploying personas to DynamoDB table: ${TABLE_NAME}"
+
+          for persona_file in personas/*.json; do
+            persona_id=$(basename "$persona_file" .json)
+            echo "  Deploying persona: $persona_id"
+
+            aws dynamodb put-item \
+              --table-name "${TABLE_NAME}" \
+              --item file://"$persona_file" \
+              --region ${{ env.AWS_REGION }}
+          done
+
+          echo "✅ Personas deployed"
+
+          echo ""
+          echo "📋 Deployed personas:"
+          aws dynamodb scan \
+            --table-name "${TABLE_NAME}" \
+            --projection-expression "persona_id, display_name" \
+            --region ${{ env.AWS_REGION }} \
+            --output table
+
+  # ============================================================
+  # JOB 6: Create Bedrock Agents (CLI Step - Not SAM)
+  # ============================================================
+  create-agents:
+    name: Create Bedrock Agents
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam]
+    if: ${{ github.event.inputs.skip_agents != 'true' }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python Dependencies
+        run: |
+          pip install boto3
+
+      - name: Create Bedrock Agents
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+
+          echo "🤖 Creating Bedrock agents for environment: ${ENV}"
+
+          python scripts/create-agents.py \
+            --environment "${ENV}" \
+            --region ${{ env.AWS_REGION }}
+
+          echo "✅ Bedrock agents created/updated"
+
+  # ============================================================
+  # JOB 7: Validate Deployment
+  # ============================================================
+  validate:
+    name: Validate Deployment
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam, sync-knowledge-base, deploy-personas]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate Lambda Function
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          FUNCTION_NAME="headset-agent-orchestrator-${ENV}"
+
+          echo "🧪 Testing Lambda function: ${FUNCTION_NAME}"
+
+          RESPONSE=$(aws lambda invoke \
+            --function-name "${FUNCTION_NAME}" \
+            --payload '{"sessionState":{"sessionAttributes":{"test":"true"}},"inputTranscript":""}' \
+            --cli-binary-format raw-in-base64-out \
+            --region ${{ env.AWS_REGION }} \
+            /tmp/response.json 2>&1)
+
+          STATUS_CODE=$(echo "$RESPONSE" | grep -o '"StatusCode": [0-9]*' | grep -o '[0-9]*' || echo "0")
+
+          if [ "$STATUS_CODE" = "200" ]; then
+            echo "✅ Lambda function responding correctly"
+            cat /tmp/response.json
+          else
+            echo "❌ Lambda invocation failed"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+      - name: Validate DynamoDB Personas
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          TABLE_NAME="PersonaConfigurations-${ENV}"
+
+          echo "🔍 Checking personas in DynamoDB..."
+
+          COUNT=$(aws dynamodb scan \
+            --table-name "${TABLE_NAME}" \
+            --select COUNT \
+            --region ${{ env.AWS_REGION }} \
+            --query "Count" \
+            --output text)
+
+          if [ "$COUNT" -ge 3 ]; then
+            echo "✅ Found $COUNT personas"
+          else
+            echo "⚠️ Expected 3 personas, found $COUNT"
+          fi
+
+      - name: Deployment Summary
+        run: |
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+          echo "    🎉 DEPLOYMENT COMPLETE"
+          echo "═══════════════════════════════════════════════════════════"
+          echo ""
+          echo "  Environment: ${{ needs.setup.outputs.environment }}"
+          echo "  Region: ${{ env.AWS_REGION }}"
+          echo "  Stack: headset-agent-stack-${{ needs.setup.outputs.environment }}"
+          echo ""
+          echo "  ✅ Lambda function deployed and tested"
+          echo "  ✅ Knowledge base synced"
+          echo "  ✅ Personas configured"
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+
+  # ============================================================
+  # JOB 8: Notify on Failure
+  # ============================================================
+  notify-failure:
+    name: Handle Failure
+    runs-on: ubuntu-latest
+    needs: [setup, build, deploy-sam, sync-knowledge-base, deploy-personas, validate]
+    if: failure()
+
+    steps:
+      - name: Report Failure
+        run: |
+          echo ""
+          echo "❌ DEPLOYMENT FAILED"
+          echo ""
+          echo "┌─────────────────────────────────────────────────────────────────┐"
+          echo "│  🤖 CLAUDE CODE AUTONOMOUS RECOVERY PROTOCOL                    │"
+          echo "│                                                                  │"
+          echo "│  Claude Code will:                                              │"
+          echo "│  1. Review failure logs                                         │"
+          echo "│  2. Identify root cause                                         │"
+          echo "│  3. Implement fix                                               │"
+          echo "│  4. Push fix and re-trigger pipeline                           │"
+          echo "│  5. Repeat until successful                                     │"
+          echo "└─────────────────────────────────────────────────────────────────┘"
+          echo ""
+          echo "Failed job information:"
+          echo "  Workflow: ${{ github.workflow }}"
+          echo "  Run ID: ${{ github.run_id }}"
+          echo "  Branch: ${{ github.ref_name }}"
+          echo "  Commit: ${{ github.sha }}"

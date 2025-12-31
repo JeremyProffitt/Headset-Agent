@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""
+Bedrock Agent Creation Script
+Creates supervisor and sub-agents for the Headset Support Agent
+
+This script handles resources that cannot be created via SAM/CloudFormation:
+- Bedrock Agents
+- Agent Collaborators (Multi-Agent)
+- Knowledge Base associations
+"""
+
+import argparse
+import boto3
+import json
+import time
+import os
+from botocore.exceptions import ClientError
+
+
+def get_agent_role_arn(environment: str, region: str) -> str:
+    """Get the Bedrock agent role ARN from CloudFormation stack outputs"""
+    cf_client = boto3.client('cloudformation', region_name=region)
+    stack_name = f"headset-agent-stack-{environment}"
+
+    try:
+        response = cf_client.describe_stacks(StackName=stack_name)
+        outputs = response['Stacks'][0]['Outputs']
+        for output in outputs:
+            if output['OutputKey'] == 'BedrockAgentRoleArn':
+                return output['OutputValue']
+    except ClientError as e:
+        print(f"Warning: Could not get role from stack: {e}")
+
+    # Fallback to constructing the ARN
+    sts = boto3.client('sts')
+    account_id = sts.get_caller_identity()['Account']
+    return f"arn:aws:iam::{account_id}:role/BedrockAgentRole-{environment}"
+
+
+def create_agent(client, name: str, role_arn: str, model_id: str, instruction: str) -> dict:
+    """Create a Bedrock agent"""
+    print(f"Creating agent: {name}")
+
+    try:
+        # Check if agent already exists
+        agents = client.list_agents()
+        for agent in agents.get('agentSummaries', []):
+            if agent['agentName'] == name:
+                print(f"  Agent {name} already exists with ID: {agent['agentId']}")
+                return {'agentId': agent['agentId'], 'exists': True}
+
+        response = client.create_agent(
+            agentName=name,
+            agentResourceRoleArn=role_arn,
+            foundationModel=model_id,
+            instruction=instruction,
+            idleSessionTTLInSeconds=600,
+            description=f"Headset Support Agent - {name}"
+        )
+
+        agent_id = response['agent']['agentId']
+        print(f"  Created agent with ID: {agent_id}")
+
+        # Wait for agent to be ready
+        wait_for_agent(client, agent_id)
+
+        return {'agentId': agent_id, 'exists': False}
+
+    except ClientError as e:
+        print(f"  Error creating agent {name}: {e}")
+        raise
+
+
+def wait_for_agent(client, agent_id: str, timeout: int = 120):
+    """Wait for agent to be in PREPARED or NOT_PREPARED status"""
+    print(f"  Waiting for agent {agent_id} to be ready...")
+
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        response = client.get_agent(agentId=agent_id)
+        status = response['agent']['agentStatus']
+
+        if status in ['PREPARED', 'NOT_PREPARED']:
+            print(f"  Agent status: {status}")
+            return
+
+        print(f"  Current status: {status}, waiting...")
+        time.sleep(5)
+
+    raise TimeoutError(f"Agent {agent_id} did not become ready within {timeout} seconds")
+
+
+def prepare_agent(client, agent_id: str):
+    """Prepare an agent for deployment"""
+    print(f"  Preparing agent {agent_id}...")
+
+    try:
+        client.prepare_agent(agentId=agent_id)
+        wait_for_agent(client, agent_id)
+        print(f"  Agent {agent_id} prepared successfully")
+    except ClientError as e:
+        print(f"  Error preparing agent: {e}")
+        raise
+
+
+def create_agent_alias(client, agent_id: str, alias_name: str = "prod") -> str:
+    """Create an alias for the agent"""
+    print(f"  Creating alias '{alias_name}' for agent {agent_id}...")
+
+    try:
+        # Check if alias exists
+        aliases = client.list_agent_aliases(agentId=agent_id)
+        for alias in aliases.get('agentAliasSummaries', []):
+            if alias['agentAliasName'] == alias_name:
+                print(f"  Alias already exists: {alias['agentAliasId']}")
+                return alias['agentAliasId']
+
+        response = client.create_agent_alias(
+            agentId=agent_id,
+            agentAliasName=alias_name,
+            description=f"Production alias for agent"
+        )
+
+        alias_id = response['agentAlias']['agentAliasId']
+        print(f"  Created alias: {alias_id}")
+        return alias_id
+
+    except ClientError as e:
+        print(f"  Error creating alias: {e}")
+        raise
+
+
+def update_ssm_parameter(param_name: str, value: str, region: str):
+    """Update SSM parameter with agent ID"""
+    ssm = boto3.client('ssm', region_name=region)
+
+    try:
+        ssm.put_parameter(
+            Name=param_name,
+            Value=value,
+            Type='String',
+            Overwrite=True
+        )
+        print(f"  Updated SSM parameter: {param_name}")
+    except ClientError as e:
+        print(f"  Error updating SSM parameter: {e}")
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Create Bedrock agents for Headset Support')
+    parser.add_argument('--environment', '-e', default='dev', choices=['dev', 'staging', 'prod'])
+    parser.add_argument('--region', '-r', default=os.environ.get('AWS_REGION', 'us-east-1'))
+    parser.add_argument('--skip-subagents', action='store_true', help='Only create supervisor agent')
+    args = parser.parse_args()
+
+    print(f"\n{'='*60}")
+    print(f"  BEDROCK AGENT CREATION")
+    print(f"  Environment: {args.environment}")
+    print(f"  Region: {args.region}")
+    print(f"{'='*60}\n")
+
+    client = boto3.client('bedrock-agent', region_name=args.region)
+    role_arn = get_agent_role_arn(args.environment, args.region)
+
+    print(f"Using role ARN: {role_arn}\n")
+
+    # Model IDs - use Haiku for sub-agents (cost optimization)
+    supervisor_model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    subagent_model = "anthropic.claude-3-5-haiku-20241022-v1:0"
+
+    # Agent instructions
+    agents_config = {
+        "TroubleshootingOrchestrator": {
+            "model": supervisor_model,
+            "instruction": """You are the Troubleshooting Orchestrator, a supervisor agent coordinating headset audio troubleshooting. You have access to three specialized sub-agents:
+
+AVAILABLE SUB-AGENTS:
+1. DiagnosticAgent: Hardware diagnostics, physical connections, basic functionality
+2. PlatformAgent: OS settings, driver issues, application configuration
+3. EscalationAgent: Human agent transfers, ticket creation
+
+ROUTING RULES:
+- Physical/hardware issues → DiagnosticAgent
+- Settings/configuration issues → PlatformAgent
+- User requests human or frustration detected → EscalationAgent
+- Complex issues → Consult DiagnosticAgent first, then PlatformAgent
+
+CONVERSATION RULES:
+1. Greet warmly and ask what issue they're experiencing
+2. Route to appropriate sub-agent based on issue description
+3. If sub-agent needs more info, relay the question naturally
+4. Always maintain conversational, supportive tone
+5. Never mention "sub-agents" or technical architecture to user
+6. Keep responses under 3 sentences for voice clarity
+7. Confirm understanding before proceeding to next step
+
+ESCALATION TRIGGERS:
+- User says: "agent", "human", "representative", "speak to someone"
+- User expresses frustration more than twice
+- Same issue persists after 4 troubleshooting steps
+- Technical issue requires physical inspection"""
+        },
+        "DiagnosticAgent": {
+            "model": subagent_model,
+            "instruction": """You are a hardware diagnostic specialist for headsets. Your expertise covers:
+- USB and audio jack connections
+- Bluetooth pairing and connectivity
+- Hardware volume controls and mute switches
+- Microphone and speaker testing
+- Cable and connector inspection
+
+BEHAVIOR:
+- Start with the simplest physical checks first
+- Ask ONE question at a time
+- Confirm each step before proceeding
+- Use layman's terms unless user indicates technical expertise
+- If you cannot resolve after 3 attempts, recommend escalation
+
+DIAGNOSTIC SEQUENCE:
+1. Physical connection verification
+2. Hardware control checks (mute/volume)
+3. Basic functionality test (can they hear anything?)
+4. Detailed component isolation (left/right, mic, speakers)"""
+        },
+        "PlatformAgent": {
+            "model": subagent_model,
+            "instruction": """You are a platform configuration specialist for audio devices. Your expertise covers:
+- Windows 10/11 audio device management
+- macOS audio preferences and permissions
+- Application-specific audio settings (Teams, Zoom, Genesys Cloud)
+
+BEHAVIOR:
+- Identify the user's operating system first
+- Guide through settings step-by-step with clear navigation paths
+- Explain what each setting does in simple terms
+- Verify changes took effect before proceeding
+
+CONFIGURATION SEQUENCE:
+1. Identify OS and version
+2. Check default audio device settings
+3. Verify application permissions (microphone access)
+4. Configure application-specific audio settings
+5. Test with built-in OS tools before application"""
+        },
+        "EscalationAgent": {
+            "model": subagent_model,
+            "instruction": """You are an escalation specialist responsible for smooth handoffs to human agents.
+
+TRIGGERS FOR ACTIVATION:
+- User explicitly requests human agent
+- User expresses repeated frustration
+- Technical issue requires physical inspection
+- Issue persists after exhausting troubleshooting steps
+
+BEHAVIOR:
+- Acknowledge the user's need immediately
+- Summarize the troubleshooting steps already attempted
+- Gather any missing information needed for the handoff
+- Prepare a concise summary for the human agent
+- Execute the transfer or create the support ticket
+
+ESCALATION PROTOCOL:
+1. Confirm user wants to proceed with escalation
+2. Generate conversation summary
+3. Collect any additional required information
+4. Create ticket or initiate transfer
+5. Provide user with reference number and expectations"""
+        }
+    }
+
+    created_agents = {}
+
+    # Create supervisor agent first
+    supervisor_name = f"TroubleshootingOrchestrator-{args.environment}"
+    supervisor = create_agent(
+        client,
+        supervisor_name,
+        role_arn,
+        agents_config["TroubleshootingOrchestrator"]["model"],
+        agents_config["TroubleshootingOrchestrator"]["instruction"]
+    )
+    created_agents["supervisor"] = supervisor
+
+    if not supervisor.get('exists'):
+        prepare_agent(client, supervisor['agentId'])
+
+    # Create alias for supervisor
+    alias_id = create_agent_alias(client, supervisor['agentId'])
+
+    # Update SSM parameters
+    update_ssm_parameter(
+        f"/headset-agent/{args.environment}/supervisor-agent-id",
+        supervisor['agentId'],
+        args.region
+    )
+    update_ssm_parameter(
+        f"/headset-agent/{args.environment}/supervisor-agent-alias",
+        alias_id,
+        args.region
+    )
+
+    if not args.skip_subagents:
+        # Create sub-agents
+        for agent_name in ["DiagnosticAgent", "PlatformAgent", "EscalationAgent"]:
+            full_name = f"{agent_name}-{args.environment}"
+            config = agents_config[agent_name]
+
+            agent = create_agent(
+                client,
+                full_name,
+                role_arn,
+                config["model"],
+                config["instruction"]
+            )
+            created_agents[agent_name] = agent
+
+            if not agent.get('exists'):
+                prepare_agent(client, agent['agentId'])
+                create_agent_alias(client, agent['agentId'])
+
+    print(f"\n{'='*60}")
+    print("  AGENT CREATION COMPLETE")
+    print(f"{'='*60}")
+    print(f"\nCreated agents:")
+    for name, agent in created_agents.items():
+        status = "existing" if agent.get('exists') else "new"
+        print(f"  - {name}: {agent['agentId']} ({status})")
+
+    print(f"\nSSM Parameters updated:")
+    print(f"  - /headset-agent/{args.environment}/supervisor-agent-id")
+    print(f"  - /headset-agent/{args.environment}/supervisor-agent-alias")
+    print()
+
+
+if __name__ == "__main__":
+    main()
