@@ -4,14 +4,10 @@
   "Metadata": {
     "entryPointPosition": {"x": 40, "y": 40},
     "ActionMetadata": {
-      "setVoice": {"position": {"x": 150, "y": 40}},
-      "lexBot": {"position": {"x": 350, "y": 40}},
-      "goodbye": {"position": {"x": 950, "y": 40}},
-      "retry1": {"position": {"x": 350, "y": 150}},
-      "lexBot2": {"position": {"x": 550, "y": 150}},
-      "retry2": {"position": {"x": 550, "y": 250}},
-      "lexBot3": {"position": {"x": 750, "y": 250}},
-      "finalError": {"position": {"x": 750, "y": 350}}
+      "setVoice": {"position": {"x": 200, "y": 40}},
+      "lexBot": {"position": {"x": 450, "y": 40}},
+      "goodbye": {"position": {"x": 700, "y": 40}},
+      "error": {"position": {"x": 450, "y": 200}}
     }
   },
   "Actions": [
@@ -43,84 +39,18 @@
       "Transitions": {
         "NextAction": "goodbye",
         "Errors": [
-          {"NextAction": "retry1", "ErrorType": "NoMatchingError"},
-          {"NextAction": "retry1", "ErrorType": "InputTimeLimitExceeded"},
-          {"NextAction": "retry1", "ErrorType": "NoMatchingCondition"}
+          {"NextAction": "error", "ErrorType": "NoMatchingError"},
+          {"NextAction": "error", "ErrorType": "InputTimeLimitExceeded"},
+          {"NextAction": "error", "ErrorType": "NoMatchingCondition"}
         ],
         "Conditions": []
       }
     },
     {
-      "Identifier": "retry1",
+      "Identifier": "error",
       "Type": "MessageParticipant",
       "Parameters": {
-        "Text": "I'm sorry, I didn't quite catch that. Could you please describe your headset issue again?"
-      },
-      "Transitions": {
-        "NextAction": "lexBot2",
-        "Errors": [],
-        "Conditions": []
-      }
-    },
-    {
-      "Identifier": "lexBot2",
-      "Type": "ConnectParticipantWithLexBot",
-      "Parameters": {
-        "LexV2Bot": {
-          "AliasArn": "${LEX_BOT_ALIAS_ARN}"
-        },
-        "LexTimeoutSeconds": {
-          "Text": "300"
-        }
-      },
-      "Transitions": {
-        "NextAction": "goodbye",
-        "Errors": [
-          {"NextAction": "retry2", "ErrorType": "NoMatchingError"},
-          {"NextAction": "retry2", "ErrorType": "InputTimeLimitExceeded"},
-          {"NextAction": "retry2", "ErrorType": "NoMatchingCondition"}
-        ],
-        "Conditions": []
-      }
-    },
-    {
-      "Identifier": "retry2",
-      "Type": "MessageParticipant",
-      "Parameters": {
-        "Text": "Let me try one more time. What problem are you having with your headset?"
-      },
-      "Transitions": {
-        "NextAction": "lexBot3",
-        "Errors": [],
-        "Conditions": []
-      }
-    },
-    {
-      "Identifier": "lexBot3",
-      "Type": "ConnectParticipantWithLexBot",
-      "Parameters": {
-        "LexV2Bot": {
-          "AliasArn": "${LEX_BOT_ALIAS_ARN}"
-        },
-        "LexTimeoutSeconds": {
-          "Text": "300"
-        }
-      },
-      "Transitions": {
-        "NextAction": "goodbye",
-        "Errors": [
-          {"NextAction": "finalError", "ErrorType": "NoMatchingError"},
-          {"NextAction": "finalError", "ErrorType": "InputTimeLimitExceeded"},
-          {"NextAction": "finalError", "ErrorType": "NoMatchingCondition"}
-        ],
-        "Conditions": []
-      }
-    },
-    {
-      "Identifier": "finalError",
-      "Type": "MessageParticipant",
-      "Parameters": {
-        "Text": "I'm having trouble understanding you. Please try calling back later or visit our website for help. Thank you for calling headset support."
+        "Text": "I'm sorry, I had trouble understanding. Thank you for calling."
       },
       "Transitions": {
         "NextAction": "goodbye",
