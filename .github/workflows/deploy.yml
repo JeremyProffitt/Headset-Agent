@@ -461,6 +461,9 @@ jobs:
     needs: [setup, deploy-sam]
 
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
