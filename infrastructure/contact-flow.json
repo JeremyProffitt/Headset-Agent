@@ -19,7 +19,8 @@
       "Parameters": {
         "Attributes": {
           "LanguageCode": "en-US"
-        }
+        },
+        "TargetContact": "Current"
       },
       "Transitions": {
         "NextAction": "setVoice",
