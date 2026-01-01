@@ -37,7 +37,7 @@
           "AliasArn": "${LEX_BOT_ALIAS_ARN}"
         },
         "LexTimeoutSeconds": {
-          "Text": "120"
+          "Text": "300"
         }
       },
       "Transitions": {
@@ -58,7 +58,7 @@
       },
       "Transitions": {
         "NextAction": "lexBot2",
-        "Errors": [{"NextAction": "lexBot2", "ErrorType": "NoMatchingError"}],
+        "Errors": [],
         "Conditions": []
       }
     },
@@ -70,7 +70,7 @@
           "AliasArn": "${LEX_BOT_ALIAS_ARN}"
         },
         "LexTimeoutSeconds": {
-          "Text": "120"
+          "Text": "300"
         }
       },
       "Transitions": {
@@ -91,7 +91,7 @@
       },
       "Transitions": {
         "NextAction": "lexBot3",
-        "Errors": [{"NextAction": "lexBot3", "ErrorType": "NoMatchingError"}],
+        "Errors": [],
         "Conditions": []
       }
     },
@@ -103,7 +103,7 @@
           "AliasArn": "${LEX_BOT_ALIAS_ARN}"
         },
         "LexTimeoutSeconds": {
-          "Text": "120"
+          "Text": "300"
         }
       },
       "Transitions": {
@@ -124,7 +124,7 @@
       },
       "Transitions": {
         "NextAction": "goodbye",
-        "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
+        "Errors": [],
         "Conditions": []
       }
     },
