@@ -520,21 +520,22 @@ jobs:
           INSTANCE_ID="${{ steps.stack.outputs.instance_id }}"
           LEX_BOT_ARN="${{ steps.stack.outputs.lex_bot_alias_arn }}"
           ENV="${{ needs.setup.outputs.environment }}"
+          FLOW_NAME="Headset Support Test"
 
           echo "📝 Deploying contact flow from infrastructure/contact-flow.json..."
 
           # Read contact flow template and substitute Lex ARN placeholder
           FLOW_CONTENT=$(sed "s|\${LEX_BOT_ALIAS_ARN}|${LEX_BOT_ARN}|g" infrastructure/contact-flow.json)
 
-          # Check if flow exists
+          # Check if flow exists (look for "Headset Support Test" first, then fallback)
           EXISTING_FLOW=$(aws connect list-contact-flows \
             --instance-id "$INSTANCE_ID" \
             --contact-flow-types CONTACT_FLOW \
-            --query "ContactFlowSummaryList[?Name=='HeadsetSupport-${ENV}'].Id" \
+            --query "ContactFlowSummaryList[?Name=='${FLOW_NAME}'].Id" \
             --output text 2>/dev/null || echo "")
 
           if [ -n "$EXISTING_FLOW" ] && [ "$EXISTING_FLOW" != "None" ]; then
-            echo "Updating existing contact flow: $EXISTING_FLOW"
+            echo "Updating existing contact flow '$FLOW_NAME': $EXISTING_FLOW"
 
             # Update existing contact flow with new content
             aws connect update-contact-flow-content \
@@ -544,13 +545,13 @@ jobs:
               --region ${{ env.AWS_REGION }}
 
             echo "contact_flow_id=$EXISTING_FLOW" >> $GITHUB_OUTPUT
-            echo "✅ Contact flow updated"
+            echo "✅ Contact flow updated with retry logic"
           else
             # Create new contact flow
             echo "Creating new contact flow..."
             RESULT=$(aws connect create-contact-flow \
               --instance-id "$INSTANCE_ID" \
-              --name "HeadsetSupport-${ENV}" \
+              --name "${FLOW_NAME}" \
               --type CONTACT_FLOW \
               --content "$FLOW_CONTENT" \
               --description "Headset support voice bot contact flow with retry logic" \
