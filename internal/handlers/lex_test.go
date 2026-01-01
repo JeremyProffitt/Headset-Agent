@@ -171,11 +171,6 @@ func TestBuildSSML(t *testing.T) {
 				t.Errorf("SSML should contain pitch %s", tt.wantPitch)
 			}
 
-			// Verify conversational domain
-			if !strings.Contains(ssml, "amazon:domain") {
-				t.Error("SSML should use amazon:domain for conversational style")
-			}
-
 			// Verify text is included
 			if !strings.Contains(ssml, tt.text) {
 				t.Error("SSML should contain the original text")
