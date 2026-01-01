@@ -4,12 +4,11 @@
   "Metadata": {
     "entryPointPosition": {"x": 40, "y": 40},
     "ActionMetadata": {
-      "setVoice": {"position": {"x": 150, "y": 40}},
-      "lexBot": {"position": {"x": 350, "y": 40}},
-      "goodbye": {"position": {"x": 750, "y": 40}},
-      "retry1": {"position": {"x": 350, "y": 150}},
-      "lexBot2": {"position": {"x": 550, "y": 150}},
-      "error": {"position": {"x": 550, "y": 250}}
+      "setVoice": {"position": {"x": 200, "y": 40}},
+      "lexBot": {"position": {"x": 450, "y": 40}},
+      "goodbye": {"position": {"x": 700, "y": 40}},
+      "error": {"position": {"x": 450, "y": 200}},
+      "retry1": {"position": {"x": 600, "y": 200}}
     }
   },
   "Actions": [
@@ -35,7 +34,7 @@
           "AliasArn": "${LEX_BOT_ALIAS_ARN}"
         },
         "LexTimeoutSeconds": {
-          "Text": "120"
+          "Text": "300"
         }
       },
       "Transitions": {
@@ -52,32 +51,11 @@
       "Identifier": "retry1",
       "Type": "MessageParticipant",
       "Parameters": {
-        "Text": "I didn't catch that. Could you please describe your headset issue again?"
+        "Text": "I didn't catch that. Could you describe your issue again?"
       },
       "Transitions": {
-        "NextAction": "lexBot2",
+        "NextAction": "error",
         "Errors": [],
-        "Conditions": []
-      }
-    },
-    {
-      "Identifier": "lexBot2",
-      "Type": "ConnectParticipantWithLexBot",
-      "Parameters": {
-        "LexV2Bot": {
-          "AliasArn": "${LEX_BOT_ALIAS_ARN}"
-        },
-        "LexTimeoutSeconds": {
-          "Text": "120"
-        }
-      },
-      "Transitions": {
-        "NextAction": "goodbye",
-        "Errors": [
-          {"NextAction": "error", "ErrorType": "NoMatchingError"},
-          {"NextAction": "error", "ErrorType": "InputTimeLimitExceeded"},
-          {"NextAction": "error", "ErrorType": "NoMatchingCondition"}
-        ],
         "Conditions": []
       }
     },
@@ -85,7 +63,7 @@
       "Identifier": "error",
       "Type": "MessageParticipant",
       "Parameters": {
-        "Text": "I'm sorry, I'm having trouble understanding. Please try calling back later. Thank you."
+        "Text": "I'm sorry, I had trouble understanding. Thank you for calling."
       },
       "Transitions": {
         "NextAction": "goodbye",
