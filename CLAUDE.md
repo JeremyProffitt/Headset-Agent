@@ -1,5 +1,10 @@
 # Headset Support Agent Project
 
+## Workflow Requirements
+1. Always commit and push changes after making fixes
+2. Review the GitHub Actions pipeline for any issues
+3. Remediate failures autonomously and re-push until pipeline succeeds
+
 ## Project Overview
 Voice-based headset troubleshooting agent using AWS multi-agent architecture with programmable personas.
 

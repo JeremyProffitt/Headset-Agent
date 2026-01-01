@@ -421,11 +421,13 @@ Resources:
               FulfillmentCodeHook:
                 Enabled: true
               DialogCodeHook:
-                Enabled: false
+                Enabled: true
             - Name: FallbackIntent
               Description: Fallback intent
               ParentIntentSignature: "AMAZON.FallbackIntent"
               FulfillmentCodeHook:
+                Enabled: true
+              DialogCodeHook:
                 Enabled: true
       BotTags:
         - Key: Environment
