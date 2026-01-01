@@ -1,17 +1,32 @@
 {
   "Version": "2019-10-30",
-  "StartAction": "setVoice",
+  "StartAction": "setLanguage",
   "Metadata": {
     "entryPointPosition": {"x": 40, "y": 40},
     "ActionMetadata": {
-      "setVoice": {"position": {"x": 200, "y": 40}},
-      "lexBot": {"position": {"x": 450, "y": 40}},
-      "goodbye": {"position": {"x": 700, "y": 40}},
-      "error": {"position": {"x": 450, "y": 200}},
-      "retry1": {"position": {"x": 600, "y": 200}}
+      "setLanguage": {"position": {"x": 120, "y": 40}},
+      "setVoice": {"position": {"x": 280, "y": 40}},
+      "lexBot": {"position": {"x": 520, "y": 40}},
+      "goodbye": {"position": {"x": 780, "y": 40}},
+      "error": {"position": {"x": 520, "y": 200}},
+      "retry1": {"position": {"x": 680, "y": 200}}
     }
   },
   "Actions": [
+    {
+      "Identifier": "setLanguage",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "Attributes": {
+          "LanguageCode": "en-US"
+        }
+      },
+      "Transitions": {
+        "NextAction": "setVoice",
+        "Errors": [{"NextAction": "setVoice", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
     {
       "Identifier": "setVoice",
       "Type": "UpdateContactTextToSpeechVoice",
