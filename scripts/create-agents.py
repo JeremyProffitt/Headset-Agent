@@ -21,7 +21,7 @@ from botocore.exceptions import ClientError
 # =============================================================================
 # Set to True to use AWS native models (Amazon Titan) - no use case form required
 # Set to False to use Anthropic Claude models - requires Anthropic use case form
-USE_AWS_NATIVE_MODELS = False
+USE_AWS_NATIVE_MODELS = True
 
 # Anthropic Claude Models (require use case form submission in AWS console)
 CLAUDE_SUPERVISOR_MODEL = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"

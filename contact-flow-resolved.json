@@ -2,16 +2,16 @@
   "Version": "2019-10-30",
   "StartAction": "setVoice",
   "Metadata": {
-    "entryPointPosition": {"x": 40, "y": 40},
+    "EntryPointPosition": {"x": 40, "y": 40},
     "ActionMetadata": {
-      "setVoice": {"position": {"x": 150, "y": 40}},
-      "lexBot": {"position": {"x": 350, "y": 40}},
-      "goodbye": {"position": {"x": 950, "y": 40}},
-      "retry1": {"position": {"x": 350, "y": 150}},
-      "lexBot2": {"position": {"x": 550, "y": 150}},
-      "retry2": {"position": {"x": 550, "y": 250}},
-      "lexBot3": {"position": {"x": 750, "y": 250}},
-      "finalError": {"position": {"x": 750, "y": 350}}
+      "setVoice": {"Position": {"x": 150, "y": 40}},
+      "lexBot": {"Position": {"x": 350, "y": 40}},
+      "goodbye": {"Position": {"x": 950, "y": 40}},
+      "retry1": {"Position": {"x": 350, "y": 150}},
+      "lexBot2": {"Position": {"x": 550, "y": 150}},
+      "retry2": {"Position": {"x": 550, "y": 250}},
+      "lexBot3": {"Position": {"x": 750, "y": 250}},
+      "finalError": {"Position": {"x": 750, "y": 350}}
     }
   },
   "Actions": [
@@ -24,7 +24,7 @@
       },
       "Transitions": {
         "NextAction": "lexBot",
-        "Errors": [],
+        "Errors": [{"NextAction": "lexBot", "ErrorType": "NoMatchingError"}],
         "Conditions": []
       }
     },
@@ -34,7 +34,7 @@
       "Parameters": {
         "Text": "Welcome to headset support. How can I help you today?",
         "LexV2Bot": {
-          "AliasArn": "${LEX_BOT_ALIAS_ARN}"
+          "AliasArn": "arn:aws:lex:us-east-1:759775734231:bot-alias/M9VBE9T4ET/5DQOYNPTPM"
         },
         "LexTimeoutSeconds": {
           "Text": "120"
@@ -58,7 +58,7 @@
       },
       "Transitions": {
         "NextAction": "lexBot2",
-        "Errors": [],
+        "Errors": [{"NextAction": "lexBot2", "ErrorType": "NoMatchingError"}],
         "Conditions": []
       }
     },
@@ -67,7 +67,7 @@
       "Type": "ConnectParticipantWithLexBot",
       "Parameters": {
         "LexV2Bot": {
-          "AliasArn": "${LEX_BOT_ALIAS_ARN}"
+          "AliasArn": "arn:aws:lex:us-east-1:759775734231:bot-alias/M9VBE9T4ET/5DQOYNPTPM"
         },
         "LexTimeoutSeconds": {
           "Text": "120"
@@ -91,7 +91,7 @@
       },
       "Transitions": {
         "NextAction": "lexBot3",
-        "Errors": [],
+        "Errors": [{"NextAction": "lexBot3", "ErrorType": "NoMatchingError"}],
         "Conditions": []
       }
     },
@@ -100,7 +100,7 @@
       "Type": "ConnectParticipantWithLexBot",
       "Parameters": {
         "LexV2Bot": {
-          "AliasArn": "${LEX_BOT_ALIAS_ARN}"
+          "AliasArn": "arn:aws:lex:us-east-1:759775734231:bot-alias/M9VBE9T4ET/5DQOYNPTPM"
         },
         "LexTimeoutSeconds": {
           "Text": "120"
@@ -124,7 +124,7 @@
       },
       "Transitions": {
         "NextAction": "goodbye",
-        "Errors": [],
+        "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
         "Conditions": []
       }
     },
