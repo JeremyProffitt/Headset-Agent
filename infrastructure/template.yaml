@@ -405,6 +405,7 @@ Resources:
           NluConfidenceThreshold: 0.40
           VoiceSettings:
             VoiceId: Joanna
+            Engine: neural
           Intents:
             - Name: TroubleshootIntent
               Description: Main troubleshooting intent

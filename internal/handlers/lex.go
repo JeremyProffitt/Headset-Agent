@@ -99,13 +99,9 @@ func BuildTestResponse() LexV2Response {
 
 // BuildSSML wraps text in SSML with persona voice settings
 func BuildSSML(p *models.Persona, text string) string {
-	return fmt.Sprintf(`<speak>
-	<prosody rate="%s" pitch="%s">
-		<amazon:domain name="conversational">
-			%s
-		</amazon:domain>
-	</prosody>
-</speak>`, p.VoiceConfig.Prosody.Rate, p.VoiceConfig.Prosody.Pitch, text)
+	// Use simple SSML without amazon:domain to ensure compatibility with Lex
+	return fmt.Sprintf(`<speak><prosody rate="%s" pitch="%s">%s</prosody></speak>`,
+		p.VoiceConfig.Prosody.Rate, p.VoiceConfig.Prosody.Pitch, text)
 }
 
 // BuildCloseResponse creates a close dialog response
