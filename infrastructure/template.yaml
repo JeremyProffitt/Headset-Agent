@@ -457,7 +457,7 @@ Resources:
                 CodeHookInterfaceVersion: "1.0"
                 LambdaArn: !GetAtt TroubleshootingFunction.Arn
       SentimentAnalysisSettings:
-        DetectSentiment: true
+        DetectSentiment: false
 
   # =============================================================
   # AMAZON CONNECT INSTANCE
