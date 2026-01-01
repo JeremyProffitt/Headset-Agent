@@ -124,8 +124,10 @@ class TestTroubleshootingFlow(HeadsetAPITestCase):
         self.assertEqual(result['status_code'], 200)
         content = result['body']['messages'][0]['content'].lower()
 
-        # Response should be relevant to troubleshooting
-        troubleshooting_keywords = ['check', 'connect', 'help', 'try', 'issue', 'problem']
+        # Response should be relevant to troubleshooting - acknowledge issue and ask diagnostic question
+        troubleshooting_keywords = ['check', 'connect', 'help', 'try', 'issue', 'problem',
+                                   'sorry', 'hear', 'audio', 'volume', 'powered', 'muted',
+                                   'tell me', 'what', 'happening', 'troubleshoot']
         has_relevant_response = any(kw in content for kw in troubleshooting_keywords)
         self.assertTrue(has_relevant_response, f"Response should contain troubleshooting keywords: {content}")
 

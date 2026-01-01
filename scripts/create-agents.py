@@ -16,6 +16,23 @@ import time
 import os
 from botocore.exceptions import ClientError
 
+# =============================================================================
+# MODEL PROVIDER CONFIGURATION
+# =============================================================================
+# Set to True to use AWS native models (Amazon Titan) - no use case form required
+# Set to False to use Anthropic Claude models - requires Anthropic use case form
+USE_AWS_NATIVE_MODELS = True
+
+# Anthropic Claude Models (require use case form submission in AWS console)
+CLAUDE_SUPERVISOR_MODEL = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+CLAUDE_SUBAGENT_MODEL = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+
+# AWS Native Models - use inference profiles for cross-region support
+# Meta Llama 3.3 - excellent instruction following
+NATIVE_SUPERVISOR_MODEL = "us.meta.llama3-3-70b-instruct-v1:0"
+NATIVE_SUBAGENT_MODEL = "us.meta.llama3-2-11b-instruct-v1:0"
+# =============================================================================
+
 
 def get_agent_role_arn(environment: str, region: str) -> str:
     """Get the Bedrock agent role ARN from CloudFormation stack outputs"""
@@ -225,42 +242,60 @@ def main():
 
     print(f"Using role ARN: {role_arn}\n")
 
-    # Inference Profile IDs - required for newer Claude models
-    # Note: Models like claude-3-5-sonnet-v2 require inference profiles, not direct model IDs
-    supervisor_model = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
-    subagent_model = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+    # Select models based on configuration
+    if USE_AWS_NATIVE_MODELS:
+        supervisor_model = NATIVE_SUPERVISOR_MODEL
+        subagent_model = NATIVE_SUBAGENT_MODEL
+        print(f"Using AWS Native Models (Meta Llama)")
+    else:
+        supervisor_model = CLAUDE_SUPERVISOR_MODEL
+        subagent_model = CLAUDE_SUBAGENT_MODEL
+        print(f"Using Anthropic Claude Models")
+
+    print(f"  Supervisor: {supervisor_model}")
+    print(f"  Subagent: {subagent_model}\n")
 
     # Agent instructions
     agents_config = {
         "TroubleshootingOrchestrator": {
             "model": supervisor_model,
-            "instruction": """You are the Troubleshooting Orchestrator, a supervisor agent coordinating headset audio troubleshooting. You have access to three specialized sub-agents:
+            "instruction": """You are a friendly headset support specialist. Help customers fix their headset problems.
 
-AVAILABLE SUB-AGENTS:
-1. DiagnosticAgent: Hardware diagnostics, physical connections, basic functionality
-2. PlatformAgent: OS settings, driver issues, application configuration
-3. EscalationAgent: Human agent transfers, ticket creation
+WHEN USER REPORTS A PROBLEM, IMMEDIATELY HELP BY:
+1. Acknowledging their issue
+2. Asking ONE specific diagnostic question OR suggesting ONE troubleshooting step
 
-ROUTING RULES:
-- Physical/hardware issues → DiagnosticAgent
-- Settings/configuration issues → PlatformAgent
-- User requests human or frustration detected → EscalationAgent
-- Complex issues → Consult DiagnosticAgent first, then PlatformAgent
+COMMON HEADSET PROBLEMS AND SOLUTIONS:
 
-CONVERSATION RULES:
-1. Greet warmly and ask what issue they're experiencing
-2. Route to appropriate sub-agent based on issue description
-3. If sub-agent needs more info, relay the question naturally
-4. Always maintain conversational, supportive tone
-5. Never mention "sub-agents" or technical architecture to user
-6. Keep responses under 3 sentences for voice clarity
-7. Confirm understanding before proceeding to next step
+NO AUDIO:
+- Check if headset is powered on
+- Verify volume is not muted (check headset and computer)
+- Ensure correct audio output is selected in system settings
+- Try unplugging and reconnecting the headset
+- Test on another device to isolate the problem
 
-ESCALATION TRIGGERS:
-- User says: "agent", "human", "representative", "speak to someone"
-- User expresses frustration more than twice
-- Same issue persists after 4 troubleshooting steps
-- Technical issue requires physical inspection"""
+BLUETOOTH WON'T CONNECT:
+- Make sure headset is in pairing mode (usually hold power button)
+- Turn Bluetooth off and on again on the device
+- Remove old pairing and re-pair fresh
+- Check headset battery level
+- Move closer to the device
+
+MICROPHONE NOT WORKING:
+- Check if mic is muted on headset
+- Verify microphone permissions in app settings
+- Select correct input device in system settings
+- Test mic in another application
+
+RESPONSE STYLE:
+- Be warm and conversational
+- Give ONE step at a time
+- Keep responses to 2-3 sentences
+- Ask if the step helped before moving on
+- NEVER include JSON, function calls, or code in your responses
+- Respond in plain conversational English only
+
+If user asks for a human agent, acknowledge and say you'll transfer them."""
         },
         "DiagnosticAgent": {
             "model": subagent_model,

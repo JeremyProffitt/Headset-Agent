@@ -37,22 +37,30 @@ type InvokeAgentInput struct {
 func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput) (*models.AgentResponse, error) {
 	// Build session attributes with persona context
 	sessionAttrs := map[string]string{
-		"persona_id":     input.Persona.PersonaID,
-		"persona_name":   input.Persona.DisplayName,
-		"persona_voice":  input.Persona.VoiceConfig.PollyVoiceID,
-		"system_context": buildSystemContext(input.Persona),
+		"persona_id":   input.Persona.PersonaID,
+		"persona_name": input.Persona.DisplayName,
 	}
 
+	// Log the invocation for debugging
+	fmt.Printf("Invoking agent %s with input: %s\n", input.AgentID, input.InputText)
+
 	// Invoke the agent
-	output, err := c.client.InvokeAgent(ctx, &bedrockagentruntime.InvokeAgentInput{
+	invokeInput := &bedrockagentruntime.InvokeAgentInput{
 		AgentId:      aws.String(input.AgentID),
 		AgentAliasId: aws.String(input.AgentAliasID),
 		SessionId:    aws.String(input.SessionID),
 		InputText:    aws.String(input.InputText),
-		SessionState: &types.SessionState{
+		EnableTrace:  aws.Bool(true),
+	}
+
+	// Only add session state if we have attributes
+	if len(sessionAttrs) > 0 {
+		invokeInput.SessionState = &types.SessionState{
 			PromptSessionAttributes: sessionAttrs,
-		},
-	})
+		}
+	}
+
+	output, err := c.client.InvokeAgent(ctx, invokeInput)
 	if err != nil {
 		return nil, fmt.Errorf("failed to invoke agent: %w", err)
 	}
@@ -65,18 +73,46 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 		switch v := event.(type) {
 		case *types.ResponseStreamMemberChunk:
 			responseText.Write(v.Value.Bytes)
+		case *types.ResponseStreamMemberTrace:
+			// Log trace information for debugging
+			fmt.Printf("Trace event received: %+v\n", v.Value)
 		}
 	}
+
+	// Clean up the response - remove any JSON function call artifacts
+	cleanedResponse := cleanResponse(responseText.String())
+	fmt.Printf("Agent response: %s\n", cleanedResponse)
 
 	if err := stream.Close(); err != nil {
 		return nil, fmt.Errorf("error closing stream: %w", err)
 	}
 
 	return &models.AgentResponse{
-		OutputText: responseText.String(),
+		OutputText: cleanedResponse,
 		SessionID:  input.SessionID,
 		Metadata:   sessionAttrs,
 	}, nil
+}
+
+// cleanResponse removes any JSON function call artifacts from the response
+func cleanResponse(response string) string {
+	// Remove JSON function calls that some models include
+	// These can look like: {"name": ...} or {{"name": ...}}
+	patterns := []string{
+		"\n{{\"name\":",
+		"\n{\"name\":",
+		" {{\"name\":",
+		" {\"name\":",
+		"{{\"name\":",
+		"{\"name\":",
+	}
+	for _, pattern := range patterns {
+		if idx := strings.Index(response, pattern); idx != -1 {
+			response = strings.TrimSpace(response[:idx])
+			break
+		}
+	}
+	return response
 }
 
 // buildSystemContext creates the enhanced system prompt with persona and troubleshooting context

@@ -227,6 +227,29 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 		return handlers.BuildTestResponse(), nil
 	}
 
+	// Handle empty transcript - this happens for initial dialog hook invocations
+	// or when voice transcription fails
+	if event.InputTranscript == "" {
+		log.Printf("Empty transcript received - returning welcome prompt")
+		// Load default persona for welcome message
+		personaID := event.SessionState.SessionAttributes["persona_id"]
+		if personaID == "" {
+			personaID = os.Getenv("DEFAULT_PERSONA")
+			if personaID == "" {
+				personaID = "tangerine"
+			}
+		}
+		p, _ := personaLoader.Load(ctx, personaID)
+		if p == nil {
+			p = persona.DefaultPersona()
+		}
+		return handlers.BuildSuccessResponse(
+			p,
+			"Hi there! I'm your headset support assistant. Please describe your issue and I'll help you troubleshoot.",
+			event.SessionState.SessionAttributes,
+		), nil
+	}
+
 	// Get persona from session attributes, default to configured default
 	personaID := event.SessionState.SessionAttributes["persona_id"]
 	if personaID == "" {
@@ -283,6 +306,14 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 	return handlers.BuildSuccessResponse(p, response.OutputText, event.SessionState.SessionAttributes), nil
 }
 
+// truncateString truncates a string to the specified length
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 // handleRequest is a unified handler that routes to the appropriate handler
 func handleRequest(ctx context.Context, event json.RawMessage) (interface{}, error) {
 	// Try to detect event type by unmarshaling into different structures
@@ -291,6 +322,9 @@ func handleRequest(ctx context.Context, event json.RawMessage) (interface{}, err
 		log.Printf("Detected API Gateway V2 HTTP event")
 		return handleAPIRequest(ctx, apiEvent)
 	}
+
+	// Log raw event for debugging Lex V2 issues
+	log.Printf("Non-API event received. Raw event (first 1000 chars): %s", truncateString(string(event), 1000))
 
 	// Fall back to Lex V2 event
 	var lexEvent LexV2Event

@@ -511,59 +511,17 @@ jobs:
 
           echo "✅ Lex bot association complete"
 
-      - name: Create Contact Flow
+      - name: Deploy Contact Flow
         id: contact-flow
         run: |
           INSTANCE_ID="${{ steps.stack.outputs.instance_id }}"
           LEX_BOT_ARN="${{ steps.stack.outputs.lex_bot_alias_arn }}"
           ENV="${{ needs.setup.outputs.environment }}"
 
-          echo "📝 Creating contact flow..."
+          echo "📝 Deploying contact flow from infrastructure/contact-flow.json..."
 
-          # Create a simple contact flow that invokes Lex
-          FLOW_CONTENT=$(cat <<EOF
-          {
-            "Version": "2019-10-30",
-            "StartAction": "PlayPrompt",
-            "Actions": [
-              {
-                "Identifier": "PlayPrompt",
-                "Type": "MessageParticipant",
-                "Parameters": {
-                  "Text": "Welcome to Headset Support. Please describe your issue."
-                },
-                "Transitions": {
-                  "NextAction": "GetInput"
-                }
-              },
-              {
-                "Identifier": "GetInput",
-                "Type": "ConnectParticipantWithLexBot",
-                "Parameters": {
-                  "LexV2Bot": {
-                    "AliasArn": "$LEX_BOT_ARN"
-                  }
-                },
-                "Transitions": {
-                  "NextAction": "EndCall",
-                  "Errors": [
-                    {
-                      "NextAction": "EndCall",
-                      "ErrorType": "NoMatchingError"
-                    }
-                  ]
-                }
-              },
-              {
-                "Identifier": "EndCall",
-                "Type": "DisconnectParticipant",
-                "Parameters": {},
-                "Transitions": {}
-              }
-            ]
-          }
-          EOF
-          )
+          # Read contact flow template and substitute Lex ARN placeholder
+          FLOW_CONTENT=$(sed "s|\${LEX_BOT_ALIAS_ARN}|${LEX_BOT_ARN}|g" infrastructure/contact-flow.json)
 
           # Check if flow exists
           EXISTING_FLOW=$(aws connect list-contact-flows \
@@ -573,16 +531,26 @@ jobs:
             --output text 2>/dev/null || echo "")
 
           if [ -n "$EXISTING_FLOW" ] && [ "$EXISTING_FLOW" != "None" ]; then
-            echo "Contact flow already exists: $EXISTING_FLOW"
+            echo "Updating existing contact flow: $EXISTING_FLOW"
+
+            # Update existing contact flow with new content
+            aws connect update-contact-flow-content \
+              --instance-id "$INSTANCE_ID" \
+              --contact-flow-id "$EXISTING_FLOW" \
+              --content "$FLOW_CONTENT" \
+              --region ${{ env.AWS_REGION }}
+
             echo "contact_flow_id=$EXISTING_FLOW" >> $GITHUB_OUTPUT
+            echo "✅ Contact flow updated"
           else
             # Create new contact flow
+            echo "Creating new contact flow..."
             RESULT=$(aws connect create-contact-flow \
               --instance-id "$INSTANCE_ID" \
               --name "HeadsetSupport-${ENV}" \
               --type CONTACT_FLOW \
               --content "$FLOW_CONTENT" \
-              --description "Headset support voice bot contact flow" \
+              --description "Headset support voice bot contact flow with retry logic" \
               --region ${{ env.AWS_REGION }} 2>&1) || true
 
             if echo "$RESULT" | grep -q "ContactFlowId"; then
