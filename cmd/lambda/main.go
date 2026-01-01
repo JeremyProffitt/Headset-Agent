@@ -30,14 +30,55 @@ var (
 
 // LexV2Event represents the incoming Lex V2 event
 type LexV2Event struct {
-	SessionID       string       `json:"sessionId"`
-	InputTranscript string       `json:"inputTranscript"`
-	SessionState    SessionState `json:"sessionState"`
+	MessageVersion  string            `json:"messageVersion"`
+	InvocationSource string           `json:"invocationSource"`
+	InputMode       string            `json:"inputMode"`
+	SessionID       string            `json:"sessionId"`
+	InputTranscript string            `json:"inputTranscript"`
+	Bot             LexBot            `json:"bot"`
+	SessionState    SessionState      `json:"sessionState"`
+	Transcriptions  []Transcription   `json:"transcriptions"`
+	Interpretations []Interpretation  `json:"interpretations"`
+}
+
+// LexBot contains bot information
+type LexBot struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	AliasID   string `json:"aliasId"`
+	LocaleID  string `json:"localeId"`
+}
+
+// Transcription contains speech-to-text results
+type Transcription struct {
+	Transcription          string  `json:"transcription"`
+	TranscriptionConfidence float64 `json:"transcriptionConfidence"`
+}
+
+// Interpretation contains intent interpretation
+type Interpretation struct {
+	Intent            IntentResult `json:"intent"`
+	NluConfidence     float64      `json:"nluConfidence"`
+}
+
+// IntentResult contains intent details
+type IntentResult struct {
+	Name              string            `json:"name"`
+	Slots             map[string]interface{} `json:"slots"`
+	State             string            `json:"state"`
+	ConfirmationState string            `json:"confirmationState"`
 }
 
 // SessionState represents session state from Lex
 type SessionState struct {
 	SessionAttributes map[string]string `json:"sessionAttributes"`
+	Intent            *IntentResult     `json:"intent"`
+	DialogAction      *DialogAction     `json:"dialogAction"`
+}
+
+// DialogAction represents the dialog action
+type DialogAction struct {
+	Type string `json:"type"`
 }
 
 // ChatRequest represents the incoming chat API request
@@ -215,7 +256,37 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 
 // handleLexRequest handles Lex V2 requests
 func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Response, error) {
-	log.Printf("Received Lex event: sessionId=%s, transcript=%s", event.SessionID, event.InputTranscript)
+	// Enhanced logging to debug empty transcript issue
+	log.Printf("Received Lex event: sessionId=%s, inputMode=%s, invocationSource=%s",
+		event.SessionID, event.InputMode, event.InvocationSource)
+	log.Printf("  InputTranscript: '%s'", event.InputTranscript)
+	log.Printf("  Transcriptions count: %d", len(event.Transcriptions))
+	for i, t := range event.Transcriptions {
+		log.Printf("  Transcription[%d]: '%s' (confidence: %.2f)", i, t.Transcription, t.TranscriptionConfidence)
+	}
+	log.Printf("  Interpretations count: %d", len(event.Interpretations))
+	for i, interp := range event.Interpretations {
+		log.Printf("  Interpretation[%d]: intent=%s, confidence=%.2f", i, interp.Intent.Name, interp.NluConfidence)
+	}
+	if event.Bot.ID != "" {
+		log.Printf("  Bot: id=%s, name=%s, aliasId=%s, localeId=%s",
+			event.Bot.ID, event.Bot.Name, event.Bot.AliasID, event.Bot.LocaleID)
+	}
+
+	// Extract transcript - try InputTranscript first, then fall back to Transcriptions array
+	transcript := event.InputTranscript
+	if transcript == "" && len(event.Transcriptions) > 0 {
+		// Use the highest confidence transcription
+		bestTranscription := event.Transcriptions[0]
+		for _, t := range event.Transcriptions[1:] {
+			if t.TranscriptionConfidence > bestTranscription.TranscriptionConfidence {
+				bestTranscription = t
+			}
+		}
+		transcript = bestTranscription.Transcription
+		log.Printf("  Using transcription from array: '%s' (confidence: %.2f)",
+			transcript, bestTranscription.TranscriptionConfidence)
+	}
 
 	// Initialize session attributes if nil
 	if event.SessionState.SessionAttributes == nil {
@@ -223,14 +294,14 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 	}
 
 	// Check for test invocation
-	if event.InputTranscript == "" && event.SessionState.SessionAttributes["test"] == "true" {
+	if transcript == "" && event.SessionState.SessionAttributes["test"] == "true" {
 		return handlers.BuildTestResponse(), nil
 	}
 
 	// Handle empty transcript - this happens for initial dialog hook invocations
 	// or when voice transcription fails
-	if event.InputTranscript == "" {
-		log.Printf("Empty transcript received - returning welcome prompt")
+	if transcript == "" {
+		log.Printf("Empty transcript received (InputTranscript and Transcriptions both empty) - returning welcome prompt")
 		// Load default persona for welcome message
 		personaID := event.SessionState.SessionAttributes["persona_id"]
 		if personaID == "" {
@@ -268,7 +339,7 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 
 	// Check for escalation triggers
 	escalationDecision := handlers.DetectEscalation(
-		event.InputTranscript,
+		transcript,
 		getIntAttr(event.SessionState.SessionAttributes, "frustration_count"),
 		getIntAttr(event.SessionState.SessionAttributes, "failed_steps"),
 	)
@@ -291,11 +362,12 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 	}
 
 	// Invoke Bedrock supervisor agent
+	log.Printf("Invoking Bedrock agent with transcript: '%s'", transcript)
 	response, err := agentClient.InvokeAgent(ctx, agents.InvokeAgentInput{
 		AgentID:      agentID,
 		AgentAliasID: agentAlias,
 		SessionID:    event.SessionID,
-		InputText:    event.InputTranscript,
+		InputText:    transcript,
 		Persona:      p,
 	})
 	if err != nil {
