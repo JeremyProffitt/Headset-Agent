@@ -48,9 +48,8 @@ def get_lex_client(region):
 def get_bot_id(client, bot_name):
     """Get bot ID by name"""
     try:
-        paginator = client.get_paginator('list_bots')
-        for page in paginator.paginate():
-            for bot in page.get('botSummaries', []):
+        response = client.list_bots(maxResults=50)
+        for bot in response.get('botSummaries', []):
                 if bot['botName'] == bot_name:
                     return bot['botId']
     except ClientError as e:
