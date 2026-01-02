@@ -204,7 +204,7 @@ jobs:
         id: deploy
         run: |
           ENV="${{ needs.setup.outputs.environment }}"
-          STACK_NAME="headset-agent-stack-${ENV}"
+          STACK_NAME="agent-headset-${ENV}"
 
           sam deploy \
             --template-file .aws-sam/build/template.yaml \
@@ -420,7 +420,7 @@ jobs:
       - name: Deployment summary
         run: |
           ENV="${{ needs.setup.outputs.environment }}"
-          STACK_NAME="headset-agent-stack-${ENV}"
+          STACK_NAME="agent-headset-${ENV}"
 
           echo "=== Deployment Complete ==="
           echo "Environment: ${ENV}"

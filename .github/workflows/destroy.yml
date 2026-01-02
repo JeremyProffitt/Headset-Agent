@@ -187,7 +187,7 @@ jobs:
       - name: Delete CloudFormation stack
         run: |
           ENV="${{ github.event.inputs.environment }}"
-          STACK_NAME="headset-agent-stack-${ENV}"
+          STACK_NAME="agent-headset-${ENV}"
 
           echo "Deleting CloudFormation stack: $STACK_NAME"
 
@@ -285,7 +285,7 @@ jobs:
           fi
 
           # Check for stack
-          if aws cloudformation describe-stacks --stack-name "headset-agent-stack-${ENV}" 2>/dev/null; then
+          if aws cloudformation describe-stacks --stack-name "agent-headset-${ENV}" 2>/dev/null; then
             echo "WARNING: CloudFormation stack still exists"
           else
             echo "CloudFormation stack deleted"
