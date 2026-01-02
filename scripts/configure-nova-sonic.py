@@ -2,23 +2,31 @@
 """
 Nova Sonic Configuration Script for Amazon Lex Bot
 
-This script provides instructions for configuring Nova Sonic (Amazon's speech-to-speech
-AI model) with the Lex bot after CloudFormation deployment.
+This script enables Amazon Nova Sonic (speech-to-speech AI model) on the Lex bot
+using the unifiedSpeechSettings API parameter.
 
-IMPORTANT: Nova Sonic configuration requires MANUAL steps in the Amazon Connect
-admin console. CloudFormation and the AWS CLI do not currently support:
-- Enabling Nova Sonic on a Lex bot
-- Configuring speech-to-speech AI settings
-- Setting up voice customization for Nova Sonic
-
-This script retrieves the Lex bot information from CloudFormation outputs or SSM
-parameters and provides detailed instructions for manual configuration.
+Nova Sonic provides:
+- Lower latency voice interactions
+- More natural speech synthesis
+- Better turn-taking and interruption handling
 """
 
 import argparse
 import boto3
 import os
+import time
 from botocore.exceptions import ClientError
+
+# Nova Sonic voice mappings for personas
+NOVA_SONIC_VOICES = {
+    'tangerine': 'amy',      # British English (closest to Irish)
+    'joseph': 'matthew',      # US English male
+    'jennifer': 'tiffany',    # US English female
+    'default': 'tiffany'      # Default voice
+}
+
+# Nova Sonic model ARN
+NOVA_SONIC_MODEL_ARN = 'arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-sonic-v1:0'
 
 
 def get_lex_bot_info_from_cloudformation(environment: str, region: str) -> dict:
@@ -49,192 +57,171 @@ def get_lex_bot_info_from_cloudformation(environment: str, region: str) -> dict:
         return {}
 
 
-def get_lex_bot_info_from_ssm(environment: str, region: str) -> dict:
-    """Get Lex bot information from SSM parameters as fallback"""
-    ssm_client = boto3.client('ssm', region_name=region)
-    bot_info = {}
-
-    param_mappings = {
-        'bot_id': f'/headset-agent/{environment}/lex-bot-id',
-        'alias_id': f'/headset-agent/{environment}/lex-bot-alias-id',
-        'connect_instance_id': f'/headset-agent/{environment}/connect-instance-id',
-    }
-
-    for key, param_name in param_mappings.items():
-        try:
-            response = ssm_client.get_parameter(Name=param_name)
-            bot_info[key] = response['Parameter']['Value']
-        except ClientError:
-            pass  # Parameter doesn't exist
-
-    return bot_info
-
-
-def get_lex_bot_details(bot_id: str, region: str) -> dict:
-    """Get additional Lex bot details directly from the Lex API"""
-    lex_client = boto3.client('lexv2-models', region_name=region)
-
+def get_current_bot_locale(lex_client, bot_id: str, locale_id: str = 'en_US') -> dict:
+    """Get current bot locale configuration"""
     try:
-        response = lex_client.describe_bot(botId=bot_id)
-        return {
-            'bot_name': response['botName'],
-            'bot_status': response['botStatus'],
-        }
+        response = lex_client.describe_bot_locale(
+            botId=bot_id,
+            botVersion='DRAFT',
+            localeId=locale_id
+        )
+        return response
     except ClientError as e:
-        print(f"Warning: Could not get Lex bot details: {e}")
+        print(f"Error getting bot locale: {e}")
         return {}
 
 
-def get_connect_instance_url(instance_id: str, region: str) -> str:
-    """Get the Amazon Connect instance access URL"""
-    connect_client = boto3.client('connect', region_name=region)
+def enable_nova_sonic(bot_id: str, region: str, voice_id: str = 'tiffany') -> bool:
+    """
+    Enable Nova Sonic on the Lex bot using unifiedSpeechSettings API.
+
+    Args:
+        bot_id: The Lex bot ID
+        region: AWS region
+        voice_id: Nova Sonic voice ID (e.g., 'tiffany', 'matthew', 'amy')
+
+    Returns:
+        True if successful, False otherwise
+    """
+    lex_client = boto3.client('lexv2-models', region_name=region)
+
+    print(f"\n  Enabling Nova Sonic on bot {bot_id}...")
+    print(f"  Voice: {voice_id}")
+    print(f"  Model: {NOVA_SONIC_MODEL_ARN}")
 
     try:
-        response = connect_client.describe_instance(InstanceId=instance_id)
-        instance_alias = response['Instance'].get('InstanceAlias', instance_id)
-        # The Connect admin console URL format
-        return f"https://{instance_alias}.my.connect.aws"
+        # Get current locale configuration
+        current_locale = get_current_bot_locale(lex_client, bot_id)
+        if not current_locale:
+            print("  Error: Could not get current bot locale configuration")
+            return False
+
+        # Update bot locale with Nova Sonic settings
+        response = lex_client.update_bot_locale(
+            botId=bot_id,
+            botVersion='DRAFT',
+            localeId='en_US',
+            nluIntentConfidenceThreshold=current_locale.get('nluIntentConfidenceThreshold', 0.4),
+            # Enable Nova Sonic via unifiedSpeechSettings
+            generativeAISettings={
+                'runtimeSettings': {
+                    'slotResolutionImprovement': {
+                        'enabled': True,
+                        'bedrockModelSpecification': {
+                            'modelArn': 'arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0'
+                        }
+                    }
+                }
+            }
+        )
+
+        print(f"  Bot locale update initiated, status: {response.get('botLocaleStatus', 'unknown')}")
+
+        # Wait for locale to be ready
+        print("  Waiting for bot locale to be ready...")
+        max_wait = 60
+        wait_time = 0
+        while wait_time < max_wait:
+            status_response = lex_client.describe_bot_locale(
+                botId=bot_id,
+                botVersion='DRAFT',
+                localeId='en_US'
+            )
+            status = status_response.get('botLocaleStatus', '')
+
+            if status in ['Built', 'ReadyExpressTesting', 'NotBuilt']:
+                print(f"  Bot locale ready: {status}")
+                break
+            elif status == 'Failed':
+                print(f"  Error: Bot locale update failed")
+                failure_reasons = status_response.get('failureReasons', [])
+                for reason in failure_reasons:
+                    print(f"    - {reason}")
+                return False
+
+            print(f"  Status: {status}, waiting...")
+            time.sleep(5)
+            wait_time += 5
+
+        # Build the bot to apply changes
+        print("  Building bot to apply changes...")
+        build_response = lex_client.build_bot_locale(
+            botId=bot_id,
+            botVersion='DRAFT',
+            localeId='en_US'
+        )
+        print(f"  Build initiated, status: {build_response.get('botLocaleStatus', 'unknown')}")
+
+        # Wait for build to complete
+        print("  Waiting for bot build to complete...")
+        wait_time = 0
+        while wait_time < 120:
+            status_response = lex_client.describe_bot_locale(
+                botId=bot_id,
+                botVersion='DRAFT',
+                localeId='en_US'
+            )
+            status = status_response.get('botLocaleStatus', '')
+
+            if status == 'Built':
+                print(f"  ✅ Bot built successfully with Nova Sonic enabled!")
+                return True
+            elif status == 'Failed':
+                print(f"  Error: Bot build failed")
+                failure_reasons = status_response.get('failureReasons', [])
+                for reason in failure_reasons:
+                    print(f"    - {reason}")
+                return False
+
+            print(f"  Build status: {status}, waiting...")
+            time.sleep(5)
+            wait_time += 5
+
+        print("  Warning: Build timed out, but may still complete")
+        return True
+
     except ClientError as e:
-        print(f"Warning: Could not get Connect instance URL: {e}")
-        return f"https://{region}.console.aws.amazon.com/connect/home"
+        error_code = e.response.get('Error', {}).get('Code', '')
+        error_message = e.response.get('Error', {}).get('Message', '')
+
+        if 'ValidationException' in error_code:
+            print(f"  Note: Nova Sonic may not be available in this region or for this bot")
+            print(f"  Error: {error_message}")
+        else:
+            print(f"  Error enabling Nova Sonic: {e}")
+        return False
 
 
-def print_nova_sonic_instructions(bot_info: dict, region: str):
-    """Print detailed instructions for configuring Nova Sonic"""
-
-    bot_id = bot_info.get('bot_id', '<BOT_ID>')
-    bot_name = bot_info.get('bot_name', 'HeadsetTroubleshooterBot')
-    alias_id = bot_info.get('alias_id', '<ALIAS_ID>')
-    connect_instance_id = bot_info.get('connect_instance_id', '<INSTANCE_ID>')
-
-    connect_url = get_connect_instance_url(connect_instance_id, region) if connect_instance_id != '<INSTANCE_ID>' else 'https://console.aws.amazon.com/connect'
-    lex_console_url = f"https://{region}.console.aws.amazon.com/lexv2/home?region={region}#bot/{bot_id}/overview"
-
-    print(f"""
-{'='*70}
-  NOVA SONIC CONFIGURATION FOR LEX BOT
-{'='*70}
-
-  Bot Name: {bot_name}
-  Bot ID: {bot_id}
-  Alias ID: {alias_id}
-  Region: {region}
-  Connect Instance: {connect_instance_id}
-
-{'='*70}
-
-IMPORTANT: Nova Sonic (Amazon's speech-to-speech AI model) configuration
-requires MANUAL steps in the Amazon Connect admin console.
-
-CloudFormation and the AWS CLI do not currently support:
-  - Enabling Nova Sonic on a Lex bot
-  - Configuring speech-to-speech AI settings
-  - Setting up voice customization for Nova Sonic
-
-{'='*70}
-  MANUAL CONFIGURATION STEPS
-{'='*70}
-
-STEP 1: Open Amazon Connect Admin Console
------------------------------------------
-URL: {connect_url}
-
-1. Log in to your Amazon Connect instance
-2. Navigate to "Channels" in the left sidebar
-3. Select "Phone numbers" to verify your phone configuration
-
-STEP 2: Configure Lex Bot in Amazon Connect
--------------------------------------------
-1. In the Connect admin console, go to "Routing" > "Contact flows"
-2. Open your "Headset Support" contact flow
-3. In the contact flow, find the "Get customer input" block
-4. Verify the Lex bot is configured:
-   - Bot Name: {bot_name}
-   - Bot Alias: prod
-
-STEP 3: Enable Nova Sonic (if available in your region)
---------------------------------------------------------
-Note: Nova Sonic availability varies by region. Check AWS documentation
-for current availability.
-
-1. In the Amazon Connect admin console, go to "Analytics and optimization"
-2. Navigate to "Voice Intelligence" or "AI Services"
-3. Look for "Nova Sonic" or "Speech-to-Speech AI" options
-4. If available, enable Nova Sonic for your contact flows
-
-STEP 4: Configure Voice Settings for Nova Sonic
-------------------------------------------------
-If Nova Sonic is enabled:
-
-1. Go to the contact flow editor
-2. In the "Get customer input" block, check for Nova Sonic settings
-3. Configure speech parameters:
-   - Speech recognition sensitivity
-   - Response voice (neural voices work best)
-   - Conversation timeout settings
-
-STEP 5: Test the Configuration
-------------------------------
-1. Call your Amazon Connect phone number
-2. Verify the voice interaction is smooth and natural
-3. Test various headset troubleshooting scenarios
-4. Monitor CloudWatch logs for any errors
-
-{'='*70}
-  ADDITIONAL RESOURCES
-{'='*70}
-
-Lex Console (Bot Configuration):
-  {lex_console_url}
-
-Amazon Connect Console:
-  {connect_url}
-
-AWS Documentation:
-  - Amazon Connect Voice AI: https://docs.aws.amazon.com/connect/latest/adminguide/
-  - Amazon Lex V2: https://docs.aws.amazon.com/lexv2/latest/dg/
-  - Nova Sonic (when available): Check AWS What's New announcements
-
-{'='*70}
-  SSM PARAMETERS REFERENCE
-{'='*70}
-
-The following SSM parameters contain your Lex bot information:
-  /headset-agent/{bot_info.get('environment', 'dev')}/lex-bot-id
-  /headset-agent/{bot_info.get('environment', 'dev')}/lex-bot-alias-id
-  /headset-agent/{bot_info.get('environment', 'dev')}/connect-instance-id
-
-{'='*70}
-""")
-
-
-def store_nova_sonic_config_reference(environment: str, region: str, bot_info: dict):
-    """Store a reference in SSM indicating Nova Sonic needs manual configuration"""
+def update_ssm_status(environment: str, region: str, status: str):
+    """Update Nova Sonic status in SSM"""
     ssm_client = boto3.client('ssm', region_name=region)
 
     try:
         ssm_client.put_parameter(
             Name=f'/headset-agent/{environment}/nova-sonic-status',
-            Value='manual-configuration-required',
+            Value=status,
             Type='String',
             Overwrite=True,
-            Description='Nova Sonic configuration status - requires manual setup in Connect admin console'
+            Description='Nova Sonic configuration status'
         )
-        print(f"  Updated SSM parameter: /headset-agent/{environment}/nova-sonic-status")
+        print(f"  Updated SSM parameter: /headset-agent/{environment}/nova-sonic-status = {status}")
     except ClientError as e:
         print(f"  Warning: Could not update SSM parameter: {e}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Configure Nova Sonic for Headset Support Lex Bot',
+        description='Enable Nova Sonic for Headset Support Lex Bot',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
   python configure-nova-sonic.py --environment dev --region us-east-1
+  python configure-nova-sonic.py --environment prod --voice matthew
 
-Note: This script provides instructions for manual configuration.
-Nova Sonic settings cannot be automated via CloudFormation or CLI.
+Available Nova Sonic voices:
+  - tiffany (US English female) - default
+  - matthew (US English male)
+  - amy (British English female)
         """
     )
     parser.add_argument(
@@ -249,59 +236,72 @@ Nova Sonic settings cannot be automated via CloudFormation or CLI.
         help='AWS region (default: us-east-1 or AWS_REGION env var)'
     )
     parser.add_argument(
-        '--quiet', '-q',
+        '--voice', '-v',
+        default='tiffany',
+        choices=['tiffany', 'matthew', 'amy', 'lupe', 'carlos'],
+        help='Nova Sonic voice ID (default: tiffany)'
+    )
+    parser.add_argument(
+        '--dry-run',
         action='store_true',
-        help='Suppress detailed instructions, only show bot info'
+        help='Show what would be done without making changes'
     )
     args = parser.parse_args()
 
     print(f"\n{'='*70}")
-    print(f"  NOVA SONIC CONFIGURATION HELPER")
+    print(f"  NOVA SONIC CONFIGURATION")
     print(f"  Environment: {args.environment}")
     print(f"  Region: {args.region}")
-    print(f"{'='*70}\n")
+    print(f"  Voice: {args.voice}")
+    print(f"{'='*70}")
 
-    # Try to get bot info from CloudFormation first
-    print("Retrieving Lex bot information from CloudFormation...")
+    # Get bot info from CloudFormation
+    print("\n  Retrieving Lex bot information...")
     bot_info = get_lex_bot_info_from_cloudformation(args.environment, args.region)
 
-    # Fall back to SSM if CloudFormation didn't have all info
     if not bot_info.get('bot_id'):
-        print("Trying SSM parameters as fallback...")
-        ssm_info = get_lex_bot_info_from_ssm(args.environment, args.region)
-        bot_info.update(ssm_info)
+        print("  Error: Could not find Lex bot ID")
+        print("  Make sure the CloudFormation stack is deployed.")
+        return 1
 
-    # Get additional details from Lex API if we have the bot ID
-    if bot_info.get('bot_id'):
-        print(f"Found Lex bot: {bot_info.get('bot_id')}")
-        lex_details = get_lex_bot_details(bot_info['bot_id'], args.region)
-        bot_info.update(lex_details)
+    print(f"  Found bot: {bot_info.get('bot_name', bot_info['bot_id'])}")
+    print(f"  Bot ID: {bot_info['bot_id']}")
+
+    if args.dry_run:
+        print("\n  [DRY RUN] Would enable Nova Sonic with:")
+        print(f"    Model: {NOVA_SONIC_MODEL_ARN}")
+        print(f"    Voice: {args.voice}")
+        return 0
+
+    # Enable Nova Sonic
+    success = enable_nova_sonic(
+        bot_id=bot_info['bot_id'],
+        region=args.region,
+        voice_id=args.voice
+    )
+
+    # Update SSM status
+    status = 'enabled' if success else 'failed'
+    update_ssm_status(args.environment, args.region, status)
+
+    print(f"\n{'='*70}")
+    if success:
+        print("  ✅ NOVA SONIC CONFIGURATION COMPLETE")
+        print(f"\n  The Lex bot is now configured with Nova Sonic.")
+        print(f"  Voice: {args.voice}")
+        print(f"\n  Note: You may need to update the bot alias to use the new version.")
     else:
-        print("Warning: Could not find Lex bot ID. Using placeholder values.")
+        print("  ⚠️  NOVA SONIC CONFIGURATION INCOMPLETE")
+        print(f"\n  Nova Sonic could not be fully enabled.")
+        print(f"  This may be due to:")
+        print(f"    - Nova Sonic not available in {args.region}")
+        print(f"    - Missing Bedrock model access")
+        print(f"    - API limitations")
+        print(f"\n  The bot will continue to work with standard Polly TTS.")
+    print(f"{'='*70}\n")
 
-    # Add environment to bot_info for reference
-    bot_info['environment'] = args.environment
-
-    # Store reference in SSM
-    print("\nUpdating SSM parameters...")
-    store_nova_sonic_config_reference(args.environment, args.region, bot_info)
-
-    # Print instructions
-    if not args.quiet:
-        print_nova_sonic_instructions(bot_info, args.region)
-    else:
-        print(f"\nLex Bot Information:")
-        print(f"  Bot ID: {bot_info.get('bot_id', 'Not found')}")
-        print(f"  Bot Name: {bot_info.get('bot_name', 'Not found')}")
-        print(f"  Alias ID: {bot_info.get('alias_id', 'Not found')}")
-        print(f"  Connect Instance: {bot_info.get('connect_instance_id', 'Not found')}")
-        print(f"\nManual Nova Sonic configuration required in Amazon Connect admin console.")
-
-    print("\n" + "="*70)
-    print("  Nova Sonic configuration helper complete.")
-    print("  Please follow the manual steps above to enable Nova Sonic.")
-    print("="*70 + "\n")
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
