@@ -53,11 +53,11 @@ jobs:
           elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
             echo "environment=prod" >> $GITHUB_OUTPUT
             echo "deploy_lex=true" >> $GITHUB_OUTPUT
-            echo "deploy_nova_sonic=true" >> $GITHUB_OUTPUT
+            echo "deploy_nova_sonic=false" >> $GITHUB_OUTPUT
           else
             echo "environment=dev" >> $GITHUB_OUTPUT
             echo "deploy_lex=true" >> $GITHUB_OUTPUT
-            echo "deploy_nova_sonic=true" >> $GITHUB_OUTPUT
+            echo "deploy_nova_sonic=false" >> $GITHUB_OUTPUT
           fi
 
   validate:
