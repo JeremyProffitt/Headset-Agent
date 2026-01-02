@@ -71,7 +71,10 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("agent invocation timed out after 25 seconds: %w", err)
 		}
-		return nil, fmt.Errorf("failed to invoke agent: %w", err)
+		// Log detailed error for debugging
+		fmt.Printf("ERROR: Bedrock agent invocation failed: %v\n", err)
+		fmt.Printf("  AgentID: %s, AliasID: %s, SessionID: %s\n", input.AgentID, input.AgentAliasID, input.SessionID)
+		return nil, fmt.Errorf("failed to invoke agent (agentId=%s, aliasId=%s): %w", input.AgentID, input.AgentAliasID, err)
 	}
 
 	// Collect response from stream

@@ -124,6 +124,17 @@ class TestTroubleshootingFlow(HeadsetAPITestCase):
         self.assertEqual(result['status_code'], 200)
         content = result['body']['messages'][0]['content'].lower()
 
+        # Check for error responses - these indicate the Bedrock agent is not working
+        error_phrases = [
+            "trouble connecting",
+            "try that again",
+            "setting up right now",
+            "system is being configured"
+        ]
+        is_error_response = any(phrase in content for phrase in error_phrases)
+        self.assertFalse(is_error_response,
+            f"Response indicates agent error (Bedrock may not be configured): {content}")
+
         # Response should be relevant to troubleshooting - acknowledge issue and ask diagnostic question
         troubleshooting_keywords = ['check', 'connect', 'help', 'try', 'issue', 'problem',
                                    'sorry', 'hear', 'audio', 'volume', 'powered', 'muted',
@@ -165,6 +176,31 @@ class TestEscalation(HeadsetAPITestCase):
         escalation_keywords = ['transfer', 'connect', 'specialist', 'agent', 'someone']
         has_escalation = any(kw in content for kw in escalation_keywords)
         self.assertTrue(has_escalation, f"Response should indicate escalation: {content}")
+
+
+class TestBedrockAgent(HeadsetAPITestCase):
+    """Test Bedrock agent is working correctly"""
+
+    def test_agent_responds_to_query(self):
+        """Test that Bedrock agent responds with actual troubleshooting help"""
+        result = self.make_request("I can't hear anything through my headset")
+
+        self.assertEqual(result['status_code'], 200)
+        content = result['body']['messages'][0]['content'].lower()
+
+        # These error messages indicate Bedrock agent is not configured correctly
+        error_indicators = [
+            "trouble connecting",
+            "try that again",
+            "setting up right now",
+            "system is being configured",
+            "didn't get a response",
+            "didn't catch that"
+        ]
+
+        for indicator in error_indicators:
+            self.assertNotIn(indicator, content,
+                f"Agent returned error response. Check Bedrock model access. Response: {content[:200]}")
 
 
 class TestErrorHandling(HeadsetAPITestCase):
@@ -225,6 +261,7 @@ def run_integration_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestPersonaSwitching))
     suite.addTests(loader.loadTestsFromTestCase(TestTroubleshootingFlow))
     suite.addTests(loader.loadTestsFromTestCase(TestEscalation))
+    suite.addTests(loader.loadTestsFromTestCase(TestBedrockAgent))
     suite.addTests(loader.loadTestsFromTestCase(TestErrorHandling))
     suite.addTests(loader.loadTestsFromTestCase(TestCORS))
 
