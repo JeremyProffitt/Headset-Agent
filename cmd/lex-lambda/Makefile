@@ -1,6 +1,8 @@
-.PHONY: build
+.PHONY: build build-LexOrchestratorFunction
 
-build:
+build: build-LexOrchestratorFunction
+
+build-LexOrchestratorFunction:
 	@if [ -f bootstrap ]; then \
 		echo "Using pre-built bootstrap binary"; \
 		cp bootstrap $(ARTIFACTS_DIR)/bootstrap; \

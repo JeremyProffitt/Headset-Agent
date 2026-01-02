@@ -1,6 +1,8 @@
-.PHONY: build
+.PHONY: build build-NovaSonicFunction
 
-build:
+build: build-NovaSonicFunction
+
+build-NovaSonicFunction:
 	@if [ -f bootstrap ]; then \
 		echo "Using pre-built bootstrap binary"; \
 		cp bootstrap $(ARTIFACTS_DIR)/bootstrap; \
