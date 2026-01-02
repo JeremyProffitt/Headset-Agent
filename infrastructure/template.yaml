@@ -549,6 +549,10 @@ Resources:
   HeadsetBotVersion:
     Type: AWS::Lex::BotVersion
     Condition: DeployLex
+    DependsOn:
+      - HeadsetBot
+      - LexOrchestratorFunction
+      - LexInvocationPermission
     Properties:
       BotId: !Ref HeadsetBot
       BotVersionLocaleSpecification:
@@ -559,6 +563,10 @@ Resources:
   HeadsetBotAlias:
     Type: AWS::Lex::BotAlias
     Condition: DeployLex
+    DependsOn:
+      - HeadsetBotVersion
+      - LexOrchestratorFunction
+      - LexInvocationPermission
     Properties:
       BotId: !Ref HeadsetBot
       BotAliasName: !Sub "live-${Environment}"
@@ -704,9 +712,3 @@ Outputs:
     Description: Name of the Nova Sonic Lambda function (Path B)
     Value: !Ref NovaSonicFunction
 
-  NovaSonicFunctionUrlOutput:
-    Condition: DeployNovaSonic
-    Description: Function URL for Nova Sonic streaming
-    Value: !GetAtt NovaSonicFunctionUrl.FunctionUrl
-    Export:
-      Name: !Sub "${AWS::StackName}-NovaSonicFunctionUrl"
