@@ -1,0 +1,240 @@
+{
+  "Version": "2019-10-30",
+  "StartAction": "setLanguage",
+  "Metadata": {
+    "entryPointPosition": {"x": 40, "y": 40},
+    "ActionMetadata": {
+      "setLanguage": {"position": {"x": 120, "y": 40}},
+      "setVoice": {"position": {"x": 280, "y": 40}},
+      "welcomePrompt": {"position": {"x": 440, "y": 40}},
+      "personaMenu": {"position": {"x": 600, "y": 40}},
+      "setPersonaTangerine": {"position": {"x": 760, "y": 0}},
+      "setPersonaJoseph": {"position": {"x": 760, "y": 80}},
+      "setPersonaJennifer": {"position": {"x": 760, "y": 160}},
+      "invokeLambda": {"position": {"x": 920, "y": 80}},
+      "processResponse": {"position": {"x": 1080, "y": 80}},
+      "checkEscalation": {"position": {"x": 1240, "y": 80}},
+      "transferToAgent": {"position": {"x": 1400, "y": 40}},
+      "continueLoop": {"position": {"x": 1240, "y": 160}},
+      "goodbye": {"position": {"x": 1400, "y": 160}},
+      "error": {"position": {"x": 920, "y": 240}}
+    }
+  },
+  "Actions": [
+    {
+      "Identifier": "setLanguage",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "Attributes": {
+          "LanguageCode": "en-US",
+          "Path": "NovaSonic"
+        },
+        "TargetContact": "Current"
+      },
+      "Transitions": {
+        "NextAction": "setVoice",
+        "Errors": [{"NextAction": "setVoice", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "setVoice",
+      "Type": "UpdateContactTextToSpeechVoice",
+      "Parameters": {
+        "TextToSpeechVoice": "Joanna",
+        "TextToSpeechEngine": "Generative"
+      },
+      "Transitions": {
+        "NextAction": "welcomePrompt",
+        "Errors": [{"NextAction": "welcomePrompt", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "welcomePrompt",
+      "Type": "MessageParticipant",
+      "Parameters": {
+        "Text": "Welcome to Headset Support. This is the Nova Sonic path with advanced speech-to-speech capabilities."
+      },
+      "Transitions": {
+        "NextAction": "personaMenu",
+        "Errors": [{"NextAction": "personaMenu", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "personaMenu",
+      "Type": "GetParticipantInput",
+      "Parameters": {
+        "Text": "For a cheerful Irish assistant, press 1. For a calm, methodical assistant, press 2. For a fast-talking friendly assistant, press 3.",
+        "InputTimeLimitSeconds": "10",
+        "DTMFConfiguration": {
+          "InputTerminationSequence": "#",
+          "DisableCancelKey": false
+        }
+      },
+      "Transitions": {
+        "NextAction": "setPersonaTangerine",
+        "Errors": [{"NextAction": "setPersonaTangerine", "ErrorType": "NoMatchingError"}],
+        "Conditions": [
+          {
+            "NextAction": "setPersonaTangerine",
+            "Condition": {"Operator": "Equals", "Operands": ["1"]}
+          },
+          {
+            "NextAction": "setPersonaJoseph",
+            "Condition": {"Operator": "Equals", "Operands": ["2"]}
+          },
+          {
+            "NextAction": "setPersonaJennifer",
+            "Condition": {"Operator": "Equals", "Operands": ["3"]}
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "setPersonaTangerine",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "Attributes": {
+          "persona_id": "tangerine",
+          "nova_sonic_voice": "amy"
+        },
+        "TargetContact": "Current"
+      },
+      "Transitions": {
+        "NextAction": "invokeLambda",
+        "Errors": [{"NextAction": "invokeLambda", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "setPersonaJoseph",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "Attributes": {
+          "persona_id": "joseph",
+          "nova_sonic_voice": "matthew"
+        },
+        "TargetContact": "Current"
+      },
+      "Transitions": {
+        "NextAction": "invokeLambda",
+        "Errors": [{"NextAction": "invokeLambda", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "setPersonaJennifer",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "Attributes": {
+          "persona_id": "jennifer",
+          "nova_sonic_voice": "tiffany"
+        },
+        "TargetContact": "Current"
+      },
+      "Transitions": {
+        "NextAction": "invokeLambda",
+        "Errors": [{"NextAction": "invokeLambda", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "invokeLambda",
+      "Type": "InvokeLambdaFunction",
+      "Parameters": {
+        "LambdaFunctionARN": "${NOVA_SONIC_LAMBDA_ARN}",
+        "InvocationTimeLimitSeconds": "8",
+        "ResponseValidation": {
+          "ResponseType": "JSON"
+        }
+      },
+      "Transitions": {
+        "NextAction": "processResponse",
+        "Errors": [
+          {"NextAction": "error", "ErrorType": "NoMatchingError"}
+        ],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "processResponse",
+      "Type": "MessageParticipant",
+      "Parameters": {
+        "Text": "$.External.textOutput"
+      },
+      "Transitions": {
+        "NextAction": "checkEscalation",
+        "Errors": [{"NextAction": "checkEscalation", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "checkEscalation",
+      "Type": "CheckContactAttributes",
+      "Parameters": {
+        "Attribute": "$.Attributes.escalation_requested",
+        "Namespace": "External"
+      },
+      "Transitions": {
+        "NextAction": "continueLoop",
+        "Errors": [{"NextAction": "continueLoop", "ErrorType": "NoMatchingError"}],
+        "Conditions": [
+          {
+            "NextAction": "transferToAgent",
+            "Condition": {"Operator": "Equals", "Operands": ["true"]}
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "transferToAgent",
+      "Type": "TransferContactToQueue",
+      "Parameters": {},
+      "Transitions": {
+        "NextAction": "goodbye",
+        "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "continueLoop",
+      "Type": "GetParticipantInput",
+      "Parameters": {
+        "Text": "Is there anything else I can help you with?",
+        "InputTimeLimitSeconds": "30",
+        "DTMFConfiguration": {
+          "InputTerminationSequence": "#",
+          "DisableCancelKey": false
+        }
+      },
+      "Transitions": {
+        "NextAction": "invokeLambda",
+        "Errors": [
+          {"NextAction": "goodbye", "ErrorType": "InputTimeLimitExceeded"},
+          {"NextAction": "goodbye", "ErrorType": "NoMatchingError"}
+        ],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "error",
+      "Type": "MessageParticipant",
+      "Parameters": {
+        "Text": "I'm sorry, I encountered an error. Please try again later."
+      },
+      "Transitions": {
+        "NextAction": "goodbye",
+        "Errors": [],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "goodbye",
+      "Type": "DisconnectParticipant",
+      "Parameters": {},
+      "Transitions": {}
+    }
+  ]
+}

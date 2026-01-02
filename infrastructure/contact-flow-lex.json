@@ -1,0 +1,220 @@
+{
+  "Version": "2019-10-30",
+  "StartAction": "setLanguage",
+  "Metadata": {
+    "entryPointPosition": {"x": 40, "y": 40},
+    "ActionMetadata": {
+      "setLanguage": {"position": {"x": 120, "y": 40}},
+      "setVoice": {"position": {"x": 280, "y": 40}},
+      "welcomePrompt": {"position": {"x": 440, "y": 40}},
+      "personaMenu": {"position": {"x": 600, "y": 40}},
+      "setPersonaTangerine": {"position": {"x": 760, "y": 0}},
+      "setPersonaJoseph": {"position": {"x": 760, "y": 80}},
+      "setPersonaJennifer": {"position": {"x": 760, "y": 160}},
+      "lexBot": {"position": {"x": 920, "y": 80}},
+      "checkEscalation": {"position": {"x": 1080, "y": 80}},
+      "transferToAgent": {"position": {"x": 1240, "y": 40}},
+      "goodbye": {"position": {"x": 1240, "y": 160}},
+      "error": {"position": {"x": 920, "y": 240}},
+      "retry": {"position": {"x": 760, "y": 240}}
+    }
+  },
+  "Actions": [
+    {
+      "Identifier": "setLanguage",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "Attributes": {
+          "LanguageCode": "en-US",
+          "Path": "Lex"
+        },
+        "TargetContact": "Current"
+      },
+      "Transitions": {
+        "NextAction": "setVoice",
+        "Errors": [{"NextAction": "setVoice", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "setVoice",
+      "Type": "UpdateContactTextToSpeechVoice",
+      "Parameters": {
+        "TextToSpeechVoice": "Joanna",
+        "TextToSpeechEngine": "Neural"
+      },
+      "Transitions": {
+        "NextAction": "welcomePrompt",
+        "Errors": [{"NextAction": "welcomePrompt", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "welcomePrompt",
+      "Type": "MessageParticipant",
+      "Parameters": {
+        "Text": "Welcome to Headset Support. This is the Lex path."
+      },
+      "Transitions": {
+        "NextAction": "personaMenu",
+        "Errors": [{"NextAction": "personaMenu", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "personaMenu",
+      "Type": "GetParticipantInput",
+      "Parameters": {
+        "Text": "For a cheerful Irish assistant, press 1. For a calm, methodical assistant, press 2. For a fast-talking friendly assistant, press 3.",
+        "InputTimeLimitSeconds": "10",
+        "DTMFConfiguration": {
+          "InputTerminationSequence": "#",
+          "DisableCancelKey": false
+        }
+      },
+      "Transitions": {
+        "NextAction": "setPersonaTangerine",
+        "Errors": [{"NextAction": "setPersonaTangerine", "ErrorType": "NoMatchingError"}],
+        "Conditions": [
+          {
+            "NextAction": "setPersonaTangerine",
+            "Condition": {"Operator": "Equals", "Operands": ["1"]}
+          },
+          {
+            "NextAction": "setPersonaJoseph",
+            "Condition": {"Operator": "Equals", "Operands": ["2"]}
+          },
+          {
+            "NextAction": "setPersonaJennifer",
+            "Condition": {"Operator": "Equals", "Operands": ["3"]}
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "setPersonaTangerine",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "Attributes": {
+          "persona_id": "tangerine"
+        },
+        "TargetContact": "Current"
+      },
+      "Transitions": {
+        "NextAction": "lexBot",
+        "Errors": [{"NextAction": "lexBot", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "setPersonaJoseph",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "Attributes": {
+          "persona_id": "joseph"
+        },
+        "TargetContact": "Current"
+      },
+      "Transitions": {
+        "NextAction": "lexBot",
+        "Errors": [{"NextAction": "lexBot", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "setPersonaJennifer",
+      "Type": "UpdateContactAttributes",
+      "Parameters": {
+        "Attributes": {
+          "persona_id": "jennifer"
+        },
+        "TargetContact": "Current"
+      },
+      "Transitions": {
+        "NextAction": "lexBot",
+        "Errors": [{"NextAction": "lexBot", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "lexBot",
+      "Type": "ConnectParticipantWithLexBot",
+      "Parameters": {
+        "Text": "How can I help you with your headset today?",
+        "LexV2Bot": {
+          "AliasArn": "${LEX_BOT_ALIAS_ARN}"
+        },
+        "LexTimeoutSeconds": {
+          "Text": "300"
+        }
+      },
+      "Transitions": {
+        "NextAction": "checkEscalation",
+        "Errors": [
+          {"NextAction": "retry", "ErrorType": "NoMatchingError"},
+          {"NextAction": "retry", "ErrorType": "InputTimeLimitExceeded"},
+          {"NextAction": "retry", "ErrorType": "NoMatchingCondition"}
+        ],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "checkEscalation",
+      "Type": "CheckContactAttributes",
+      "Parameters": {
+        "Attribute": "$.Attributes.escalation_requested",
+        "Namespace": "External"
+      },
+      "Transitions": {
+        "NextAction": "goodbye",
+        "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
+        "Conditions": [
+          {
+            "NextAction": "transferToAgent",
+            "Condition": {"Operator": "Equals", "Operands": ["true"]}
+          }
+        ]
+      }
+    },
+    {
+      "Identifier": "transferToAgent",
+      "Type": "TransferContactToQueue",
+      "Parameters": {},
+      "Transitions": {
+        "NextAction": "goodbye",
+        "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "retry",
+      "Type": "MessageParticipant",
+      "Parameters": {
+        "Text": "I didn't catch that. Could you describe your issue again?"
+      },
+      "Transitions": {
+        "NextAction": "error",
+        "Errors": [],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "error",
+      "Type": "MessageParticipant",
+      "Parameters": {
+        "Text": "I'm sorry, I had trouble understanding. Thank you for calling."
+      },
+      "Transitions": {
+        "NextAction": "goodbye",
+        "Errors": [],
+        "Conditions": []
+      }
+    },
+    {
+      "Identifier": "goodbye",
+      "Type": "DisconnectParticipant",
+      "Parameters": {},
+      "Transitions": {}
+    }
+  ]
+}

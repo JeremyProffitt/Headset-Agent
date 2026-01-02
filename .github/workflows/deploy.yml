@@ -1,0 +1,439 @@
+name: Deploy Headset Agent (Dual Path)
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      deploy_lex_path:
+        description: 'Deploy Lex Path (A)'
+        type: boolean
+        default: true
+      deploy_nova_sonic_path:
+        description: 'Deploy Nova Sonic Path (B)'
+        type: boolean
+        default: true
+      skip_agents:
+        description: 'Skip Bedrock agent creation'
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  GO_VERSION: '1.23'
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  setup:
+    name: Setup Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      deploy_lex: ${{ steps.set-env.outputs.deploy_lex }}
+      deploy_nova_sonic: ${{ steps.set-env.outputs.deploy_nova_sonic }}
+    steps:
+      - name: Determine environment
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "deploy_lex=${{ github.event.inputs.deploy_lex_path }}" >> $GITHUB_OUTPUT
+            echo "deploy_nova_sonic=${{ github.event.inputs.deploy_nova_sonic_path }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "deploy_lex=true" >> $GITHUB_OUTPUT
+            echo "deploy_nova_sonic=true" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "deploy_lex=true" >> $GITHUB_OUTPUT
+            echo "deploy_nova_sonic=true" >> $GITHUB_OUTPUT
+          fi
+
+  validate:
+    name: Validate Configuration
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - name: Check required secrets
+        run: |
+          missing=""
+          [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && missing="$missing AWS_ACCESS_KEY_ID"
+          [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] && missing="$missing AWS_SECRET_ACCESS_KEY"
+          [ -z "${{ secrets.AWS_ACCOUNT_ID }}" ] && missing="$missing AWS_ACCOUNT_ID"
+
+          if [ -n "$missing" ]; then
+            echo "Missing required secrets:$missing"
+            exit 1
+          fi
+          echo "All required secrets are configured"
+
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    needs: [setup, validate]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Go dependencies
+        run: |
+          go mod download
+          go mod tidy
+
+      - name: Run Go tests
+        run: |
+          go test -v -race -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out
+
+      - name: Build Lex Lambda (Path A)
+        if: needs.setup.outputs.deploy_lex == 'true'
+        run: |
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
+            -ldflags="-s -w" \
+            -o cmd/lex-lambda/bootstrap \
+            ./cmd/lex-lambda/
+
+      - name: Build Nova Sonic Lambda (Path B)
+        if: needs.setup.outputs.deploy_nova_sonic == 'true'
+        run: |
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
+            -ldflags="-s -w" \
+            -o cmd/nova-sonic-lambda/bootstrap \
+            ./cmd/nova-sonic-lambda/
+
+      - name: Upload Lex Lambda artifact
+        if: needs.setup.outputs.deploy_lex == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lex-lambda-binary
+          path: cmd/lex-lambda/bootstrap
+
+      - name: Upload Nova Sonic Lambda artifact
+        if: needs.setup.outputs.deploy_nova_sonic == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nova-sonic-lambda-binary
+          path: cmd/nova-sonic-lambda/bootstrap
+
+  deploy-sam:
+    name: Deploy SAM Stack
+    runs-on: ubuntu-latest
+    needs: [setup, build]
+    environment: ${{ needs.setup.outputs.environment }}
+    outputs:
+      stack_outputs: ${{ steps.deploy.outputs.stack_outputs }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Lex Lambda artifact
+        if: needs.setup.outputs.deploy_lex == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: lex-lambda-binary
+          path: cmd/lex-lambda/
+
+      - name: Download Nova Sonic Lambda artifact
+        if: needs.setup.outputs.deploy_nova_sonic == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: nova-sonic-lambda-binary
+          path: cmd/nova-sonic-lambda/
+
+      - name: Make binaries executable
+        run: |
+          chmod +x cmd/lex-lambda/bootstrap 2>/dev/null || true
+          chmod +x cmd/nova-sonic-lambda/bootstrap 2>/dev/null || true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Create SAM S3 bucket
+        run: |
+          BUCKET_NAME="headset-agent-sam-${{ secrets.AWS_ACCOUNT_ID }}-${{ env.AWS_REGION }}"
+          aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null || \
+          aws s3 mb "s3://$BUCKET_NAME" --region ${{ env.AWS_REGION }}
+
+      - name: SAM Build
+        run: sam build --template infrastructure/template.yaml
+
+      - name: SAM Deploy
+        id: deploy
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          STACK_NAME="headset-agent-stack-${ENV}"
+
+          sam deploy \
+            --template-file .aws-sam/build/template.yaml \
+            --stack-name "$STACK_NAME" \
+            --s3-bucket "headset-agent-sam-${{ secrets.AWS_ACCOUNT_ID }}-${{ env.AWS_REGION }}" \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              Environment="$ENV" \
+              KBBucketName="headset-kb-${{ secrets.AWS_ACCOUNT_ID }}" \
+              DeployLexPath="${{ needs.setup.outputs.deploy_lex }}" \
+              DeployNovaSonicPath="${{ needs.setup.outputs.deploy_nova_sonic }}"
+
+          # Get stack outputs
+          OUTPUTS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query 'Stacks[0].Outputs' --output json)
+          echo "stack_outputs=$OUTPUTS" >> $GITHUB_OUTPUT
+
+  sync-knowledge-base:
+    name: Sync Knowledge Base
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sync KB documents to S3
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          BUCKET="headset-kb-${{ secrets.AWS_ACCOUNT_ID }}-${ENV}"
+
+          aws s3 sync knowledge-base/ "s3://${BUCKET}/" \
+            --exclude ".git/*" \
+            --exclude ".DS_Store" \
+            --delete
+
+  deploy-personas:
+    name: Deploy Personas
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy persona configurations
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          TABLE="PersonaConfigurations-${ENV}"
+
+          for persona_file in personas/*.json; do
+            echo "Deploying persona: $persona_file"
+            aws dynamodb put-item \
+              --table-name "$TABLE" \
+              --item file://"$persona_file"
+          done
+
+  create-agents:
+    name: Create Bedrock Agents
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam]
+    if: github.event.inputs.skip_agents != 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create Bedrock agents
+        run: |
+          python scripts/create-agents.py \
+            --environment "${{ needs.setup.outputs.environment }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --model-provider anthropic
+
+  configure-nova-sonic:
+    name: Configure Nova Sonic
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam, create-agents]
+    if: needs.setup.outputs.deploy_lex == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure Nova Sonic for Lex
+        run: |
+          python scripts/configure-nova-sonic.py \
+            --environment "${{ needs.setup.outputs.environment }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --persona tangerine \
+            --voice-engine generative
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam, deploy-personas, create-agents]
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test dependencies
+        run: pip install boto3 pytest
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run integration tests
+        run: |
+          export ENVIRONMENT="${{ needs.setup.outputs.environment }}"
+          pytest tests/integration/ -v --tb=short || true
+
+  validate-deployment:
+    name: Validate Deployment
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam, deploy-personas, create-agents, sync-knowledge-base]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate Lambda functions
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+
+          # Test Lex Lambda
+          if [ "${{ needs.setup.outputs.deploy_lex }}" == "true" ]; then
+            echo "Testing Lex Lambda..."
+            aws lambda invoke \
+              --function-name "headset-lex-orchestrator-${ENV}" \
+              --payload '{"sessionState":{"sessionAttributes":{"test":"true"}}}' \
+              --cli-binary-format raw-in-base64-out \
+              response.json || echo "Lex Lambda test failed"
+            cat response.json
+          fi
+
+          # Test Nova Sonic Lambda
+          if [ "${{ needs.setup.outputs.deploy_nova_sonic }}" == "true" ]; then
+            echo "Testing Nova Sonic Lambda..."
+            aws lambda invoke \
+              --function-name "headset-nova-sonic-${ENV}" \
+              --payload '{"action":"start","sessionId":"test-123"}' \
+              --cli-binary-format raw-in-base64-out \
+              response.json || echo "Nova Sonic Lambda test failed"
+            cat response.json
+          fi
+
+      - name: Validate SSM parameters
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+
+          # Check supervisor agent configuration
+          AGENT_ID=$(aws ssm get-parameter --name "/headset-agent/${ENV}/supervisor-agent-id" --query 'Parameter.Value' --output text 2>/dev/null || echo "PLACEHOLDER")
+
+          if [ "$AGENT_ID" == "PLACEHOLDER" ]; then
+            echo "WARNING: Supervisor agent not configured yet"
+          else
+            echo "Supervisor Agent ID: $AGENT_ID"
+          fi
+
+      - name: Deployment summary
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          STACK_NAME="headset-agent-stack-${ENV}"
+
+          echo "=== Deployment Complete ==="
+          echo "Environment: ${ENV}"
+          echo "Stack: ${STACK_NAME}"
+          echo ""
+          echo "Paths deployed:"
+          echo "  - Lex Path (A): ${{ needs.setup.outputs.deploy_lex }}"
+          echo "  - Nova Sonic Path (B): ${{ needs.setup.outputs.deploy_nova_sonic }}"
+          echo ""
+          echo "Next steps:"
+          echo "  1. Configure Amazon Connect instance"
+          echo "  2. Claim phone numbers for each path"
+          echo "  3. Deploy contact flows"
+          echo "  4. Test both paths"
+
+  notify-failure:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: [setup, build, deploy-sam, create-agents]
+    if: failure()
+    steps:
+      - name: Notify failure
+        run: |
+          echo "=== DEPLOYMENT FAILED ==="
+          echo "Environment: ${{ needs.setup.outputs.environment }}"
+          echo ""
+          echo "Claude Code Autonomous Recovery Protocol:"
+          echo "1. Check the failed job logs above"
+          echo "2. Identify the root cause"
+          echo "3. Use /fix-pipeline skill for automated remediation"
+          echo "4. Push fixes and re-run the pipeline"

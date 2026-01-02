@@ -1,0 +1,279 @@
+name: Destroy AWS Resources
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      confirmation:
+        description: 'Type DESTROY to confirm'
+        required: true
+        type: string
+      delete_sam_bucket:
+        description: 'Also delete SAM deployment bucket'
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  validate:
+    name: Validate Destruction Request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirmation }}" != "DESTROY" ]; then
+            echo "ERROR: You must type 'DESTROY' to confirm"
+            exit 1
+          fi
+
+          echo "WARNING: This will permanently delete all AWS resources for environment: ${{ github.event.inputs.environment }}"
+          echo "This action cannot be undone!"
+
+  delete-bedrock-agents:
+    name: Delete Bedrock Agents
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete Bedrock agents
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+
+          AGENTS="TroubleshootingOrchestrator DiagnosticAgent PlatformAgent EscalationAgent"
+
+          for AGENT_BASE in $AGENTS; do
+            AGENT_NAME="${AGENT_BASE}-${ENV}"
+            echo "Looking for agent: $AGENT_NAME"
+
+            AGENT_ID=$(aws bedrock-agent list-agents --query "agentSummaries[?agentName=='${AGENT_NAME}'].agentId" --output text 2>/dev/null || echo "")
+
+            if [ -n "$AGENT_ID" ] && [ "$AGENT_ID" != "None" ]; then
+              echo "Found agent $AGENT_NAME with ID: $AGENT_ID"
+
+              # Delete aliases first
+              ALIASES=$(aws bedrock-agent list-agent-aliases --agent-id "$AGENT_ID" --query 'agentAliasSummaries[].agentAliasId' --output text 2>/dev/null || echo "")
+              for ALIAS_ID in $ALIASES; do
+                if [ -n "$ALIAS_ID" ] && [ "$ALIAS_ID" != "None" ]; then
+                  echo "  Deleting alias: $ALIAS_ID"
+                  aws bedrock-agent delete-agent-alias --agent-id "$AGENT_ID" --agent-alias-id "$ALIAS_ID" || true
+                fi
+              done
+
+              # Delete the agent
+              echo "  Deleting agent: $AGENT_ID"
+              aws bedrock-agent delete-agent --agent-id "$AGENT_ID" --skip-resource-in-use-check || true
+            else
+              echo "Agent $AGENT_NAME not found"
+            fi
+          done
+
+  delete-connect:
+    name: Delete Connect Resources
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Release phone numbers
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+
+          # Get phone numbers from SSM
+          for PATH_TYPE in "lex" "nova-sonic"; do
+            PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-${PATH_TYPE}" --query 'Parameter.Value' --output text 2>/dev/null || echo "PLACEHOLDER")
+
+            if [ "$PHONE" != "PLACEHOLDER" ] && [ -n "$PHONE" ]; then
+              echo "Releasing phone number: $PHONE"
+              # Note: Actual release requires phone number ID, not the number itself
+              # This is a placeholder - actual implementation would need Connect API calls
+            fi
+          done
+
+  empty-s3-buckets:
+    name: Empty S3 Buckets
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Empty buckets
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+
+          BUCKETS=(
+            "headset-kb-${{ secrets.AWS_ACCOUNT_ID }}-${ENV}"
+            "headset-chat-${{ secrets.AWS_ACCOUNT_ID }}-${ENV}"
+          )
+
+          for BUCKET in "${BUCKETS[@]}"; do
+            echo "Emptying bucket: $BUCKET"
+
+            # Check if bucket exists
+            if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+              # Delete all objects including versions
+              aws s3 rm "s3://${BUCKET}" --recursive || true
+
+              # Delete versioned objects if versioning is enabled
+              aws s3api list-object-versions --bucket "$BUCKET" --query 'Versions[].{Key:Key,VersionId:VersionId}' --output text 2>/dev/null | while read KEY VERSION; do
+                if [ -n "$KEY" ] && [ -n "$VERSION" ]; then
+                  aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --version-id "$VERSION" || true
+                fi
+              done
+
+              # Delete delete markers
+              aws s3api list-object-versions --bucket "$BUCKET" --query 'DeleteMarkers[].{Key:Key,VersionId:VersionId}' --output text 2>/dev/null | while read KEY VERSION; do
+                if [ -n "$KEY" ] && [ -n "$VERSION" ]; then
+                  aws s3api delete-object --bucket "$BUCKET" --key "$KEY" --version-id "$VERSION" || true
+                fi
+              done
+            else
+              echo "Bucket $BUCKET does not exist"
+            fi
+          done
+
+  delete-cloudformation:
+    name: Delete CloudFormation Stack
+    runs-on: ubuntu-latest
+    needs: [delete-bedrock-agents, delete-connect, empty-s3-buckets]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete CloudFormation stack
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          STACK_NAME="headset-agent-stack-${ENV}"
+
+          echo "Deleting CloudFormation stack: $STACK_NAME"
+
+          # Check if stack exists
+          if aws cloudformation describe-stacks --stack-name "$STACK_NAME" 2>/dev/null; then
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+
+            echo "Waiting for stack deletion..."
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || {
+              echo "Stack deletion may have failed. Checking status..."
+              aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --query 'StackEvents[?ResourceStatus==`DELETE_FAILED`].[LogicalResourceId,ResourceStatusReason]' --output table || true
+            }
+          else
+            echo "Stack $STACK_NAME does not exist"
+          fi
+
+  cleanup-ssm:
+    name: Clean SSM Parameters
+    runs-on: ubuntu-latest
+    needs: delete-cloudformation
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete SSM parameters
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+
+          echo "Deleting SSM parameters for environment: $ENV"
+
+          # Get all parameters under the environment path
+          PARAMS=$(aws ssm get-parameters-by-path --path "/headset-agent/${ENV}/" --recursive --query 'Parameters[].Name' --output text 2>/dev/null || echo "")
+
+          for PARAM in $PARAMS; do
+            if [ -n "$PARAM" ]; then
+              echo "Deleting parameter: $PARAM"
+              aws ssm delete-parameter --name "$PARAM" || true
+            fi
+          done
+
+  delete-sam-bucket:
+    name: Delete SAM Bucket
+    runs-on: ubuntu-latest
+    needs: cleanup-ssm
+    if: github.event.inputs.delete_sam_bucket == 'true'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete SAM bucket
+        run: |
+          BUCKET="headset-agent-sam-${{ secrets.AWS_ACCOUNT_ID }}-${{ env.AWS_REGION }}"
+
+          if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Emptying and deleting SAM bucket: $BUCKET"
+            aws s3 rm "s3://${BUCKET}" --recursive || true
+            aws s3 rb "s3://${BUCKET}" --force || true
+          fi
+
+  summary:
+    name: Destruction Summary
+    runs-on: ubuntu-latest
+    needs: [delete-cloudformation, cleanup-ssm]
+    if: always()
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify cleanup
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+
+          echo "=== Destruction Summary ==="
+          echo "Environment: ${ENV}"
+          echo ""
+
+          # Check for remaining agents
+          REMAINING_AGENTS=$(aws bedrock-agent list-agents --query "agentSummaries[?contains(agentName, '${ENV}')].agentName" --output text 2>/dev/null || echo "")
+          if [ -n "$REMAINING_AGENTS" ]; then
+            echo "WARNING: Some agents may still exist: $REMAINING_AGENTS"
+          else
+            echo "All Bedrock agents deleted"
+          fi
+
+          # Check for stack
+          if aws cloudformation describe-stacks --stack-name "headset-agent-stack-${ENV}" 2>/dev/null; then
+            echo "WARNING: CloudFormation stack still exists"
+          else
+            echo "CloudFormation stack deleted"
+          fi
+
+          echo ""
+          echo "=== Cleanup Complete ==="

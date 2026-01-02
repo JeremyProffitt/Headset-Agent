@@ -1,0 +1,712 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Headset Support Agent - Voice-based troubleshooting with programmable personas (Dual Path - Lex + Nova Sonic)
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: provided.al2023
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        LOG_LEVEL: !Ref LogLevel
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  SupervisorAgentName:
+    Type: String
+    Default: TroubleshootingOrchestrator
+    Description: Name of the Bedrock supervisor agent
+
+  KBBucketName:
+    Type: String
+    Description: S3 bucket name for knowledge base documents
+
+  PersonaTableName:
+    Type: String
+    Default: PersonaConfigurations
+    Description: DynamoDB table name for persona configurations
+
+  LexBotName:
+    Type: String
+    Default: HeadsetTroubleshooterBot
+    Description: Name of the Lex V2 bot
+
+  BedrockModelSupervisor:
+    Type: String
+    Default: us.anthropic.claude-3-5-sonnet-20241022-v2:0
+    Description: Inference profile for supervisor agent
+
+  BedrockModelSubagent:
+    Type: String
+    Default: us.anthropic.claude-3-5-haiku-20241022-v1:0
+    Description: Inference profile for sub-agents (cost optimized)
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARN
+      - ERROR
+
+  DefaultPersona:
+    Type: String
+    Default: tangerine
+    AllowedValues:
+      - tangerine
+      - joseph
+      - jennifer
+
+  UseNovaSonic:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Enable Amazon Nova Sonic for voice streaming
+
+  DeployLexPath:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Deploy Path A (Lex-based voice)
+
+  DeployNovaSonicPath:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Deploy Path B (Nova Sonic streaming)
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  DeployLex: !Equals [!Ref DeployLexPath, 'true']
+  DeployNovaSonic: !Equals [!Ref DeployNovaSonicPath, 'true']
+
+Resources:
+  # =============================================================
+  # S3 BUCKET FOR KNOWLEDGE BASE
+  # =============================================================
+  KnowledgeBaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${KBBucketName}-${Environment}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  # =============================================================
+  # DYNAMODB TABLE FOR PERSONAS
+  # =============================================================
+  PersonaTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${PersonaTableName}-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: persona_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: persona_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  # =============================================================
+  # DYNAMODB TABLE FOR SESSION STATE
+  # =============================================================
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "HeadsetAgentSessions-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================
+  # LAMBDA FUNCTION - PATH A: LEX FULFILLMENT
+  # =============================================================
+  LexOrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Condition: DeployLex
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "headset-lex-orchestrator-${Environment}"
+      Handler: bootstrap
+      CodeUri: ../cmd/lex-lambda/
+      Description: Headset troubleshooting agent - Lex fulfillment handler (Path A)
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PERSONA_TABLE_NAME: !Ref PersonaTable
+          SESSION_TABLE_NAME: !Ref SessionTable
+          KB_BUCKET_NAME: !Ref KnowledgeBaseBucket
+          SUPERVISOR_AGENT_ID_PARAM: !Sub "/headset-agent/${Environment}/supervisor-agent-id"
+          SUPERVISOR_AGENT_ALIAS_PARAM: !Sub "/headset-agent/${Environment}/supervisor-agent-alias"
+          DEFAULT_PERSONA: !Ref DefaultPersona
+          BEDROCK_MODEL_SUPERVISOR: !Ref BedrockModelSupervisor
+          BEDROCK_MODEL_SUBAGENT: !Ref BedrockModelSubagent
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: BedrockFullAccess
+              Effect: Allow
+              Action:
+                - bedrock:InvokeAgent
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:RetrieveAndGenerate
+                - bedrock:Retrieve
+                - bedrock-agent-runtime:InvokeAgent
+                - bedrock-agent-runtime:RetrieveAndGenerate
+                - bedrock-agent-runtime:Retrieve
+              Resource: '*'
+            - Sid: DynamoDBAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+              Resource:
+                - !GetAtt PersonaTable.Arn
+                - !GetAtt SessionTable.Arn
+            - Sid: S3Access
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource:
+                - !GetAtt KnowledgeBaseBucket.Arn
+                - !Sub "${KnowledgeBaseBucket.Arn}/*"
+            - Sid: SSMAccess
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/headset-agent/${Environment}/*"
+            - Sid: PollyAccess
+              Effect: Allow
+              Action:
+                - polly:SynthesizeSpeech
+              Resource: '*'
+      Events:
+        ChatApiPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ChatApi
+            Path: /chat
+            Method: POST
+      Tags:
+        Environment: !Ref Environment
+        Project: HeadsetSupportAgent
+        Path: Lex
+
+  # Lambda permission for Lex
+  LexInvocationPermission:
+    Type: AWS::Lambda::Permission
+    Condition: DeployLex
+    Properties:
+      FunctionName: !Ref LexOrchestratorFunction
+      Action: lambda:InvokeFunction
+      Principal: lexv2.amazonaws.com
+      SourceArn: !Sub "arn:aws:lex:${AWS::Region}:${AWS::AccountId}:bot-alias/*"
+
+  # =============================================================
+  # LAMBDA FUNCTION - PATH B: NOVA SONIC STREAMING
+  # =============================================================
+  NovaSonicFunction:
+    Type: AWS::Serverless::Function
+    Condition: DeployNovaSonic
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "headset-nova-sonic-${Environment}"
+      Handler: bootstrap
+      CodeUri: ../cmd/nova-sonic-lambda/
+      Description: Headset troubleshooting agent - Nova Sonic streaming handler (Path B)
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PERSONA_TABLE_NAME: !Ref PersonaTable
+          SESSION_TABLE_NAME: !Ref SessionTable
+          KB_BUCKET_NAME: !Ref KnowledgeBaseBucket
+          SUPERVISOR_AGENT_ID_PARAM: !Sub "/headset-agent/${Environment}/supervisor-agent-id"
+          SUPERVISOR_AGENT_ALIAS_PARAM: !Sub "/headset-agent/${Environment}/supervisor-agent-alias"
+          DEFAULT_PERSONA: !Ref DefaultPersona
+          NOVA_SONIC_MODEL: amazon.nova-sonic-v1:0
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: BedrockFullAccess
+              Effect: Allow
+              Action:
+                - bedrock:InvokeAgent
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:InvokeModelWithBidirectionalStream
+                - bedrock:Converse
+                - bedrock:ConverseStream
+                - bedrock-agent-runtime:InvokeAgent
+              Resource: '*'
+            - Sid: NovaSonicAccess
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModelWithBidirectionalStream
+              Resource:
+                - "arn:aws:bedrock:*::foundation-model/amazon.nova-sonic*"
+            - Sid: DynamoDBAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+              Resource:
+                - !GetAtt PersonaTable.Arn
+                - !GetAtt SessionTable.Arn
+            - Sid: S3Access
+              Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource:
+                - !GetAtt KnowledgeBaseBucket.Arn
+                - !Sub "${KnowledgeBaseBucket.Arn}/*"
+            - Sid: SSMAccess
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/headset-agent/${Environment}/*"
+      FunctionUrlConfig:
+        AuthType: AWS_IAM
+        InvokeMode: RESPONSE_STREAM
+      Tags:
+        Environment: !Ref Environment
+        Project: HeadsetSupportAgent
+        Path: NovaSonic
+
+  # =============================================================
+  # IAM ROLE FOR BEDROCK AGENTS
+  # =============================================================
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "BedrockAgentRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: BedrockAgentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeModel
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:GetInferenceProfile
+                  - bedrock:ListInferenceProfiles
+                Resource: '*'
+              - Sid: CrossRegionInference
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*"
+                  - "arn:aws:bedrock:*::foundation-model/*"
+              - Sid: KnowledgeBase
+                Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: '*'
+              - Sid: S3KnowledgeBase
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt KnowledgeBaseBucket.Arn
+                  - !Sub "${KnowledgeBaseBucket.Arn}/*"
+              - Sid: NovaSonicAccess
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModelWithBidirectionalStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/amazon.nova-sonic*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =============================================================
+  # IAM ROLE FOR LEX BOT
+  # =============================================================
+  LexServiceRole:
+    Type: AWS::IAM::Role
+    Condition: DeployLex
+    Properties:
+      RoleName: !Sub "LexServiceRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lexv2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LexServicePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - polly:SynthesizeSpeech
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt LexOrchestratorFunction.Arn
+
+  # =============================================================
+  # CLOUDWATCH LOG GROUPS
+  # =============================================================
+  LexLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployLex
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/headset-lex-orchestrator-${Environment}"
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  NovaSonicLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployNovaSonic
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/headset-nova-sonic-${Environment}"
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # =============================================================
+  # API GATEWAY FOR WEB CHAT
+  # =============================================================
+  ChatApi:
+    Type: AWS::Serverless::HttpApi
+    Condition: DeployLex
+    Properties:
+      StageName: !Ref Environment
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - X-Session-Id
+          - X-Persona-Id
+
+  # =============================================================
+  # S3 BUCKET FOR STATIC WEBSITE
+  # =============================================================
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "headset-chat-${AWS::AccountId}-${Environment}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${WebsiteBucket.Arn}/*"
+
+  # =============================================================
+  # LEX V2 BOT FOR VOICE INTERFACE (PATH A)
+  # =============================================================
+  HeadsetBot:
+    Type: AWS::Lex::Bot
+    Condition: DeployLex
+    Properties:
+      Name: !Sub "${LexBotName}-${Environment}"
+      Description: Headset troubleshooting voice bot (Path A - Lex)
+      RoleArn: !GetAtt LexServiceRole.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300
+      AutoBuildBotLocales: true
+      BotLocales:
+        - LocaleId: en_US
+          NluConfidenceThreshold: 0.40
+          VoiceSettings:
+            VoiceId: Joanna
+            Engine: neural
+          Intents:
+            - Name: TroubleshootIntent
+              Description: Main troubleshooting intent
+              SampleUtterances:
+                - Utterance: "I need help with my headset"
+                - Utterance: "My headset isn't working"
+                - Utterance: "I have a problem"
+                - Utterance: "Help me fix my headset"
+                - Utterance: "Audio not working"
+                - Utterance: "Can't hear anything"
+                - Utterance: "Microphone not working"
+                - Utterance: "Bluetooth won't connect"
+                - Utterance: "How do I pair my headset"
+              FulfillmentCodeHook:
+                Enabled: true
+              DialogCodeHook:
+                Enabled: true
+            - Name: FallbackIntent
+              Description: Fallback intent
+              ParentIntentSignature: "AMAZON.FallbackIntent"
+              FulfillmentCodeHook:
+                Enabled: true
+              DialogCodeHook:
+                Enabled: true
+      BotTags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+        - Key: Path
+          Value: Lex
+
+  HeadsetBotVersion:
+    Type: AWS::Lex::BotVersion
+    Condition: DeployLex
+    Properties:
+      BotId: !Ref HeadsetBot
+      BotVersionLocaleSpecification:
+        - LocaleId: en_US
+          BotVersionLocaleDetails:
+            SourceBotVersion: DRAFT
+
+  HeadsetBotAlias:
+    Type: AWS::Lex::BotAlias
+    Condition: DeployLex
+    Properties:
+      BotId: !Ref HeadsetBot
+      BotAliasName: !Sub "live-${Environment}"
+      BotVersion: !GetAtt HeadsetBotVersion.BotVersion
+      BotAliasLocaleSettings:
+        - LocaleId: en_US
+          BotAliasLocaleSetting:
+            Enabled: true
+            CodeHookSpecification:
+              LambdaCodeHook:
+                CodeHookInterfaceVersion: "1.0"
+                LambdaArn: !GetAtt LexOrchestratorFunction.Arn
+      SentimentAnalysisSettings:
+        DetectSentiment: false
+
+  # =============================================================
+  # SSM PARAMETERS (Placeholders - Updated by agent creation script)
+  # =============================================================
+  SupervisorAgentIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/supervisor-agent-id"
+      Type: String
+      Value: "PLACEHOLDER"
+      Description: Bedrock Supervisor Agent ID (updated by create-agents script)
+
+  SupervisorAgentAliasParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/supervisor-agent-alias"
+      Type: String
+      Value: "PLACEHOLDER"
+      Description: Bedrock Supervisor Agent Alias (updated by create-agents script)
+
+  PhoneNumberLexParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/connect/phone-number-lex"
+      Type: String
+      Value: "PLACEHOLDER"
+      Description: Phone number for Lex path (Path A)
+
+  PhoneNumberNovaSonicParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/connect/phone-number-nova-sonic"
+      Type: String
+      Value: "PLACEHOLDER"
+      Description: Phone number for Nova Sonic path (Path B)
+
+Outputs:
+  # Shared Outputs
+  KnowledgeBaseBucketName:
+    Description: S3 bucket for knowledge base documents
+    Value: !Ref KnowledgeBaseBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-KBBucket"
+
+  PersonaTableName:
+    Description: DynamoDB table for persona configurations
+    Value: !Ref PersonaTable
+    Export:
+      Name: !Sub "${AWS::StackName}-PersonaTable"
+
+  SessionTableName:
+    Description: DynamoDB table for session state
+    Value: !Ref SessionTable
+
+  BedrockAgentRoleArn:
+    Description: IAM role ARN for Bedrock agents
+    Value: !GetAtt BedrockAgentRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BedrockAgentRole"
+
+  WebsiteUrl:
+    Description: Static website URL for chat interface
+    Value: !Sub "http://${WebsiteBucket}.s3-website-${AWS::Region}.amazonaws.com"
+    Export:
+      Name: !Sub "${AWS::StackName}-WebsiteUrl"
+
+  WebsiteBucketName:
+    Description: S3 bucket name for static website
+    Value: !Ref WebsiteBucket
+
+  # Path A (Lex) Outputs
+  LexLambdaFunctionArn:
+    Condition: DeployLex
+    Description: ARN of the Lex Lambda function (Path A)
+    Value: !GetAtt LexOrchestratorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LexLambdaArn"
+
+  LexLambdaFunctionName:
+    Condition: DeployLex
+    Description: Name of the Lex Lambda function (Path A)
+    Value: !Ref LexOrchestratorFunction
+
+  LexServiceRoleArn:
+    Condition: DeployLex
+    Description: IAM role ARN for Lex bot
+    Value: !GetAtt LexServiceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LexServiceRole"
+
+  ChatApiUrl:
+    Condition: DeployLex
+    Description: API Gateway URL for chat endpoint
+    Value: !Sub "https://${ChatApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/chat"
+    Export:
+      Name: !Sub "${AWS::StackName}-ChatApiUrl"
+
+  LexBotId:
+    Condition: DeployLex
+    Description: Lex V2 Bot ID
+    Value: !Ref HeadsetBot
+    Export:
+      Name: !Sub "${AWS::StackName}-LexBotId"
+
+  LexBotAliasId:
+    Condition: DeployLex
+    Description: Lex V2 Bot Alias ID
+    Value: !GetAtt HeadsetBotAlias.BotAliasId
+    Export:
+      Name: !Sub "${AWS::StackName}-LexBotAliasId"
+
+  LexBotAliasArn:
+    Condition: DeployLex
+    Description: Lex V2 Bot Alias ARN
+    Value: !GetAtt HeadsetBotAlias.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LexBotAliasArn"
+
+  # Path B (Nova Sonic) Outputs
+  NovaSonicLambdaFunctionArn:
+    Condition: DeployNovaSonic
+    Description: ARN of the Nova Sonic Lambda function (Path B)
+    Value: !GetAtt NovaSonicFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-NovaSonicLambdaArn"
+
+  NovaSonicLambdaFunctionName:
+    Condition: DeployNovaSonic
+    Description: Name of the Nova Sonic Lambda function (Path B)
+    Value: !Ref NovaSonicFunction
+
+  NovaSonicFunctionUrl:
+    Condition: DeployNovaSonic
+    Description: Function URL for Nova Sonic streaming
+    Value: !GetAtt NovaSonicFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub "${AWS::StackName}-NovaSonicFunctionUrl"
