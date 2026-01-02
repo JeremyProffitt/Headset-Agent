@@ -704,9 +704,9 @@ Outputs:
     Description: Name of the Nova Sonic Lambda function (Path B)
     Value: !Ref NovaSonicFunction
 
-  NovaSonicFunctionUrl:
+  NovaSonicFunctionUrlOutput:
     Condition: DeployNovaSonic
     Description: Function URL for Nova Sonic streaming
-    Value: !GetAtt NovaSonicFunction.FunctionUrl
+    Value: !GetAtt NovaSonicFunctionUrl.FunctionUrl
     Export:
       Name: !Sub "${AWS::StackName}-NovaSonicFunctionUrl"
