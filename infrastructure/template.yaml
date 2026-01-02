@@ -69,6 +69,14 @@ Parameters:
       - joseph
       - jennifer
 
+  UseNovaSonic:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Enable Amazon Nova Sonic for voice streaming
+
 Conditions:
   IsProd: !Equals [!Ref Environment, prod]
 
@@ -207,6 +215,12 @@ Resources:
               Action:
                 - polly:SynthesizeSpeech
               Resource: '*'
+            - Sid: NovaSonicAccess
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModelWithBidirectionalStream
+              Resource:
+                - "arn:aws:bedrock:*::foundation-model/amazon.nova-sonic*"
       Events:
         ChatApiPost:
           Type: HttpApi
@@ -285,6 +299,12 @@ Resources:
                   - lambda:InvokeFunction
                 Resource:
                   - !GetAtt TroubleshootingFunction.Arn
+              - Sid: NovaSonicAccess
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModelWithBidirectionalStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/amazon.nova-sonic*"
       Tags:
         - Key: Environment
           Value: !Ref Environment
