@@ -27,6 +27,8 @@ jobs:
   validate:
     name: Validate Destruction Request
     runs-on: ubuntu-latest
+    outputs:
+      aws_account_id: ${{ steps.get-account.outputs.account_id }}
     steps:
       - name: Verify confirmation
         run: |
@@ -37,6 +39,20 @@ jobs:
 
           echo "WARNING: This will permanently delete all AWS resources for environment: ${{ github.event.inputs.environment }}"
           echo "This action cannot be undone!"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get AWS Account ID
+        id: get-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "AWS Account ID: $ACCOUNT_ID"
 
   delete-bedrock-agents:
     name: Delete Bedrock Agents
@@ -126,8 +142,8 @@ jobs:
           ENV="${{ github.event.inputs.environment }}"
 
           BUCKETS=(
-            "headset-kb-${{ secrets.AWS_ACCOUNT_ID }}-${ENV}"
-            "headset-chat-${{ secrets.AWS_ACCOUNT_ID }}-${ENV}"
+            "headset-kb-${{ needs.validate.outputs.aws_account_id }}-${ENV}"
+            "headset-chat-${{ needs.validate.outputs.aws_account_id }}-${ENV}"
           )
 
           for BUCKET in "${BUCKETS[@]}"; do
@@ -231,7 +247,7 @@ jobs:
 
       - name: Delete SAM bucket
         run: |
-          BUCKET="headset-agent-sam-${{ secrets.AWS_ACCOUNT_ID }}-${{ env.AWS_REGION }}"
+          BUCKET="headset-agent-sam-${{ needs.validate.outputs.aws_account_id }}-${{ env.AWS_REGION }}"
 
           if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
             echo "Emptying and deleting SAM bucket: $BUCKET"
