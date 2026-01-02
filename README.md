@@ -12,22 +12,14 @@ Voice-based headset troubleshooting agent using AWS multi-agent architecture wit
 | **Amazon Connect** | Configured | Phone number active |
 | **Nova Sonic** | Enabled | Speech-to-speech configured |
 | **Bedrock Agents** | Created | Supervisor + 3 sub-agents |
-| **Bedrock Invocation** | Not Working | Agent returns error response |
+| **Bedrock Invocation** | Working | Meta Llama 3.3 responding |
 | **Knowledge Bases** | Not Integrated | KB not associated with agents |
 
-### Known Issues
+### Remaining Issues
 
-1. **Bedrock Agent Not Responding**: The Lambda function connects to Bedrock but receives errors. The API returns: `"I'm having a bit of trouble connecting. Let me try that again."`
+1. **Multi-Agent Collaboration Not Configured**: The `create-agents.py` script creates agents but does not call `associate_agent_collaborator()` to link sub-agents to the supervisor. Currently the supervisor agent handles all requests directly.
 
-   **Root Cause**: Meta Llama model access likely not enabled in Bedrock console.
-
-   **Fix**: Go to AWS Console > Bedrock > Model access and request access to:
-   - `Meta Llama 3.3 70B Instruct` (supervisor model)
-   - `Meta Llama 3.2 11B Instruct` (sub-agent model)
-
-2. **Multi-Agent Collaboration Not Configured**: The `create-agents.py` script creates agents but does not call `associate_agent_collaborator()` to link sub-agents to the supervisor.
-
-3. **Knowledge Bases Not Associated**: Knowledge base documents are synced to S3 but not associated with Bedrock agents.
+2. **Knowledge Bases Not Associated**: Knowledge base documents are synced to S3 but not associated with Bedrock agents.
 
 ### Agent Configuration
 
