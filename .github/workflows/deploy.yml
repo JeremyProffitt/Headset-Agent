@@ -362,10 +362,40 @@ jobs:
           export ENVIRONMENT="${{ needs.setup.outputs.environment }}"
           pytest tests/integration/ -v --tb=short || true
 
+  setup-connect:
+    name: Setup Amazon Connect
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-sam, create-agents]
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Connect resources
+        run: |
+          python scripts/setup-connect.py \
+            --environment "${{ needs.setup.outputs.environment }}" \
+            --region "${{ env.AWS_REGION }}"
+
   validate-deployment:
     name: Validate Deployment
     runs-on: ubuntu-latest
-    needs: [setup, deploy-sam, deploy-personas, create-agents, sync-knowledge-base]
+    needs: [setup, deploy-sam, deploy-personas, create-agents, sync-knowledge-base, setup-connect]
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -426,11 +456,11 @@ jobs:
           echo "  - Lex Path (A): ${{ needs.setup.outputs.deploy_lex }}"
           echo "  - Nova Sonic Path (B): ${{ needs.setup.outputs.deploy_nova_sonic }}"
           echo ""
-          echo "Next steps:"
-          echo "  1. Configure Amazon Connect instance"
-          echo "  2. Claim phone numbers for each path"
-          echo "  3. Deploy contact flows"
-          echo "  4. Test both paths"
+          echo "Connect Status:"
+          LEX_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-lex" --query 'Parameter.Value' --output text 2>/dev/null || echo "Not configured")
+          NOVA_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-nova-sonic" --query 'Parameter.Value' --output text 2>/dev/null || echo "Not configured")
+          echo "  - Lex Phone: ${LEX_PHONE}"
+          echo "  - Nova Sonic Phone: ${NOVA_PHONE}"
 
   notify-failure:
     name: Notify on Failure
