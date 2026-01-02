@@ -11,7 +11,10 @@
           "rate": {"S": "110%"},
           "pitch": {"S": "+5%"}
         }
-      }
+      },
+      "use_nova_sonic": {"BOOL": true},
+      "nova_sonic_voice_id": {"S": "amy"},
+      "fallback_polly_voice_id": {"S": "Niamh"}
     }
   },
   "personality": {

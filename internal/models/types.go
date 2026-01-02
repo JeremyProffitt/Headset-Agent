@@ -11,12 +11,15 @@ type Persona struct {
 	FillerPhrases []string  `json:"filler_phrases" dynamodbav:"filler_phrases"`
 }
 
-// VoiceConfig contains Amazon Polly voice settings
+// VoiceConfig contains Amazon Polly and Nova Sonic voice settings
 type VoiceConfig struct {
-	PollyVoiceID string  `json:"polly_voice_id" dynamodbav:"polly_voice_id"`
-	PollyEngine  string  `json:"polly_engine" dynamodbav:"polly_engine"`
-	LanguageCode string  `json:"language_code" dynamodbav:"language_code"`
-	Prosody      Prosody `json:"prosody" dynamodbav:"prosody"`
+	PollyVoiceID       string  `json:"polly_voice_id" dynamodbav:"polly_voice_id"`
+	PollyEngine        string  `json:"polly_engine" dynamodbav:"polly_engine"`
+	LanguageCode       string  `json:"language_code" dynamodbav:"language_code"`
+	Prosody            Prosody `json:"prosody" dynamodbav:"prosody"`
+	UseNovaSonic       bool    `json:"use_nova_sonic" dynamodbav:"use_nova_sonic"`
+	NovaSonicVoiceID   string  `json:"nova_sonic_voice_id,omitempty" dynamodbav:"nova_sonic_voice_id,omitempty"`
+	FallbackPollyVoiceID string `json:"fallback_polly_voice_id,omitempty" dynamodbav:"fallback_polly_voice_id,omitempty"`
 }
 
 // Prosody contains speech rate and pitch settings

@@ -11,7 +11,10 @@
           "rate": {"S": "115%"},
           "pitch": {"S": "medium"}
         }
-      }
+      },
+      "use_nova_sonic": {"BOOL": true},
+      "nova_sonic_voice_id": {"S": "joanna"},
+      "fallback_polly_voice_id": {"S": "Joanna"}
     }
   },
   "personality": {
