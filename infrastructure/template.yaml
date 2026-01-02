@@ -707,6 +707,6 @@ Outputs:
   NovaSonicFunctionUrl:
     Condition: DeployNovaSonic
     Description: Function URL for Nova Sonic streaming
-    Value: !GetAtt NovaSonicFunctionUrl.FunctionUrl
+    Value: !GetAtt NovaSonicFunction.FunctionUrl
     Export:
       Name: !Sub "${AWS::StackName}-NovaSonicFunctionUrl"
