@@ -645,58 +645,74 @@ Resources:
       Content: !Sub |
         {
           "Version": "2019-10-30",
-          "StartAction": "Welcome",
+          "StartAction": "a1b2c3d4-1234-5678-9abc-def012345678",
           "Actions": [
             {
-              "Identifier": "Welcome",
+              "Identifier": "a1b2c3d4-1234-5678-9abc-def012345678",
               "Type": "MessageParticipant",
               "Parameters": {
                 "Text": "Welcome to Headset Support. I'll connect you with our troubleshooting assistant."
               },
               "Transitions": {
-                "NextAction": "GetLexBot"
+                "NextAction": "b2c3d4e5-2345-6789-abcd-ef0123456789",
+                "Errors": [],
+                "Conditions": []
               }
             },
             {
-              "Identifier": "GetLexBot",
+              "Identifier": "b2c3d4e5-2345-6789-abcd-ef0123456789",
               "Type": "ConnectParticipantWithLexBot",
               "Parameters": {
-                "LexBot": {
+                "Text": "How can I help you with your headset today?",
+                "LexV2Bot": {
                   "AliasArn": "${HeadsetBotAlias.Arn}"
                 }
               },
               "Transitions": {
-                "NextAction": "Goodbye",
+                "NextAction": "c3d4e5f6-3456-789a-bcde-f01234567890",
                 "Errors": [
                   {
-                    "NextAction": "Error",
+                    "NextAction": "d4e5f6a7-4567-89ab-cdef-012345678901",
                     "ErrorType": "NoMatchingError"
+                  },
+                  {
+                    "NextAction": "d4e5f6a7-4567-89ab-cdef-012345678901",
+                    "ErrorType": "NoMatchingCondition"
+                  },
+                  {
+                    "NextAction": "d4e5f6a7-4567-89ab-cdef-012345678901",
+                    "ErrorType": "InputTimeLimitExceeded"
                   }
-                ]
+                ],
+                "Conditions": []
               }
             },
             {
-              "Identifier": "Goodbye",
+              "Identifier": "c3d4e5f6-3456-789a-bcde-f01234567890",
               "Type": "MessageParticipant",
               "Parameters": {
                 "Text": "Thank you for contacting Headset Support. Goodbye!"
               },
               "Transitions": {
-                "NextAction": "Disconnect"
+                "NextAction": "e5f6a7b8-5678-9abc-def0-123456789012",
+                "Errors": [],
+                "Conditions": []
               }
             },
             {
-              "Identifier": "Error",
+              "Identifier": "d4e5f6a7-4567-89ab-cdef-012345678901",
               "Type": "MessageParticipant",
               "Parameters": {
                 "Text": "I'm sorry, we're experiencing technical difficulties. Please try again later."
               },
               "Transitions": {
-                "NextAction": "Disconnect"
+                "NextAction": "e5f6a7b8-5678-9abc-def0-123456789012",
+                "Errors": [],
+                "Conditions": []
               }
             },
             {
-              "Identifier": "Disconnect",
+              "Identifier": "e5f6a7b8-5678-9abc-def0-123456789012",
               "Type": "DisconnectParticipant",
               "Parameters": {},
               "Transitions": {}
@@ -723,57 +739,64 @@ Resources:
       Content: !Sub |
         {
           "Version": "2019-10-30",
-          "StartAction": "Welcome",
+          "StartAction": "f1a2b3c4-6789-0abc-def1-234567890abc",
           "Actions": [
             {
-              "Identifier": "Welcome",
+              "Identifier": "f1a2b3c4-6789-0abc-def1-234567890abc",
               "Type": "MessageParticipant",
               "Parameters": {
                 "Text": "Welcome to Headset Support with Nova Sonic voice."
               },
               "Transitions": {
-                "NextAction": "InvokeLambda"
+                "NextAction": "a2b3c4d5-7890-1bcd-ef12-345678901bcd",
+                "Errors": [],
+                "Conditions": []
               }
             },
             {
-              "Identifier": "InvokeLambda",
+              "Identifier": "a2b3c4d5-7890-1bcd-ef12-345678901bcd",
               "Type": "InvokeLambdaFunction",
               "Parameters": {
                 "LambdaFunctionARN": "${NovaSonicFunction.Arn}",
                 "InvocationTimeLimitSeconds": "8"
               },
               "Transitions": {
-                "NextAction": "Goodbye",
+                "NextAction": "b3c4d5e6-8901-2cde-f123-456789012cde",
                 "Errors": [
                   {
-                    "NextAction": "Error",
+                    "NextAction": "c4d5e6f7-9012-3def-0123-567890123def",
                     "ErrorType": "NoMatchingError"
                   }
-                ]
+                ],
+                "Conditions": []
               }
             },
             {
-              "Identifier": "Goodbye",
+              "Identifier": "b3c4d5e6-8901-2cde-f123-456789012cde",
               "Type": "MessageParticipant",
               "Parameters": {
                 "Text": "Thank you for using Nova Sonic Support. Goodbye!"
               },
               "Transitions": {
-                "NextAction": "Disconnect"
+                "NextAction": "d5e6f7a8-0123-4ef0-1234-678901234ef0",
+                "Errors": [],
+                "Conditions": []
               }
             },
             {
-              "Identifier": "Error",
+              "Identifier": "c4d5e6f7-9012-3def-0123-567890123def",
               "Type": "MessageParticipant",
               "Parameters": {
                 "Text": "I'm sorry, we're experiencing technical difficulties. Please try again later."
               },
               "Transitions": {
-                "NextAction": "Disconnect"
+                "NextAction": "d5e6f7a8-0123-4ef0-1234-678901234ef0",
+                "Errors": [],
+                "Conditions": []
               }
             },
             {
-              "Identifier": "Disconnect",
+              "Identifier": "d5e6f7a8-0123-4ef0-1234-678901234ef0",
               "Type": "DisconnectParticipant",
               "Parameters": {},
               "Transitions": {}
