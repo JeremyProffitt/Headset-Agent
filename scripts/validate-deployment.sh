@@ -72,8 +72,10 @@ AGENT_ID=$(aws ssm get-parameter \
     --region "$REGION" 2>/dev/null || echo "NOT_SET")
 
 if [ "$AGENT_ID" = "PLACEHOLDER" ] || [ "$AGENT_ID" = "NOT_SET" ]; then
-    echo "  WARNING: Supervisor agent ID not configured"
+    echo "  ERROR: Supervisor agent ID not configured (value: $AGENT_ID)"
+    echo "  The create-agents job must complete successfully before validation."
     echo "  Run: python scripts/create-agents.py --environment $ENVIRONMENT"
+    exit 1
 else
     echo "  Supervisor Agent ID: $AGENT_ID"
 fi
