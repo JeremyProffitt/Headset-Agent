@@ -371,8 +371,18 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 		Persona:      p,
 	})
 	if err != nil {
-		log.Printf("Error invoking Bedrock agent: %v", err)
+		log.Printf("Error invoking Bedrock agent (sessionId=%s): %v", event.SessionID, err)
 		return handlers.BuildErrorResponse(p, "I'm having a bit of trouble connecting. Let me try that again."), nil
+	}
+
+	// Validate response to prevent silent failures
+	if response == nil {
+		log.Printf("Nil response from Bedrock agent (sessionId=%s)", event.SessionID)
+		return handlers.BuildErrorResponse(p, "I didn't get a response. Let me try that again for you."), nil
+	}
+	if response.OutputText == "" {
+		log.Printf("Empty OutputText from Bedrock agent (sessionId=%s)", event.SessionID)
+		return handlers.BuildErrorResponse(p, "I'm sorry, I didn't catch that. Could you please rephrase your question?"), nil
 	}
 
 	return handlers.BuildSuccessResponse(p, response.OutputText, event.SessionState.SessionAttributes), nil

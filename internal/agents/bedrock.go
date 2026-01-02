@@ -2,9 +2,11 @@ package agents
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockagentruntime"
@@ -35,6 +37,10 @@ type InvokeAgentInput struct {
 
 // InvokeAgent invokes the Bedrock supervisor agent with persona context
 func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput) (*models.AgentResponse, error) {
+	// Set timeout of 25 seconds to leave buffer for Lambda's 30s timeout
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+
 	// Build session attributes with persona context
 	sessionAttrs := map[string]string{
 		"persona_id":   input.Persona.PersonaID,
@@ -62,6 +68,9 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 
 	output, err := c.client.InvokeAgent(ctx, invokeInput)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("agent invocation timed out after 25 seconds: %w", err)
+		}
 		return nil, fmt.Errorf("failed to invoke agent: %w", err)
 	}
 
@@ -70,6 +79,13 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 	stream := output.GetStream()
 
 	for event := range stream.Events() {
+		// Check for context timeout during stream processing
+		if ctx.Err() != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return nil, fmt.Errorf("agent response stream timed out: %w", ctx.Err())
+			}
+			return nil, fmt.Errorf("context cancelled during stream processing: %w", ctx.Err())
+		}
 		switch v := event.(type) {
 		case *types.ResponseStreamMemberChunk:
 			responseText.Write(v.Value.Bytes)
@@ -85,6 +101,11 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 
 	if err := stream.Close(); err != nil {
 		return nil, fmt.Errorf("error closing stream: %w", err)
+	}
+
+	// Validate that we received a non-empty response
+	if cleanedResponse == "" {
+		return nil, fmt.Errorf("empty response received from agent (sessionId=%s): no chunks were returned", input.SessionID)
 	}
 
 	return &models.AgentResponse{

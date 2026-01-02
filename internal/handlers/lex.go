@@ -99,6 +99,10 @@ func BuildTestResponse() LexV2Response {
 
 // BuildSSML wraps text in SSML with persona voice settings
 func BuildSSML(p *models.Persona, text string) string {
+	// Validate input text - use fallback if empty to prevent silent failures
+	if text == "" {
+		text = "I'm sorry, I didn't catch that. Could you please repeat your question?"
+	}
 	// Use simple SSML without amazon:domain to ensure compatibility with Lex
 	return fmt.Sprintf(`<speak><prosody rate="%s" pitch="%s">%s</prosody></speak>`,
 		p.VoiceConfig.Prosody.Rate, p.VoiceConfig.Prosody.Pitch, text)
