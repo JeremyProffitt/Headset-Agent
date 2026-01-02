@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"fmt"
+	"html"
+	"strings"
 
 	"github.com/headset-support-agent/internal/models"
 )
@@ -103,9 +105,19 @@ func BuildSSML(p *models.Persona, text string) string {
 	if text == "" {
 		text = "I'm sorry, I didn't catch that. Could you please repeat your question?"
 	}
+
+	// Escape special XML characters to prevent SSML parsing errors
+	// This is critical - if Bedrock returns <, >, &, ", or ', the SSML would be malformed
+	escapedText := html.EscapeString(text)
+
+	// Remove any existing SSML tags that might have been included in the response
+	// Some models include their own <speak> tags which would break our wrapper
+	escapedText = strings.ReplaceAll(escapedText, "&lt;speak&gt;", "")
+	escapedText = strings.ReplaceAll(escapedText, "&lt;/speak&gt;", "")
+
 	// Use simple SSML without amazon:domain to ensure compatibility with Lex
 	return fmt.Sprintf(`<speak><prosody rate="%s" pitch="%s">%s</prosody></speak>`,
-		p.VoiceConfig.Prosody.Rate, p.VoiceConfig.Prosody.Pitch, text)
+		p.VoiceConfig.Prosody.Rate, p.VoiceConfig.Prosody.Pitch, escapedText)
 }
 
 // BuildCloseResponse creates a close dialog response

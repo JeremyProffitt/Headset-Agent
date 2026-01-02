@@ -256,7 +256,8 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 
 // handleLexRequest handles Lex V2 requests
 func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Response, error) {
-	// Enhanced logging to debug empty transcript issue
+	// Enhanced logging to debug voice call flow
+	log.Printf("=== LEX HANDLER START ===")
 	log.Printf("Received Lex event: sessionId=%s, inputMode=%s, invocationSource=%s",
 		event.SessionID, event.InputMode, event.InvocationSource)
 	log.Printf("  InputTranscript: '%s'", event.InputTranscript)
@@ -378,14 +379,20 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 	// Validate response to prevent silent failures
 	if response == nil {
 		log.Printf("Nil response from Bedrock agent (sessionId=%s)", event.SessionID)
-		return handlers.BuildErrorResponse(p, "I didn't get a response. Let me try that again for you."), nil
+		lexResp := handlers.BuildErrorResponse(p, "I didn't get a response. Let me try that again for you.")
+		log.Printf("=== LEX HANDLER END (nil response) === Response: %+v", lexResp)
+		return lexResp, nil
 	}
 	if response.OutputText == "" {
 		log.Printf("Empty OutputText from Bedrock agent (sessionId=%s)", event.SessionID)
-		return handlers.BuildErrorResponse(p, "I'm sorry, I didn't catch that. Could you please rephrase your question?"), nil
+		lexResp := handlers.BuildErrorResponse(p, "I'm sorry, I didn't catch that. Could you please rephrase your question?")
+		log.Printf("=== LEX HANDLER END (empty response) === Response: %+v", lexResp)
+		return lexResp, nil
 	}
 
-	return handlers.BuildSuccessResponse(p, response.OutputText, event.SessionState.SessionAttributes), nil
+	lexResp := handlers.BuildSuccessResponse(p, response.OutputText, event.SessionState.SessionAttributes)
+	log.Printf("=== LEX HANDLER END (success) === OutputText: %s", truncateString(response.OutputText, 200))
+	return lexResp, nil
 }
 
 // truncateString truncates a string to the specified length

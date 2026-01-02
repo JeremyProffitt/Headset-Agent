@@ -171,9 +171,12 @@ func TestBuildSSML(t *testing.T) {
 				t.Errorf("SSML should contain pitch %s", tt.wantPitch)
 			}
 
-			// Verify text is included
-			if !strings.Contains(ssml, tt.text) {
-				t.Error("SSML should contain the original text")
+			// Verify text is included (escaped version for SSML safety)
+			escapedText := strings.ReplaceAll(tt.text, "&", "&amp;")
+			escapedText = strings.ReplaceAll(escapedText, "<", "&lt;")
+			escapedText = strings.ReplaceAll(escapedText, ">", "&gt;")
+			if !strings.Contains(ssml, escapedText) {
+				t.Errorf("SSML should contain the escaped text, got: %s", ssml)
 			}
 		})
 	}
@@ -223,6 +226,54 @@ func TestBuildSuccessResponse_NilSessionAttrs(t *testing.T) {
 	// Session attributes should be nil (not initialized)
 	if response.SessionState.SessionAttributes != nil {
 		t.Log("SessionAttributes was initialized, which is fine")
+	}
+}
+
+func TestBuildSSML_EscapesSpecialCharacters(t *testing.T) {
+	persona := &models.Persona{
+		VoiceConfig: models.VoiceConfig{
+			Prosody: models.Prosody{
+				Rate:  "100%",
+				Pitch: "medium",
+			},
+		},
+	}
+
+	// Test with special XML characters that could break SSML
+	textWithSpecialChars := "Check if volume is < 50% or > 100% & verify settings"
+	ssml := BuildSSML(persona, textWithSpecialChars)
+
+	// Should be valid SSML - no unescaped < or > or &
+	if strings.Contains(ssml, "< ") || strings.Contains(ssml, " >") {
+		t.Error("SSML should not contain unescaped < or > characters")
+	}
+
+	// Should contain escaped versions
+	if !strings.Contains(ssml, "&lt;") || !strings.Contains(ssml, "&gt;") || !strings.Contains(ssml, "&amp;") {
+		t.Error("SSML should contain escaped special characters")
+	}
+
+	// Verify structure is still valid
+	if !strings.HasPrefix(ssml, "<speak>") || !strings.HasSuffix(ssml, "</speak>") {
+		t.Error("SSML structure should be valid")
+	}
+}
+
+func TestBuildSSML_EmptyText(t *testing.T) {
+	persona := &models.Persona{
+		VoiceConfig: models.VoiceConfig{
+			Prosody: models.Prosody{
+				Rate:  "100%",
+				Pitch: "medium",
+			},
+		},
+	}
+
+	ssml := BuildSSML(persona, "")
+
+	// Should use fallback text
+	if !strings.Contains(ssml, "sorry") {
+		t.Error("Empty text should use fallback message")
 	}
 }
 
