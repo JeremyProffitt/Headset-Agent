@@ -430,15 +430,18 @@ def associate_lambda(client, instance_id, lambda_arn):
 def associate_phone_with_flow(client, instance_id, phone_number_id, contact_flow_id):
     """Associate phone number with contact flow"""
     try:
-        # Determine the target ARN - instance_id might already be an ARN
+        # Extract instance ID from ARN if needed
         if instance_id.startswith('arn:'):
-            target_arn = instance_id
+            # Extract just the instance ID from the ARN
+            # ARN format: arn:aws:connect:region:account:instance/instance-id
+            instance_id_only = instance_id.split('/')[-1]
         else:
-            target_arn = f"arn:aws:connect:us-east-1:{get_account_id()}:instance/{instance_id}"
+            instance_id_only = instance_id
 
-        client.update_phone_number(
+        # Use associate_phone_number_contact_flow API
+        client.associate_phone_number_contact_flow(
             PhoneNumberId=phone_number_id,
-            TargetArn=target_arn,
+            InstanceId=instance_id_only,
             ContactFlowId=contact_flow_id
         )
         print(f"Associated phone number with contact flow")
@@ -451,16 +454,13 @@ def associate_phone_with_flow(client, instance_id, phone_number_id, contact_flow
 def save_to_ssm(ssm_client, param_name, value, description=''):
     """Save value to SSM Parameter Store"""
     try:
+        # Cannot use tags with overwrite - update existing parameter
         ssm_client.put_parameter(
             Name=param_name,
             Value=value,
             Type='String',
             Description=description,
-            Overwrite=True,
-            Tags=[
-                {'Key': 'Environment', 'Value': 'dev'},
-                {'Key': 'Project', 'Value': 'HeadsetSupportAgent'}
-            ]
+            Overwrite=True
         )
         print(f"Saved parameter: {param_name}")
         return True
