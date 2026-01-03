@@ -466,18 +466,29 @@ def get_ssm_parameter(ssm_client, param_name):
         return None
 
 
+def get_contact_flow_id_by_name(client, instance_id, flow_name):
+    """Get contact flow ID by name"""
+    try:
+        flows = list_contact_flows(client, instance_id)
+        for flow in flows:
+            if flow['Name'] == flow_name:
+                return flow['Id']
+    except ClientError as e:
+        print(f"Error finding contact flow {flow_name}: {e}")
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description='Setup Amazon Connect for Headset Support Agent')
     parser.add_argument('--environment', '-e', default='dev', choices=['dev', 'staging', 'prod'])
     parser.add_argument('--region', '-r', default='us-east-1')
-    parser.add_argument('--instance-alias', default='headset-support')
     parser.add_argument('--skip-phone-numbers', action='store_true',
                         help='Skip phone number claiming (useful if already claimed)')
     parser.add_argument('--dry-run', action='store_true')
 
     args = parser.parse_args()
 
-    print(f"=== Amazon Connect Setup ===")
+    print(f"=== Amazon Connect Setup (Phone Number Claiming) ===")
     print(f"Environment: {args.environment}")
     print(f"Region: {args.region}")
 
@@ -488,130 +499,108 @@ def main():
     connect_client = get_connect_client(args.region)
     ssm_client = get_ssm_client(args.region)
 
-    # Step 1: Get or verify Connect instance
-    print("\n--- Step 1: Connect Instance ---")
-    instance_id = get_or_create_instance(connect_client, args.instance_alias)
+    # Step 1: Get Connect instance ID from SSM (created by CloudFormation)
+    print("\n--- Step 1: Get Connect Instance ---")
+    instance_id = get_ssm_parameter(ssm_client, f"/headset-agent/{args.environment}/connect/instance-id")
+
     if not instance_id:
-        print("WARN: No Connect instance available. Skipping Connect setup.")
-        print("      Create a Connect instance in the AWS Console and re-run.")
-        return 0  # Don't fail pipeline - Connect instance creation is manual
+        print("WARN: Connect instance not yet created by CloudFormation.")
+        print("      The SAM stack must complete successfully first.")
+        return 0  # Don't fail - CloudFormation might still be running
 
-    # Save instance ID to SSM
-    save_to_ssm(ssm_client,
-                f"/headset-agent/{args.environment}/connect/instance-id",
-                instance_id,
-                "Amazon Connect Instance ID")
+    print(f"Connect Instance ID: {instance_id}")
 
-    # Step 2: Get Lex bot info from SSM/CloudFormation
-    print("\n--- Step 2: Get Resource ARNs ---")
-    lex_bot_alias_arn = get_ssm_parameter(ssm_client,
-                                           f"/headset-agent/{args.environment}/lex-bot-alias-arn")
-    if not lex_bot_alias_arn:
-        # Try to get from CloudFormation outputs
-        cf_client = boto3.client('cloudformation', region_name=args.region)
-        try:
-            response = cf_client.describe_stacks(StackName=f"agent-headset-{args.environment}")
-            for output in response['Stacks'][0].get('Outputs', []):
-                if output['OutputKey'] == 'LexBotAliasArn':
-                    lex_bot_alias_arn = output['OutputValue']
-                    break
-        except ClientError:
-            pass
+    # Step 2: Get contact flow IDs from Connect (created by CloudFormation)
+    print("\n--- Step 2: Get Contact Flows ---")
+    lex_flow_id = get_contact_flow_id_by_name(
+        connect_client, instance_id, f"HeadsetSupport-Lex-{args.environment}"
+    )
+    nova_flow_id = get_contact_flow_id_by_name(
+        connect_client, instance_id, f"HeadsetSupport-NovaSonic-{args.environment}"
+    )
 
-    nova_sonic_lambda_arn = get_ssm_parameter(ssm_client,
-                                               f"/headset-agent/{args.environment}/nova-sonic-lambda-arn")
-    if not nova_sonic_lambda_arn:
-        try:
-            response = cf_client.describe_stacks(StackName=f"agent-headset-{args.environment}")
-            for output in response['Stacks'][0].get('Outputs', []):
-                if output['OutputKey'] == 'NovaSonicLambdaFunctionArn':
-                    nova_sonic_lambda_arn = output['OutputValue']
-                    break
-        except ClientError:
-            pass
+    print(f"Lex Contact Flow ID: {lex_flow_id or 'Not found'}")
+    print(f"Nova Sonic Contact Flow ID: {nova_flow_id or 'Not found'}")
 
-    print(f"Lex Bot Alias ARN: {lex_bot_alias_arn or 'Not found'}")
-    print(f"Nova Sonic Lambda ARN: {nova_sonic_lambda_arn or 'Not found'}")
-
-    # Step 3: Associate Lex bot and Lambda with Connect
-    print("\n--- Step 3: Associate Resources ---")
-    if lex_bot_alias_arn:
-        associate_lex_bot(connect_client, instance_id, lex_bot_alias_arn)
-
-    if nova_sonic_lambda_arn:
-        associate_lambda(connect_client, instance_id, nova_sonic_lambda_arn)
-
-    # Step 4: Create contact flows
-    print("\n--- Step 4: Contact Flows ---")
-    lex_flow_id = None
-    nova_flow_id = None
-
-    if lex_bot_alias_arn:
-        lex_flow_id = create_lex_contact_flow(
-            connect_client, instance_id,
-            f"HeadsetSupport-Lex-{args.environment}",
-            lex_bot_alias_arn,
-            None  # Not using Lambda in Lex path directly
+    # Step 3: Claim phone numbers and associate with flows
+    print("\n--- Step 3: Phone Numbers ---")
+    if args.skip_phone_numbers:
+        print("Skipping phone number claiming (--skip-phone-numbers)")
+    else:
+        # Check existing phone numbers
+        existing_lex_phone = get_ssm_parameter(
+            ssm_client, f"/headset-agent/{args.environment}/connect/phone-number-lex"
+        )
+        existing_nova_phone = get_ssm_parameter(
+            ssm_client, f"/headset-agent/{args.environment}/connect/phone-number-nova-sonic"
         )
 
-    if nova_sonic_lambda_arn:
-        nova_flow_id = create_nova_sonic_contact_flow(
-            connect_client, instance_id,
-            f"HeadsetSupport-NovaSonic-{args.environment}",
-            nova_sonic_lambda_arn
-        )
-
-    # Step 5: Claim phone numbers (if not skipped)
-    print("\n--- Step 5: Phone Numbers ---")
-    if not args.skip_phone_numbers:
-        # Check if we already have phone numbers
-        existing_lex_phone = get_ssm_parameter(ssm_client,
-                                                f"/headset-agent/{args.environment}/connect/phone-number-lex")
-        existing_nova_phone = get_ssm_parameter(ssm_client,
-                                                 f"/headset-agent/{args.environment}/connect/phone-number-nova-sonic")
-
-        if existing_lex_phone and existing_lex_phone != 'PLACEHOLDER':
+        # Claim phone for Lex path
+        if existing_lex_phone and existing_lex_phone not in ['PLACEHOLDER', 'PENDING']:
             print(f"Lex path phone number already claimed: {existing_lex_phone}")
         elif lex_flow_id:
-            lex_phone = claim_phone_number(connect_client, instance_id,
-                                           description=f"Headset Support - Lex Path ({args.environment})")
+            print("Claiming phone number for Lex path...")
+            lex_phone = claim_phone_number(
+                connect_client, instance_id,
+                phone_type='TOLL_FREE',
+                description=f"Headset Support - Lex Path ({args.environment})"
+            )
             if lex_phone:
-                save_to_ssm(ssm_client,
-                           f"/headset-agent/{args.environment}/connect/phone-number-lex",
-                           lex_phone['PhoneNumber'],
-                           "Phone number for Lex path (Path A)")
+                save_to_ssm(
+                    ssm_client,
+                    f"/headset-agent/{args.environment}/connect/phone-number-lex",
+                    lex_phone['PhoneNumber'],
+                    "Phone number for Lex path (Path A)"
+                )
                 # Associate with contact flow
                 if lex_phone.get('PhoneNumberId'):
-                    associate_phone_with_flow(connect_client, instance_id,
-                                             lex_phone['PhoneNumberId'], lex_flow_id)
+                    associate_phone_with_flow(
+                        connect_client, instance_id,
+                        lex_phone['PhoneNumberId'], lex_flow_id
+                    )
+            else:
+                print("Failed to claim Lex phone number - may need manual claiming")
+        else:
+            print("Lex contact flow not found - skipping phone number")
 
-        if existing_nova_phone and existing_nova_phone != 'PLACEHOLDER':
+        # Claim phone for Nova Sonic path
+        if existing_nova_phone and existing_nova_phone not in ['PLACEHOLDER', 'PENDING']:
             print(f"Nova Sonic path phone number already claimed: {existing_nova_phone}")
         elif nova_flow_id:
-            nova_phone = claim_phone_number(connect_client, instance_id,
-                                            description=f"Headset Support - Nova Sonic Path ({args.environment})")
+            print("Claiming phone number for Nova Sonic path...")
+            nova_phone = claim_phone_number(
+                connect_client, instance_id,
+                phone_type='TOLL_FREE',
+                description=f"Headset Support - Nova Sonic Path ({args.environment})"
+            )
             if nova_phone:
-                save_to_ssm(ssm_client,
-                           f"/headset-agent/{args.environment}/connect/phone-number-nova-sonic",
-                           nova_phone['PhoneNumber'],
-                           "Phone number for Nova Sonic path (Path B)")
+                save_to_ssm(
+                    ssm_client,
+                    f"/headset-agent/{args.environment}/connect/phone-number-nova-sonic",
+                    nova_phone['PhoneNumber'],
+                    "Phone number for Nova Sonic path (Path B)"
+                )
                 # Associate with contact flow
                 if nova_phone.get('PhoneNumberId'):
-                    associate_phone_with_flow(connect_client, instance_id,
-                                             nova_phone['PhoneNumberId'], nova_flow_id)
-    else:
-        print("Skipping phone number claiming (--skip-phone-numbers)")
+                    associate_phone_with_flow(
+                        connect_client, instance_id,
+                        nova_phone['PhoneNumberId'], nova_flow_id
+                    )
+            else:
+                print("Failed to claim Nova Sonic phone number - may need manual claiming")
+        else:
+            print("Nova Sonic contact flow not found - skipping phone number")
 
     # Summary
     print("\n=== Connect Setup Summary ===")
     print(f"Instance ID: {instance_id}")
-    print(f"Lex Contact Flow: {lex_flow_id or 'Not created'}")
-    print(f"Nova Sonic Contact Flow: {nova_flow_id or 'Not created'}")
+    print(f"Lex Contact Flow: {lex_flow_id or 'Not found'}")
+    print(f"Nova Sonic Contact Flow: {nova_flow_id or 'Not found'}")
 
     lex_phone = get_ssm_parameter(ssm_client, f"/headset-agent/{args.environment}/connect/phone-number-lex")
     nova_phone = get_ssm_parameter(ssm_client, f"/headset-agent/{args.environment}/connect/phone-number-nova-sonic")
-    print(f"Lex Phone: {lex_phone or 'Not assigned'}")
-    print(f"Nova Sonic Phone: {nova_phone or 'Not assigned'}")
+    print(f"Lex Phone: {lex_phone if lex_phone not in ['PLACEHOLDER', 'PENDING', None] else 'Not assigned'}")
+    print(f"Nova Sonic Phone: {nova_phone if nova_phone not in ['PLACEHOLDER', 'PENDING', None] else 'Not assigned'}")
 
     print("\n=== Setup Complete ===")
     return 0

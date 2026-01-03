@@ -810,39 +810,6 @@ Resources:
           Value: NovaSonic
 
   # =============================================================
-  # CONNECT PHONE NUMBERS
-  # =============================================================
-  LexPhoneNumber:
-    Type: AWS::Connect::PhoneNumber
-    Condition: DeployLex
-    DependsOn: LexContactFlow
-    Properties:
-      TargetArn: !GetAtt ConnectInstance.Arn
-      CountryCode: US
-      Type: TOLL_FREE
-      Description: !Sub "Headset Support Lex Path (${Environment})"
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Path
-          Value: Lex
-
-  NovaSonicPhoneNumber:
-    Type: AWS::Connect::PhoneNumber
-    Condition: DeployNovaSonic
-    DependsOn: NovaSonicContactFlow
-    Properties:
-      TargetArn: !GetAtt ConnectInstance.Arn
-      CountryCode: US
-      Type: TOLL_FREE
-      Description: !Sub "Headset Support Nova Sonic Path (${Environment})"
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Path
-          Value: NovaSonic
-
-  # =============================================================
   # SSM PARAMETERS
   # =============================================================
   SupervisorAgentIdParam:
@@ -871,23 +838,19 @@ Resources:
 
   PhoneNumberLexParam:
     Type: AWS::SSM::Parameter
-    Condition: DeployLex
-    DependsOn: LexPhoneNumber
     Properties:
       Name: !Sub "/headset-agent/${Environment}/connect/phone-number-lex"
       Type: String
-      Value: !GetAtt LexPhoneNumber.Address
-      Description: Phone number for Lex path (Path A)
+      Value: "PENDING"
+      Description: Phone number for Lex path (Path A) - claimed by setup-connect script
 
   PhoneNumberNovaSonicParam:
     Type: AWS::SSM::Parameter
-    Condition: DeployNovaSonic
-    DependsOn: NovaSonicPhoneNumber
     Properties:
       Name: !Sub "/headset-agent/${Environment}/connect/phone-number-nova-sonic"
       Type: String
-      Value: !GetAtt NovaSonicPhoneNumber.Address
-      Description: Phone number for Nova Sonic path (Path B)
+      Value: "PENDING"
+      Description: Phone number for Nova Sonic path (Path B) - claimed by setup-connect script
 
 Outputs:
   # Shared Outputs
@@ -996,20 +959,6 @@ Outputs:
     Value: !GetAtt ConnectInstance.Arn
     Export:
       Name: !Sub "${AWS::StackName}-ConnectInstanceArn"
-
-  LexPhoneNumberAddress:
-    Condition: DeployLex
-    Description: Phone number for Lex path (Path A)
-    Value: !GetAtt LexPhoneNumber.Address
-    Export:
-      Name: !Sub "${AWS::StackName}-LexPhoneNumber"
-
-  NovaSonicPhoneNumberAddress:
-    Condition: DeployNovaSonic
-    Description: Phone number for Nova Sonic path (Path B)
-    Value: !GetAtt NovaSonicPhoneNumber.Address
-    Export:
-      Name: !Sub "${AWS::StackName}-NovaSonicPhoneNumber"
 
   LexContactFlowArn:
     Condition: DeployLex
