@@ -65,12 +65,25 @@ def wait_for_phone_number_ready(client, phone_number_id, timeout=120):
             response = client.describe_phone_number(PhoneNumberId=phone_number_id)
             status = response.get('ClaimedPhoneNumberSummary', {}).get('PhoneNumberStatus', {})
             status_value = status.get('Status', 'UNKNOWN')
+            status_message = status.get('Message', '')
 
             if status_value == 'CLAIMED':
                 print(f"  Phone number is ready (status: CLAIMED)")
                 return True
             elif status_value in ['FAILED', 'CANCELLED']:
                 print(f"  Phone number provisioning failed: {status_value}")
+                if 'limit' in status_message.lower():
+                    print("")
+                    print("  ⚠️  PHONE NUMBER QUOTA ISSUE DETECTED")
+                    print("  This is a known AWS issue. Even with 0 phone numbers,")
+                    print("  the limit may be exceeded. Resolution requires AWS Support.")
+                    print("")
+                    print("  To resolve:")
+                    print("  1. Go to AWS Console > Service Quotas > Amazon Connect")
+                    print("  2. Search for 'Phone numbers per instance'")
+                    print("  3. Request a quota increase for your Connect instance")
+                    print("  4. Or open an AWS Support case for faster resolution")
+                    print("")
                 return False
             else:
                 print(f"  Status: {status_value}, waiting...")
