@@ -819,7 +819,7 @@ Resources:
     Properties:
       TargetArn: !GetAtt ConnectInstance.Arn
       CountryCode: US
-      Type: DID
+      Type: TOLL_FREE
       Description: !Sub "Headset Support Lex Path (${Environment})"
       Tags:
         - Key: Environment
@@ -834,7 +834,7 @@ Resources:
     Properties:
       TargetArn: !GetAtt ConnectInstance.Arn
       CountryCode: US
-      Type: DID
+      Type: TOLL_FREE
       Description: !Sub "Headset Support Nova Sonic Path (${Environment})"
       Tags:
         - Key: Environment
