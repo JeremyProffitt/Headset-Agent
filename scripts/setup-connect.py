@@ -58,9 +58,15 @@ def get_or_create_instance(client, instance_alias):
 def claim_phone_number(client, instance_id, country_code='US', phone_type='DID', description=''):
     """Claim a phone number for the Connect instance"""
     try:
+        # Determine the target ARN - instance_id might already be an ARN
+        if instance_id.startswith('arn:'):
+            target_arn = instance_id
+        else:
+            target_arn = f"arn:aws:connect:us-east-1:{get_account_id()}:instance/{instance_id}"
+
         # Search for available phone numbers
         response = client.search_available_phone_numbers(
-            TargetArn=f"arn:aws:connect:us-east-1:{get_account_id()}:instance/{instance_id}",
+            TargetArn=target_arn,
             PhoneNumberCountryCode=country_code,
             PhoneNumberType=phone_type,
             MaxResults=1
@@ -76,7 +82,7 @@ def claim_phone_number(client, instance_id, country_code='US', phone_type='DID',
 
         # Claim the phone number
         claim_response = client.claim_phone_number(
-            TargetArn=f"arn:aws:connect:us-east-1:{get_account_id()}:instance/{instance_id}",
+            TargetArn=target_arn,
             PhoneNumber=phone_number,
             PhoneNumberDescription=description,
             Tags={
@@ -424,9 +430,15 @@ def associate_lambda(client, instance_id, lambda_arn):
 def associate_phone_with_flow(client, instance_id, phone_number_id, contact_flow_id):
     """Associate phone number with contact flow"""
     try:
+        # Determine the target ARN - instance_id might already be an ARN
+        if instance_id.startswith('arn:'):
+            target_arn = instance_id
+        else:
+            target_arn = f"arn:aws:connect:us-east-1:{get_account_id()}:instance/{instance_id}"
+
         client.update_phone_number(
             PhoneNumberId=phone_number_id,
-            TargetArn=f"arn:aws:connect:us-east-1:{get_account_id()}:instance/{instance_id}",
+            TargetArn=target_arn,
             ContactFlowId=contact_flow_id
         )
         print(f"Associated phone number with contact flow")
