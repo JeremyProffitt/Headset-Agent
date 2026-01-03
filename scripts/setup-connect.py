@@ -55,6 +55,34 @@ def get_or_create_instance(client, instance_alias):
         return None
 
 
+def wait_for_phone_number_ready(client, phone_number_id, timeout=120):
+    """Wait for phone number to be in CLAIMED status (ready for use)"""
+    print(f"  Waiting for phone number to be provisioned...")
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        try:
+            response = client.describe_phone_number(PhoneNumberId=phone_number_id)
+            status = response.get('ClaimedPhoneNumberSummary', {}).get('PhoneNumberStatus', {})
+            status_value = status.get('Status', 'UNKNOWN')
+
+            if status_value == 'CLAIMED':
+                print(f"  Phone number is ready (status: CLAIMED)")
+                return True
+            elif status_value in ['FAILED', 'CANCELLED']:
+                print(f"  Phone number provisioning failed: {status_value}")
+                return False
+            else:
+                print(f"  Status: {status_value}, waiting...")
+                time.sleep(5)
+        except ClientError as e:
+            print(f"  Error checking status: {e}")
+            time.sleep(5)
+
+    print(f"  Timeout waiting for phone number to be ready")
+    return False
+
+
 def claim_phone_number(client, instance_id, country_code='US', phone_type='DID', description=''):
     """Claim a phone number for the Connect instance"""
     try:
@@ -91,10 +119,17 @@ def claim_phone_number(client, instance_id, country_code='US', phone_type='DID',
             }
         )
 
-        print(f"Claimed phone number: {phone_number}")
+        claimed_phone_number_id = claim_response.get('PhoneNumberId')
+        print(f"Claimed phone number: {phone_number} (ID: {claimed_phone_number_id})")
+
+        # Wait for phone number to be fully provisioned
+        if claimed_phone_number_id:
+            if not wait_for_phone_number_ready(client, claimed_phone_number_id):
+                print(f"  WARNING: Phone number may not be fully provisioned")
+
         return {
             'PhoneNumber': phone_number,
-            'PhoneNumberId': claim_response.get('PhoneNumberId'),
+            'PhoneNumberId': claimed_phone_number_id,
             'PhoneNumberArn': claim_response.get('PhoneNumberArn')
         }
 
@@ -427,28 +462,34 @@ def associate_lambda(client, instance_id, lambda_arn):
         return False
 
 
-def associate_phone_with_flow(client, instance_id, phone_number_id, contact_flow_id):
-    """Associate phone number with contact flow"""
-    try:
-        # Extract instance ID from ARN if needed
-        if instance_id.startswith('arn:'):
-            # Extract just the instance ID from the ARN
-            # ARN format: arn:aws:connect:region:account:instance/instance-id
-            instance_id_only = instance_id.split('/')[-1]
-        else:
-            instance_id_only = instance_id
+def associate_phone_with_flow(client, instance_id, phone_number_id, contact_flow_id, max_retries=3):
+    """Associate phone number with contact flow with retry logic"""
+    # Extract instance ID from ARN if needed
+    if instance_id.startswith('arn:'):
+        # Extract just the instance ID from the ARN
+        # ARN format: arn:aws:connect:region:account:instance/instance-id
+        instance_id_only = instance_id.split('/')[-1]
+    else:
+        instance_id_only = instance_id
 
-        # Use associate_phone_number_contact_flow API
-        client.associate_phone_number_contact_flow(
-            PhoneNumberId=phone_number_id,
-            InstanceId=instance_id_only,
-            ContactFlowId=contact_flow_id
-        )
-        print(f"Associated phone number with contact flow")
-        return True
-    except ClientError as e:
-        print(f"Error associating phone with flow: {e}")
-        return False
+    for attempt in range(max_retries):
+        try:
+            # Use associate_phone_number_contact_flow API
+            client.associate_phone_number_contact_flow(
+                PhoneNumberId=phone_number_id,
+                InstanceId=instance_id_only,
+                ContactFlowId=contact_flow_id
+            )
+            print(f"Associated phone number with contact flow")
+            return True
+        except ClientError as e:
+            if 'ResourceNotFoundException' in str(e) and attempt < max_retries - 1:
+                print(f"  Phone number not ready yet, retrying in 10 seconds... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(10)
+            else:
+                print(f"Error associating phone with flow: {e}")
+                return False
+    return False
 
 
 def save_to_ssm(ssm_client, param_name, value, description=''):
@@ -488,6 +529,26 @@ def get_contact_flow_id_by_name(client, instance_id, flow_name):
     except ClientError as e:
         print(f"Error finding contact flow {flow_name}: {e}")
     return None
+
+
+def verify_phone_number_exists(client, instance_id, phone_number):
+    """Verify if a phone number is claimed and active in Connect"""
+    try:
+        # Get target ARN
+        if instance_id.startswith('arn:'):
+            target_arn = instance_id
+        else:
+            target_arn = f"arn:aws:connect:us-east-1:{get_account_id()}:instance/{instance_id}"
+
+        response = client.list_phone_numbers_v2(TargetArn=target_arn)
+
+        for phone in response.get('ListPhoneNumbersSummaryList', []):
+            if phone.get('PhoneNumber') == phone_number:
+                return True
+        return False
+    except ClientError as e:
+        print(f"Error verifying phone number: {e}")
+        return False
 
 
 def main():
@@ -549,8 +610,14 @@ def main():
 
         # Claim phone for Lex path
         if existing_lex_phone and existing_lex_phone not in ['PLACEHOLDER', 'PENDING']:
-            print(f"Lex path phone number already claimed: {existing_lex_phone}")
-        elif lex_flow_id:
+            # Verify the phone number actually exists in Connect
+            if verify_phone_number_exists(connect_client, instance_id, existing_lex_phone):
+                print(f"Lex path phone number already claimed and verified: {existing_lex_phone}")
+            else:
+                print(f"Lex path phone number {existing_lex_phone} no longer exists in Connect, reclaiming...")
+                existing_lex_phone = None  # Force reclaim
+
+        if not existing_lex_phone and lex_flow_id:
             print("Claiming phone number for Lex path...")
             lex_phone = claim_phone_number(
                 connect_client, instance_id,
@@ -577,8 +644,14 @@ def main():
 
         # Claim phone for Nova Sonic path
         if existing_nova_phone and existing_nova_phone not in ['PLACEHOLDER', 'PENDING']:
-            print(f"Nova Sonic path phone number already claimed: {existing_nova_phone}")
-        elif nova_flow_id:
+            # Verify the phone number actually exists in Connect
+            if verify_phone_number_exists(connect_client, instance_id, existing_nova_phone):
+                print(f"Nova Sonic path phone number already claimed and verified: {existing_nova_phone}")
+            else:
+                print(f"Nova Sonic path phone number {existing_nova_phone} no longer exists in Connect, reclaiming...")
+                existing_nova_phone = None  # Force reclaim
+
+        if not existing_nova_phone and nova_flow_id:
             print("Claiming phone number for Nova Sonic path...")
             nova_phone = claim_phone_number(
                 connect_client, instance_id,
