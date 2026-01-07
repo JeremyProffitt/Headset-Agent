@@ -196,30 +196,45 @@ jobs:
       - name: Check for existing Connect instance
         id: connect
         run: |
+          # Show which AWS account we're working in
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "AWS Account ID: $ACCOUNT_ID"
+
+          # List ALL Connect instances to see what exists
+          echo "Listing all Connect instances in this account..."
+          aws connect list-instances --output table || echo "No instances found or error listing"
+
           # Look for Connect instance with alias "headset"
           CONNECT_ALIAS="headset"
-
-          echo "Checking for Connect instance with alias: $CONNECT_ALIAS"
+          echo ""
+          echo "Looking for Connect instance with alias: $CONNECT_ALIAS"
 
           EXISTING_INSTANCE=$(aws connect list-instances \
             --query "InstanceSummaryList[?InstanceAlias=='${CONNECT_ALIAS}' && InstanceStatus=='ACTIVE'].Id | [0]" \
             --output text 2>/dev/null || echo "None")
 
           if [ "$EXISTING_INSTANCE" != "None" ] && [ -n "$EXISTING_INSTANCE" ]; then
-            # Verify instance is actually accessible by describing it
+            # Double-verify instance is actually accessible
+            echo "Found instance ID: $EXISTING_INSTANCE - verifying it exists..."
             INSTANCE_STATUS=$(aws connect describe-instance --instance-id "$EXISTING_INSTANCE" \
               --query 'Instance.InstanceStatus' --output text 2>/dev/null || echo "ERROR")
 
             if [ "$INSTANCE_STATUS" == "ACTIVE" ]; then
-              echo "Found existing Connect instance: $EXISTING_INSTANCE (status: $INSTANCE_STATUS)"
+              # Get the instance ARN to fully verify
+              INSTANCE_ARN=$(aws connect describe-instance --instance-id "$EXISTING_INSTANCE" \
+                --query 'Instance.Arn' --output text 2>/dev/null || echo "")
+              echo "Verified Connect instance: $EXISTING_INSTANCE"
+              echo "  Status: $INSTANCE_STATUS"
+              echo "  ARN: $INSTANCE_ARN"
               echo "instance_id=$EXISTING_INSTANCE" >> $GITHUB_OUTPUT
             else
-              echo "Connect instance $EXISTING_INSTANCE is not accessible or not ACTIVE (status: $INSTANCE_STATUS)"
+              echo "Connect instance $EXISTING_INSTANCE verification failed (status: $INSTANCE_STATUS)"
               echo "Will create a new instance instead"
               echo "instance_id=" >> $GITHUB_OUTPUT
             fi
           else
-            echo "No existing Connect instance found, will create new with alias: $CONNECT_ALIAS"
+            echo "No existing Connect instance found with alias: $CONNECT_ALIAS"
+            echo "CloudFormation will create a new instance"
             echo "instance_id=" >> $GITHUB_OUTPUT
           fi
 

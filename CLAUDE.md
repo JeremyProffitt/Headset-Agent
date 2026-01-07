@@ -1,6 +1,9 @@
 # AWS Deployment Policy
 **CRITICAL: All AWS infrastructure and code changes MUST be deployed via GitHub Actions pipelines.**
 
+### Local AWS CLI Warning
+**IMPORTANT: The AWS CLI on this computer is configured for a DIFFERENT AWS account than the GitHub Actions pipeline deploys to.** Do not use local AWS CLI queries to check deployment status or resource state - the results will be from the wrong account.
+
 ### Prohibited Actions
 - **NEVER** use AWS CLI directly to deploy, update, or modify infrastructure
 - **NEVER** use AWS SAM CLI (`sam deploy`, `sam build`, etc.) for deployments
