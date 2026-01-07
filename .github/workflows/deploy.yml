@@ -215,19 +215,29 @@ jobs:
 
           # Check for instance with new naming pattern first
           EXISTING_INSTANCE=$(aws connect list-instances \
-            --query "InstanceSummaryList[?InstanceAlias=='${NEW_ALIAS}'].Id | [0]" \
+            --query "InstanceSummaryList[?InstanceAlias=='${NEW_ALIAS}' && InstanceStatus=='ACTIVE'].Id | [0]" \
             --output text 2>/dev/null || echo "None")
 
           if [ "$EXISTING_INSTANCE" == "None" ] || [ -z "$EXISTING_INSTANCE" ]; then
             # Check for legacy naming pattern
             EXISTING_INSTANCE=$(aws connect list-instances \
-              --query "InstanceSummaryList[?InstanceAlias=='${LEGACY_ALIAS}'].Id | [0]" \
+              --query "InstanceSummaryList[?InstanceAlias=='${LEGACY_ALIAS}' && InstanceStatus=='ACTIVE'].Id | [0]" \
               --output text 2>/dev/null || echo "None")
           fi
 
           if [ "$EXISTING_INSTANCE" != "None" ] && [ -n "$EXISTING_INSTANCE" ]; then
-            echo "Found existing Connect instance: $EXISTING_INSTANCE"
-            echo "instance_id=$EXISTING_INSTANCE" >> $GITHUB_OUTPUT
+            # Verify instance is actually accessible by describing it
+            INSTANCE_STATUS=$(aws connect describe-instance --instance-id "$EXISTING_INSTANCE" \
+              --query 'Instance.InstanceStatus' --output text 2>/dev/null || echo "ERROR")
+
+            if [ "$INSTANCE_STATUS" == "ACTIVE" ]; then
+              echo "Found existing Connect instance: $EXISTING_INSTANCE (status: $INSTANCE_STATUS)"
+              echo "instance_id=$EXISTING_INSTANCE" >> $GITHUB_OUTPUT
+            else
+              echo "Connect instance $EXISTING_INSTANCE is not accessible or not ACTIVE (status: $INSTANCE_STATUS)"
+              echo "Will create a new instance instead"
+              echo "instance_id=" >> $GITHUB_OUTPUT
+            fi
           else
             echo "No existing Connect instance found, will create new with alias: $NEW_ALIAS"
             echo "instance_id=" >> $GITHUB_OUTPUT
