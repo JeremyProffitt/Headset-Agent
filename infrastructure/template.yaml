@@ -619,7 +619,11 @@ Resources:
     DependsOn:
       - HeadsetBotAlias
     Properties:
-      InstanceId: !If [CreateConnectInstance, !Ref ConnectInstance, !Ref ExistingConnectInstanceId]
+      # InstanceId property requires ARN format, not just the instance ID
+      InstanceId: !If
+        - CreateConnectInstance
+        - !GetAtt ConnectInstance.Arn
+        - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ExistingConnectInstanceId}"
       IntegrationType: LEX_BOT
       IntegrationArn: !GetAtt HeadsetBotAlias.Arn
 
@@ -629,7 +633,11 @@ Resources:
     DependsOn:
       - NovaSonicFunction
     Properties:
-      InstanceId: !If [CreateConnectInstance, !Ref ConnectInstance, !Ref ExistingConnectInstanceId]
+      # InstanceId property requires ARN format, not just the instance ID
+      InstanceId: !If
+        - CreateConnectInstance
+        - !GetAtt ConnectInstance.Arn
+        - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ExistingConnectInstanceId}"
       IntegrationType: LAMBDA_FUNCTION
       IntegrationArn: !GetAtt NovaSonicFunction.Arn
 
