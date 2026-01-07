@@ -55,6 +55,36 @@ def get_or_create_instance(client, instance_alias):
         return None
 
 
+def wait_for_instance_ready(client, instance_id, timeout=300):
+    """Wait for Connect instance to be fully operational (able to list contact flows)"""
+    print(f"  Waiting for Connect instance to be fully operational...")
+    start_time = time.time()
+    last_error = None
+
+    while time.time() - start_time < timeout:
+        try:
+            # Try to list contact flows - this is a good indicator that the instance is ready
+            client.list_contact_flows(
+                InstanceId=instance_id,
+                ContactFlowTypes=['CONTACT_FLOW'],
+                MaxResults=1
+            )
+            print(f"  Connect instance is ready")
+            return True
+        except ClientError as e:
+            error_message = str(e)
+            if 'inactive' in error_message.lower() or 'ResourceNotFoundException' in error_message:
+                last_error = e
+                print(f"  Instance not ready yet, waiting...")
+                time.sleep(15)
+            else:
+                print(f"  Error checking instance: {e}")
+                return False
+
+    print(f"  Timeout waiting for instance to be ready. Last error: {last_error}")
+    return False
+
+
 def wait_for_phone_number_ready(client, phone_number_id, timeout=180):
     """Wait for phone number to be in CLAIMED status (ready for use)"""
     print(f"  Waiting for phone number to be provisioned...")
@@ -703,6 +733,14 @@ def main():
         return 0  # Don't fail - CloudFormation might still be running
 
     print(f"Connect Instance ID: {instance_id}")
+
+    # Wait for Connect instance to be fully operational
+    print("\nWaiting for Connect instance to be fully operational...")
+    if not wait_for_instance_ready(connect_client, instance_id, timeout=300):
+        print("WARN: Connect instance is not fully operational yet.")
+        print("      Phone numbers cannot be claimed until the instance is ready.")
+        print("      Re-run the pipeline in a few minutes.")
+        return 0
 
     # Step 2: Get contact flow IDs from Connect (created by CloudFormation)
     print("\n--- Step 2: Get Contact Flows ---")
