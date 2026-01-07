@@ -198,11 +198,43 @@ jobs:
       - name: SAM Build
         run: sam build --template infrastructure/template.yaml
 
+      - name: Check for existing Connect instance
+        id: connect
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          INSTANCE_ALIAS="headset-support-${ENV}"
+
+          # Check if a Connect instance with this alias already exists
+          EXISTING_INSTANCE=$(aws connect list-instances \
+            --query "InstanceSummaryList[?InstanceAlias=='${INSTANCE_ALIAS}'].Id | [0]" \
+            --output text 2>/dev/null || echo "None")
+
+          if [ "$EXISTING_INSTANCE" != "None" ] && [ -n "$EXISTING_INSTANCE" ]; then
+            echo "Found existing Connect instance: $EXISTING_INSTANCE"
+            echo "instance_id=$EXISTING_INSTANCE" >> $GITHUB_OUTPUT
+          else
+            echo "No existing Connect instance found, will create new"
+            echo "instance_id=" >> $GITHUB_OUTPUT
+          fi
+
       - name: SAM Deploy
         id: deploy
         run: |
           ENV="${{ needs.setup.outputs.environment }}"
           STACK_NAME="agent-headset-${ENV}"
+          EXISTING_CONNECT="${{ steps.connect.outputs.instance_id }}"
+
+          # Build parameter overrides
+          PARAMS="Environment=$ENV"
+          PARAMS="$PARAMS KBBucketName=headset-kb-${{ needs.validate.outputs.aws_account_id }}"
+          PARAMS="$PARAMS DeployLexPath=${{ needs.setup.outputs.deploy_lex }}"
+          PARAMS="$PARAMS DeployNovaSonicPath=${{ needs.setup.outputs.deploy_nova_sonic }}"
+
+          # Add existing Connect instance ID if found
+          if [ -n "$EXISTING_CONNECT" ]; then
+            echo "Using existing Connect instance: $EXISTING_CONNECT"
+            PARAMS="$PARAMS ExistingConnectInstanceId=$EXISTING_CONNECT"
+          fi
 
           sam deploy \
             --template-file .aws-sam/build/template.yaml \
@@ -210,11 +242,7 @@ jobs:
             --s3-bucket "headset-agent-sam-${{ needs.validate.outputs.aws_account_id }}-${{ env.AWS_REGION }}" \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset \
-            --parameter-overrides \
-              Environment="$ENV" \
-              KBBucketName="headset-kb-${{ needs.validate.outputs.aws_account_id }}" \
-              DeployLexPath="${{ needs.setup.outputs.deploy_lex }}" \
-              DeployNovaSonicPath="${{ needs.setup.outputs.deploy_nova_sonic }}"
+            --parameter-overrides $PARAMS
 
           echo "Stack deployment complete: $STACK_NAME"
 

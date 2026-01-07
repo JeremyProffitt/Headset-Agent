@@ -93,10 +93,16 @@ Parameters:
       - "false"
     Description: Deploy Path B (Nova Sonic streaming)
 
+  ExistingConnectInstanceId:
+    Type: String
+    Default: ""
+    Description: Existing Amazon Connect instance ID. Leave empty to create a new instance.
+
 Conditions:
   IsProd: !Equals [!Ref Environment, prod]
   DeployLex: !Equals [!Ref DeployLexPath, 'true']
   DeployNovaSonic: !Equals [!Ref DeployNovaSonicPath, 'true']
+  CreateConnectInstance: !Equals [!Ref ExistingConnectInstanceId, ""]
 
 Resources:
   # =============================================================
@@ -587,6 +593,7 @@ Resources:
   # =============================================================
   ConnectInstance:
     Type: AWS::Connect::Instance
+    Condition: CreateConnectInstance
     Properties:
       InstanceAlias: !Sub "headset-support-${Environment}"
       IdentityManagementType: CONNECT_MANAGED
@@ -610,10 +617,9 @@ Resources:
     Type: AWS::Connect::IntegrationAssociation
     Condition: DeployLex
     DependsOn:
-      - ConnectInstance
       - HeadsetBotAlias
     Properties:
-      InstanceId: !Ref ConnectInstance
+      InstanceId: !If [CreateConnectInstance, !Ref ConnectInstance, !Ref ExistingConnectInstanceId]
       IntegrationType: LEX_BOT
       IntegrationArn: !GetAtt HeadsetBotAlias.Arn
 
@@ -621,10 +627,9 @@ Resources:
     Type: AWS::Connect::IntegrationAssociation
     Condition: DeployNovaSonic
     DependsOn:
-      - ConnectInstance
       - NovaSonicFunction
     Properties:
-      InstanceId: !Ref ConnectInstance
+      InstanceId: !If [CreateConnectInstance, !Ref ConnectInstance, !Ref ExistingConnectInstanceId]
       IntegrationType: LAMBDA_FUNCTION
       IntegrationArn: !GetAtt NovaSonicFunction.Arn
 
@@ -635,10 +640,12 @@ Resources:
     Type: AWS::Connect::ContactFlow
     Condition: DeployLex
     DependsOn:
-      - ConnectInstance
       - ConnectLexIntegration
     Properties:
-      InstanceArn: !GetAtt ConnectInstance.Arn
+      InstanceArn: !If
+        - CreateConnectInstance
+        - !GetAtt ConnectInstance.Arn
+        - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ExistingConnectInstanceId}"
       Name: !Sub "HeadsetSupport-Lex-${Environment}"
       Type: CONTACT_FLOW
       State: ACTIVE
@@ -729,10 +736,12 @@ Resources:
     Type: AWS::Connect::ContactFlow
     Condition: DeployNovaSonic
     DependsOn:
-      - ConnectInstance
       - ConnectLambdaIntegration
     Properties:
-      InstanceArn: !GetAtt ConnectInstance.Arn
+      InstanceArn: !If
+        - CreateConnectInstance
+        - !GetAtt ConnectInstance.Arn
+        - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ExistingConnectInstanceId}"
       Name: !Sub "HeadsetSupport-NovaSonic-${Environment}"
       Type: CONTACT_FLOW
       State: ACTIVE
@@ -833,7 +842,7 @@ Resources:
     Properties:
       Name: !Sub "/headset-agent/${Environment}/connect/instance-id"
       Type: String
-      Value: !Ref ConnectInstance
+      Value: !If [CreateConnectInstance, !Ref ConnectInstance, !Ref ExistingConnectInstanceId]
       Description: Amazon Connect instance ID
 
   PhoneNumberLexParam:
@@ -950,13 +959,16 @@ Outputs:
   # Connect Outputs
   ConnectInstanceId:
     Description: Amazon Connect Instance ID
-    Value: !Ref ConnectInstance
+    Value: !If [CreateConnectInstance, !Ref ConnectInstance, !Ref ExistingConnectInstanceId]
     Export:
       Name: !Sub "${AWS::StackName}-ConnectInstanceId"
 
   ConnectInstanceArn:
     Description: Amazon Connect Instance ARN
-    Value: !GetAtt ConnectInstance.Arn
+    Value: !If
+      - CreateConnectInstance
+      - !GetAtt ConnectInstance.Arn
+      - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ExistingConnectInstanceId}"
     Export:
       Name: !Sub "${AWS::StackName}-ConnectInstanceArn"
 
