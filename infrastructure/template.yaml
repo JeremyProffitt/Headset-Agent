@@ -595,7 +595,7 @@ Resources:
     Type: AWS::Connect::Instance
     Condition: CreateConnectInstance
     Properties:
-      InstanceAlias: !Sub "headset-support-${Environment}"
+      InstanceAlias: !Sub "headset-${AWS::AccountId}-${Environment}"
       IdentityManagementType: CONNECT_MANAGED
       Attributes:
         InboundCalls: true

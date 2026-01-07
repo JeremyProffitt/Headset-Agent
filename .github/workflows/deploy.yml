@@ -202,18 +202,34 @@ jobs:
         id: connect
         run: |
           ENV="${{ needs.setup.outputs.environment }}"
-          INSTANCE_ALIAS="headset-support-${ENV}"
+          AWS_ACCOUNT_ID="${{ needs.validate.outputs.aws_account_id }}"
 
-          # Check if a Connect instance with this alias already exists
+          # Check for existing instance with new naming pattern (headset-{account}-{env})
+          NEW_ALIAS="headset-${AWS_ACCOUNT_ID}-${ENV}"
+          # Also check for legacy naming pattern (headset-support-{env})
+          LEGACY_ALIAS="headset-support-${ENV}"
+
+          echo "Checking for Connect instances..."
+          echo "  New pattern: $NEW_ALIAS"
+          echo "  Legacy pattern: $LEGACY_ALIAS"
+
+          # Check for instance with new naming pattern first
           EXISTING_INSTANCE=$(aws connect list-instances \
-            --query "InstanceSummaryList[?InstanceAlias=='${INSTANCE_ALIAS}'].Id | [0]" \
+            --query "InstanceSummaryList[?InstanceAlias=='${NEW_ALIAS}'].Id | [0]" \
             --output text 2>/dev/null || echo "None")
+
+          if [ "$EXISTING_INSTANCE" == "None" ] || [ -z "$EXISTING_INSTANCE" ]; then
+            # Check for legacy naming pattern
+            EXISTING_INSTANCE=$(aws connect list-instances \
+              --query "InstanceSummaryList[?InstanceAlias=='${LEGACY_ALIAS}'].Id | [0]" \
+              --output text 2>/dev/null || echo "None")
+          fi
 
           if [ "$EXISTING_INSTANCE" != "None" ] && [ -n "$EXISTING_INSTANCE" ]; then
             echo "Found existing Connect instance: $EXISTING_INSTANCE"
             echo "instance_id=$EXISTING_INSTANCE" >> $GITHUB_OUTPUT
           else
-            echo "No existing Connect instance found, will create new"
+            echo "No existing Connect instance found, will create new with alias: $NEW_ALIAS"
             echo "instance_id=" >> $GITHUB_OUTPUT
           fi
 
