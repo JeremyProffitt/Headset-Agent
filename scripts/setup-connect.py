@@ -639,72 +639,78 @@ def main():
         )
 
         # Claim phone for Lex path
-        if existing_lex_phone and existing_lex_phone not in ['PLACEHOLDER', 'PENDING']:
+        needs_lex_phone = not existing_lex_phone or existing_lex_phone in ['PLACEHOLDER', 'PENDING']
+
+        if not needs_lex_phone:
             # Verify the phone number actually exists in Connect
             if verify_phone_number_exists(connect_client, instance_id, existing_lex_phone):
                 print(f"Lex path phone number already claimed and verified: {existing_lex_phone}")
             else:
                 print(f"Lex path phone number {existing_lex_phone} no longer exists in Connect, reclaiming...")
-                existing_lex_phone = None  # Force reclaim
+                needs_lex_phone = True
 
-        if not existing_lex_phone and lex_flow_id:
-            print("Claiming phone number for Lex path...")
-            lex_phone = claim_phone_number(
-                connect_client, instance_id,
-                phone_type='TOLL_FREE',
-                description=f"Headset Support - Lex Path ({args.environment})"
-            )
-            if lex_phone:
-                save_to_ssm(
-                    ssm_client,
-                    f"/headset-agent/{args.environment}/connect/phone-number-lex",
-                    lex_phone['PhoneNumber'],
-                    "Phone number for Lex path (Path A)"
+        if needs_lex_phone:
+            if lex_flow_id:
+                print("Claiming phone number for Lex path...")
+                lex_phone = claim_phone_number(
+                    connect_client, instance_id,
+                    phone_type='TOLL_FREE',
+                    description=f"Headset Support - Lex Path ({args.environment})"
                 )
-                # Associate with contact flow
-                if lex_phone.get('PhoneNumberId'):
-                    associate_phone_with_flow(
-                        connect_client, instance_id,
-                        lex_phone['PhoneNumberId'], lex_flow_id
+                if lex_phone:
+                    save_to_ssm(
+                        ssm_client,
+                        f"/headset-agent/{args.environment}/connect/phone-number-lex",
+                        lex_phone['PhoneNumber'],
+                        "Phone number for Lex path (Path A)"
                     )
+                    # Associate with contact flow
+                    if lex_phone.get('PhoneNumberId'):
+                        associate_phone_with_flow(
+                            connect_client, instance_id,
+                            lex_phone['PhoneNumberId'], lex_flow_id
+                        )
+                else:
+                    print("Failed to claim Lex phone number - may need manual claiming")
             else:
-                print("Failed to claim Lex phone number - may need manual claiming")
-        else:
-            print("Lex contact flow not found - skipping phone number")
+                print("Lex contact flow not found - skipping phone number")
 
         # Claim phone for Nova Sonic path
-        if existing_nova_phone and existing_nova_phone not in ['PLACEHOLDER', 'PENDING']:
+        needs_nova_phone = not existing_nova_phone or existing_nova_phone in ['PLACEHOLDER', 'PENDING']
+
+        if not needs_nova_phone:
             # Verify the phone number actually exists in Connect
             if verify_phone_number_exists(connect_client, instance_id, existing_nova_phone):
                 print(f"Nova Sonic path phone number already claimed and verified: {existing_nova_phone}")
             else:
                 print(f"Nova Sonic path phone number {existing_nova_phone} no longer exists in Connect, reclaiming...")
-                existing_nova_phone = None  # Force reclaim
+                needs_nova_phone = True
 
-        if not existing_nova_phone and nova_flow_id:
-            print("Claiming phone number for Nova Sonic path...")
-            nova_phone = claim_phone_number(
-                connect_client, instance_id,
-                phone_type='TOLL_FREE',
-                description=f"Headset Support - Nova Sonic Path ({args.environment})"
-            )
-            if nova_phone:
-                save_to_ssm(
-                    ssm_client,
-                    f"/headset-agent/{args.environment}/connect/phone-number-nova-sonic",
-                    nova_phone['PhoneNumber'],
-                    "Phone number for Nova Sonic path (Path B)"
+        if needs_nova_phone:
+            if nova_flow_id:
+                print("Claiming phone number for Nova Sonic path...")
+                nova_phone = claim_phone_number(
+                    connect_client, instance_id,
+                    phone_type='TOLL_FREE',
+                    description=f"Headset Support - Nova Sonic Path ({args.environment})"
                 )
-                # Associate with contact flow
-                if nova_phone.get('PhoneNumberId'):
-                    associate_phone_with_flow(
-                        connect_client, instance_id,
-                        nova_phone['PhoneNumberId'], nova_flow_id
+                if nova_phone:
+                    save_to_ssm(
+                        ssm_client,
+                        f"/headset-agent/{args.environment}/connect/phone-number-nova-sonic",
+                        nova_phone['PhoneNumber'],
+                        "Phone number for Nova Sonic path (Path B)"
                     )
+                    # Associate with contact flow
+                    if nova_phone.get('PhoneNumberId'):
+                        associate_phone_with_flow(
+                            connect_client, instance_id,
+                            nova_phone['PhoneNumberId'], nova_flow_id
+                        )
+                else:
+                    print("Failed to claim Nova Sonic phone number - may need manual claiming")
             else:
-                print("Failed to claim Nova Sonic phone number - may need manual claiming")
-        else:
-            print("Nova Sonic contact flow not found - skipping phone number")
+                print("Nova Sonic contact flow not found - skipping phone number")
 
     # Summary
     print("\n=== Connect Setup Summary ===")
