@@ -244,16 +244,58 @@ jobs:
           STACK_NAME="agent-headset-${ENV}"
           EXISTING_CONNECT="${{ steps.connect.outputs.instance_id }}"
 
+          delete_stack() {
+            echo "Deleting stack $STACK_NAME..."
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            echo "Waiting for stack deletion to complete..."
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
+
+            # Check if deletion actually succeeded
+            FINAL_STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
+            if [ "$FINAL_STATUS" == "DOES_NOT_EXIST" ]; then
+              echo "Stack deleted successfully"
+              return 0
+            elif [ "$FINAL_STATUS" == "DELETE_FAILED" ]; then
+              echo "Stack deletion failed. Attempting to identify stuck resources..."
+              # Get resources that failed to delete
+              aws cloudformation describe-stack-resources --stack-name "$STACK_NAME" \
+                --query "StackResources[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceType,ResourceStatusReason]" \
+                --output table || true
+
+              # Retry deletion - sometimes resources need multiple attempts
+              echo "Retrying stack deletion..."
+              aws cloudformation delete-stack --stack-name "$STACK_NAME"
+              sleep 30
+              aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
+
+              RETRY_STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+                --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
+              if [ "$RETRY_STATUS" == "DOES_NOT_EXIST" ]; then
+                echo "Stack deleted successfully on retry"
+                return 0
+              else
+                echo "ERROR: Stack still exists in state: $RETRY_STATUS"
+                echo "Manual intervention may be required"
+                exit 1
+              fi
+            else
+              echo "Stack still exists in unexpected state: $FINAL_STATUS"
+              return 1
+            fi
+          }
+
           # Check if stack exists
           STACK_STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
             --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
 
+          echo "Current stack status: $STACK_STATUS"
+
           if [ "$STACK_STATUS" == "ROLLBACK_COMPLETE" ] || [ "$STACK_STATUS" == "DELETE_FAILED" ] || [ "$STACK_STATUS" == "UPDATE_ROLLBACK_COMPLETE" ]; then
-            echo "Stack $STACK_NAME is in $STACK_STATUS state. Deleting..."
-            aws cloudformation delete-stack --stack-name "$STACK_NAME"
-            echo "Waiting for stack deletion to complete..."
-            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
-            echo "Stack deleted successfully"
+            echo "Stack $STACK_NAME is in $STACK_STATUS state."
+            delete_stack
           elif [ "$STACK_STATUS" == "DOES_NOT_EXIST" ]; then
             echo "Stack does not exist, proceeding with fresh deployment"
           elif [ -z "$EXISTING_CONNECT" ]; then
@@ -270,10 +312,7 @@ jobs:
               if [ "$INSTANCE_STATUS" != "ACTIVE" ]; then
                 echo "Stack references Connect instance $STACK_CONNECT_ID which is $INSTANCE_STATUS"
                 echo "Deleting stack to allow fresh deployment with new Connect instance..."
-                aws cloudformation delete-stack --stack-name "$STACK_NAME"
-                echo "Waiting for stack deletion to complete..."
-                aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
-                echo "Stack deleted successfully"
+                delete_stack
               else
                 echo "Stack references valid Connect instance: $STACK_CONNECT_ID"
               fi
