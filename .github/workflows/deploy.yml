@@ -553,6 +553,52 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Clear stale phone number SSM parameters
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          echo "Checking for stale phone number configurations..."
+
+          # Get current phone numbers from SSM
+          LEX_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-lex" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+          NOVA_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-nova-sonic" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+
+          # Get Connect instance
+          INSTANCE_ID=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/instance-id" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+
+          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+            # Check if Lex phone exists and is valid
+            if [ -n "$LEX_PHONE" ] && [ "$LEX_PHONE" != "PLACEHOLDER" ] && [ "$LEX_PHONE" != "PENDING" ]; then
+              # Verify phone number is actually claimed in Connect
+              TARGET_ARN="arn:aws:connect:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):instance/${INSTANCE_ID}"
+              PHONE_EXISTS=$(aws connect list-phone-numbers-v2 --target-arn "$TARGET_ARN" \
+                --query "ListPhoneNumbersSummaryList[?PhoneNumber=='${LEX_PHONE}'].PhoneNumber" \
+                --output text 2>/dev/null || echo "")
+
+              if [ -z "$PHONE_EXISTS" ]; then
+                echo "Lex phone number $LEX_PHONE not found in Connect - clearing SSM parameter"
+                aws ssm delete-parameter --name "/headset-agent/${ENV}/connect/phone-number-lex" 2>/dev/null || true
+              fi
+            fi
+
+            # Check if Nova phone exists and is valid
+            if [ -n "$NOVA_PHONE" ] && [ "$NOVA_PHONE" != "PLACEHOLDER" ] && [ "$NOVA_PHONE" != "PENDING" ]; then
+              TARGET_ARN="arn:aws:connect:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):instance/${INSTANCE_ID}"
+              PHONE_EXISTS=$(aws connect list-phone-numbers-v2 --target-arn "$TARGET_ARN" \
+                --query "ListPhoneNumbersSummaryList[?PhoneNumber=='${NOVA_PHONE}'].PhoneNumber" \
+                --output text 2>/dev/null || echo "")
+
+              if [ -z "$PHONE_EXISTS" ]; then
+                echo "Nova Sonic phone number $NOVA_PHONE not found in Connect - clearing SSM parameter"
+                aws ssm delete-parameter --name "/headset-agent/${ENV}/connect/phone-number-nova-sonic" 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          echo "Phone number parameter check complete"
+
       - name: Setup Connect resources
         run: |
           python scripts/setup-connect.py \

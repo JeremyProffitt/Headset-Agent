@@ -55,7 +55,7 @@ def get_or_create_instance(client, instance_alias):
         return None
 
 
-def wait_for_phone_number_ready(client, phone_number_id, timeout=120):
+def wait_for_phone_number_ready(client, phone_number_id, timeout=180):
     """Wait for phone number to be in CLAIMED status (ready for use)"""
     print(f"  Waiting for phone number to be provisioned...")
     start_time = time.time()
@@ -72,19 +72,17 @@ def wait_for_phone_number_ready(client, phone_number_id, timeout=120):
                 return True
             elif status_value in ['FAILED', 'CANCELLED']:
                 print(f"  Phone number provisioning failed: {status_value}")
-                if 'limit' in status_message.lower():
+                if status_message:
+                    print(f"  Message: {status_message}")
+                if 'limit' in status_message.lower() or 'quota' in status_message.lower():
                     print("")
                     print("  ⚠️  PHONE NUMBER QUOTA ISSUE DETECTED")
-                    print("  This is a known AWS issue. Even with 0 phone numbers,")
-                    print("  the limit may be exceeded. Resolution requires AWS Support.")
-                    print("")
-                    print("  To resolve:")
-                    print("  1. Go to AWS Console > Service Quotas > Amazon Connect")
-                    print("  2. Search for 'Phone numbers per instance'")
-                    print("  3. Request a quota increase for your Connect instance")
-                    print("  4. Or open an AWS Support case for faster resolution")
+                    print("  This is a known AWS issue. Resolution requires AWS Support.")
                     print("")
                 return False
+            elif status_value == 'IN_PROGRESS':
+                print(f"  Status: IN_PROGRESS, waiting...")
+                time.sleep(10)
             else:
                 print(f"  Status: {status_value}, waiting...")
                 time.sleep(5)
@@ -96,62 +94,146 @@ def wait_for_phone_number_ready(client, phone_number_id, timeout=120):
     return False
 
 
-def claim_phone_number(client, instance_id, country_code='US', phone_type='DID', description=''):
-    """Claim a phone number for the Connect instance"""
+def release_phone_number(client, phone_number_id):
+    """Release a phone number from Connect"""
     try:
-        # Determine the target ARN - instance_id might already be an ARN
+        client.release_phone_number(PhoneNumberId=phone_number_id)
+        print(f"  Released phone number: {phone_number_id}")
+        # Wait for release to complete
+        time.sleep(5)
+        return True
+    except ClientError as e:
+        if 'ResourceNotFoundException' in str(e):
+            print(f"  Phone number already released or not found")
+            return True
+        print(f"  Error releasing phone number: {e}")
+        return False
+
+
+def get_phone_number_status(client, phone_number_id):
+    """Get the status of a phone number"""
+    try:
+        response = client.describe_phone_number(PhoneNumberId=phone_number_id)
+        status = response.get('ClaimedPhoneNumberSummary', {}).get('PhoneNumberStatus', {})
+        return status.get('Status', 'UNKNOWN')
+    except ClientError as e:
+        if 'ResourceNotFoundException' in str(e):
+            return 'NOT_FOUND'
+        print(f"  Error getting phone number status: {e}")
+        return 'ERROR'
+
+
+def find_and_cleanup_failed_phone_numbers(client, instance_id):
+    """Find and release any phone numbers in FAILED state"""
+    try:
         if instance_id.startswith('arn:'):
             target_arn = instance_id
         else:
             target_arn = f"arn:aws:connect:us-east-1:{get_account_id()}:instance/{instance_id}"
 
-        # Search for available phone numbers
-        response = client.search_available_phone_numbers(
-            TargetArn=target_arn,
-            PhoneNumberCountryCode=country_code,
-            PhoneNumberType=phone_type,
-            MaxResults=1
-        )
+        response = client.list_phone_numbers_v2(TargetArn=target_arn)
 
-        available = response.get('AvailableNumbersList', [])
-        if not available:
-            print(f"No available {phone_type} phone numbers in {country_code}")
+        released_count = 0
+        for phone in response.get('ListPhoneNumbersSummaryList', []):
+            phone_id = phone.get('PhoneNumberId')
+            if phone_id:
+                status = get_phone_number_status(client, phone_id)
+                if status in ['FAILED', 'CANCELLED']:
+                    print(f"  Found failed phone number: {phone.get('PhoneNumber')} (status: {status})")
+                    if release_phone_number(client, phone_id):
+                        released_count += 1
+
+        if released_count > 0:
+            print(f"  Released {released_count} failed phone number(s)")
+            # Wait for releases to fully propagate
+            print("  Waiting for releases to propagate...")
+            time.sleep(30)
+
+        return released_count
+    except ClientError as e:
+        print(f"  Error cleaning up failed phone numbers: {e}")
+        return 0
+
+
+def claim_phone_number(client, instance_id, country_code='US', phone_type='DID', description='', max_retries=3):
+    """Claim a phone number for the Connect instance with retry logic"""
+
+    for attempt in range(max_retries):
+        try:
+            # Determine the target ARN - instance_id might already be an ARN
+            if instance_id.startswith('arn:'):
+                target_arn = instance_id
+            else:
+                target_arn = f"arn:aws:connect:us-east-1:{get_account_id()}:instance/{instance_id}"
+
+            # Search for available phone numbers
+            response = client.search_available_phone_numbers(
+                TargetArn=target_arn,
+                PhoneNumberCountryCode=country_code,
+                PhoneNumberType=phone_type,
+                MaxResults=1
+            )
+
+            available = response.get('AvailableNumbersList', [])
+            if not available:
+                print(f"No available {phone_type} phone numbers in {country_code}")
+                return None
+
+            phone_number = available[0]['PhoneNumber']
+
+            # Claim the phone number
+            claim_response = client.claim_phone_number(
+                TargetArn=target_arn,
+                PhoneNumber=phone_number,
+                PhoneNumberDescription=description,
+                Tags={
+                    'Environment': 'prod',
+                    'Project': 'HeadsetSupportAgent'
+                }
+            )
+
+            claimed_phone_number_id = claim_response.get('PhoneNumberId')
+            print(f"Claimed phone number: {phone_number} (ID: {claimed_phone_number_id})")
+
+            # Wait for phone number to be fully provisioned
+            if claimed_phone_number_id:
+                if wait_for_phone_number_ready(client, claimed_phone_number_id):
+                    # SUCCESS - phone is ready
+                    return {
+                        'PhoneNumber': phone_number,
+                        'PhoneNumberId': claimed_phone_number_id,
+                        'PhoneNumberArn': claim_response.get('PhoneNumberArn'),
+                        'Status': 'CLAIMED'
+                    }
+                else:
+                    # Provisioning failed - release the phone number and retry
+                    print(f"  Provisioning failed, releasing phone number...")
+                    release_phone_number(client, claimed_phone_number_id)
+
+                    if attempt < max_retries - 1:
+                        wait_time = 30 * (attempt + 1)  # Exponential backoff
+                        print(f"  Waiting {wait_time}s before retry (attempt {attempt + 2}/{max_retries})...")
+                        time.sleep(wait_time)
+                    continue
+
             return None
 
-        phone_number = available[0]['PhoneNumber']
-        phone_number_id = available[0].get('PhoneNumberId')
+        except ClientError as e:
+            if 'ResourceNotFoundException' in str(e):
+                print(f"No phone numbers available or instance not found")
+            elif 'LimitExceededException' in str(e) or 'ServiceQuotaExceededException' in str(e):
+                print(f"  Phone number quota exceeded")
+                if attempt < max_retries - 1:
+                    wait_time = 60 * (attempt + 1)
+                    print(f"  Waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+                    continue
+            else:
+                print(f"Error claiming phone number: {e}")
+            return None
 
-        # Claim the phone number
-        claim_response = client.claim_phone_number(
-            TargetArn=target_arn,
-            PhoneNumber=phone_number,
-            PhoneNumberDescription=description,
-            Tags={
-                'Environment': 'dev',
-                'Project': 'HeadsetSupportAgent'
-            }
-        )
-
-        claimed_phone_number_id = claim_response.get('PhoneNumberId')
-        print(f"Claimed phone number: {phone_number} (ID: {claimed_phone_number_id})")
-
-        # Wait for phone number to be fully provisioned
-        if claimed_phone_number_id:
-            if not wait_for_phone_number_ready(client, claimed_phone_number_id):
-                print(f"  WARNING: Phone number may not be fully provisioned")
-
-        return {
-            'PhoneNumber': phone_number,
-            'PhoneNumberId': claimed_phone_number_id,
-            'PhoneNumberArn': claim_response.get('PhoneNumberArn')
-        }
-
-    except ClientError as e:
-        if 'ResourceNotFoundException' in str(e):
-            print(f"No phone numbers available or instance not found")
-        else:
-            print(f"Error claiming phone number: {e}")
-        return None
+    print(f"  Failed to claim phone number after {max_retries} attempts")
+    return None
 
 
 def get_account_id():
@@ -545,7 +627,7 @@ def get_contact_flow_id_by_name(client, instance_id, flow_name):
 
 
 def verify_phone_number_exists(client, instance_id, phone_number):
-    """Verify if a phone number is claimed and active in Connect"""
+    """Verify if a phone number is claimed and active in Connect (not failed)"""
     try:
         # Get target ARN
         if instance_id.startswith('arn:'):
@@ -557,6 +639,15 @@ def verify_phone_number_exists(client, instance_id, phone_number):
 
         for phone in response.get('ListPhoneNumbersSummaryList', []):
             if phone.get('PhoneNumber') == phone_number:
+                # Also check the phone number status
+                phone_id = phone.get('PhoneNumberId')
+                if phone_id:
+                    status = get_phone_number_status(client, phone_id)
+                    if status == 'CLAIMED':
+                        return True
+                    else:
+                        print(f"  Phone number exists but status is {status}")
+                        return False
                 return True
         return False
     except ClientError as e:
@@ -630,6 +721,10 @@ def main():
     if args.skip_phone_numbers:
         print("Skipping phone number claiming (--skip-phone-numbers)")
     else:
+        # First, clean up any failed phone numbers from previous attempts
+        print("Checking for failed phone numbers to clean up...")
+        find_and_cleanup_failed_phone_numbers(connect_client, instance_id)
+
         # Check existing phone numbers
         existing_lex_phone = get_ssm_parameter(
             ssm_client, f"/headset-agent/{args.environment}/connect/phone-number-lex"
@@ -642,7 +737,7 @@ def main():
         needs_lex_phone = not existing_lex_phone or existing_lex_phone in ['PLACEHOLDER', 'PENDING']
 
         if not needs_lex_phone:
-            # Verify the phone number actually exists in Connect
+            # Verify the phone number actually exists in Connect and is claimed
             if verify_phone_number_exists(connect_client, instance_id, existing_lex_phone):
                 print(f"Lex path phone number already claimed and verified: {existing_lex_phone}")
             else:
@@ -657,7 +752,7 @@ def main():
                     phone_type='TOLL_FREE',
                     description=f"Headset Support - Lex Path ({args.environment})"
                 )
-                if lex_phone:
+                if lex_phone and lex_phone.get('Status') == 'CLAIMED':
                     save_to_ssm(
                         ssm_client,
                         f"/headset-agent/{args.environment}/connect/phone-number-lex",
@@ -670,8 +765,10 @@ def main():
                             connect_client, instance_id,
                             lex_phone['PhoneNumberId'], lex_flow_id
                         )
+                    print(f"✓ Lex phone number ready: {lex_phone['PhoneNumber']}")
                 else:
-                    print("Failed to claim Lex phone number - may need manual claiming")
+                    print("✗ Failed to claim Lex phone number - provisioning did not complete")
+                    print("  This may be a quota issue - check AWS Service Quotas for Amazon Connect")
             else:
                 print("Lex contact flow not found - skipping phone number")
 
@@ -694,7 +791,7 @@ def main():
                     phone_type='TOLL_FREE',
                     description=f"Headset Support - Nova Sonic Path ({args.environment})"
                 )
-                if nova_phone:
+                if nova_phone and nova_phone.get('Status') == 'CLAIMED':
                     save_to_ssm(
                         ssm_client,
                         f"/headset-agent/{args.environment}/connect/phone-number-nova-sonic",
@@ -707,8 +804,10 @@ def main():
                             connect_client, instance_id,
                             nova_phone['PhoneNumberId'], nova_flow_id
                         )
+                    print(f"✓ Nova Sonic phone number ready: {nova_phone['PhoneNumber']}")
                 else:
-                    print("Failed to claim Nova Sonic phone number - may need manual claiming")
+                    print("✗ Failed to claim Nova Sonic phone number - provisioning did not complete")
+                    print("  This may be a quota issue - check AWS Service Quotas for Amazon Connect")
             else:
                 print("Nova Sonic contact flow not found - skipping phone number")
 
