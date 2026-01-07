@@ -566,7 +566,7 @@ def verify_phone_number_exists(client, instance_id, phone_number):
 
 def main():
     parser = argparse.ArgumentParser(description='Setup Amazon Connect for Headset Support Agent')
-    parser.add_argument('--environment', '-e', default='dev', choices=['dev', 'staging', 'prod'])
+    parser.add_argument('--environment', '-e', default='prod', choices=['prod'])
     parser.add_argument('--region', '-r', default='us-east-1')
     parser.add_argument('--skip-phone-numbers', action='store_true',
                         help='Skip phone number claiming (useful if already claimed)')

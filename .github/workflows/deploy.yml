@@ -10,11 +10,9 @@ on:
       environment:
         description: 'Target environment'
         required: true
-        default: 'dev'
+        default: 'prod'
         type: choice
         options:
-          - dev
-          - staging
           - prod
       deploy_lex_path:
         description: 'Deploy Lex Path (A)'
@@ -46,16 +44,13 @@ jobs:
       - name: Determine environment
         id: set-env
         run: |
+          # Single environment: prod
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
             echo "deploy_lex=${{ github.event.inputs.deploy_lex_path }}" >> $GITHUB_OUTPUT
             echo "deploy_nova_sonic=${{ github.event.inputs.deploy_nova_sonic_path }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
-            echo "environment=prod" >> $GITHUB_OUTPUT
-            echo "deploy_lex=true" >> $GITHUB_OUTPUT
-            echo "deploy_nova_sonic=true" >> $GITHUB_OUTPUT
           else
-            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "environment=prod" >> $GITHUB_OUTPUT
             echo "deploy_lex=true" >> $GITHUB_OUTPUT
             echo "deploy_nova_sonic=true" >> $GITHUB_OUTPUT
           fi
@@ -201,29 +196,14 @@ jobs:
       - name: Check for existing Connect instance
         id: connect
         run: |
-          ENV="${{ needs.setup.outputs.environment }}"
-          AWS_ACCOUNT_ID="${{ needs.validate.outputs.aws_account_id }}"
+          # Look for Connect instance with alias "headset"
+          CONNECT_ALIAS="headset"
 
-          # Check for existing instance with new naming pattern (headset-{account}-{env})
-          NEW_ALIAS="headset-${AWS_ACCOUNT_ID}-${ENV}"
-          # Also check for legacy naming pattern (headset-support-{env})
-          LEGACY_ALIAS="headset-support-${ENV}"
+          echo "Checking for Connect instance with alias: $CONNECT_ALIAS"
 
-          echo "Checking for Connect instances..."
-          echo "  New pattern: $NEW_ALIAS"
-          echo "  Legacy pattern: $LEGACY_ALIAS"
-
-          # Check for instance with new naming pattern first
           EXISTING_INSTANCE=$(aws connect list-instances \
-            --query "InstanceSummaryList[?InstanceAlias=='${NEW_ALIAS}' && InstanceStatus=='ACTIVE'].Id | [0]" \
+            --query "InstanceSummaryList[?InstanceAlias=='${CONNECT_ALIAS}' && InstanceStatus=='ACTIVE'].Id | [0]" \
             --output text 2>/dev/null || echo "None")
-
-          if [ "$EXISTING_INSTANCE" == "None" ] || [ -z "$EXISTING_INSTANCE" ]; then
-            # Check for legacy naming pattern
-            EXISTING_INSTANCE=$(aws connect list-instances \
-              --query "InstanceSummaryList[?InstanceAlias=='${LEGACY_ALIAS}' && InstanceStatus=='ACTIVE'].Id | [0]" \
-              --output text 2>/dev/null || echo "None")
-          fi
 
           if [ "$EXISTING_INSTANCE" != "None" ] && [ -n "$EXISTING_INSTANCE" ]; then
             # Verify instance is actually accessible by describing it
@@ -239,7 +219,7 @@ jobs:
               echo "instance_id=" >> $GITHUB_OUTPUT
             fi
           else
-            echo "No existing Connect instance found, will create new with alias: $NEW_ALIAS"
+            echo "No existing Connect instance found, will create new with alias: $CONNECT_ALIAS"
             echo "instance_id=" >> $GITHUB_OUTPUT
           fi
 

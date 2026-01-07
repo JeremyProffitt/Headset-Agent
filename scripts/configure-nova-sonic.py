@@ -163,7 +163,7 @@ def configure_nova_sonic_for_connect(connect_client, instance_id, bot_id, bot_al
 
 def main():
     parser = argparse.ArgumentParser(description='Configure Nova Sonic for Lex Bot')
-    parser.add_argument('--environment', '-e', default='dev', choices=['dev', 'staging', 'prod'],
+    parser.add_argument('--environment', '-e', default='prod', choices=['prod'],
                         help='Deployment environment')
     parser.add_argument('--region', '-r', default='us-east-1', help='AWS region')
     parser.add_argument('--bot-name', '-b', default='HeadsetTroubleshooterBot',

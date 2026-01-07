@@ -16,12 +16,10 @@ Globals:
 Parameters:
   Environment:
     Type: String
-    Default: dev
+    Default: prod
     AllowedValues:
-      - dev
-      - staging
       - prod
-    Description: Deployment environment
+    Description: Deployment environment (production only)
 
   SupervisorAgentName:
     Type: String
@@ -595,7 +593,7 @@ Resources:
     Type: AWS::Connect::Instance
     Condition: CreateConnectInstance
     Properties:
-      InstanceAlias: !Sub "headset-${AWS::AccountId}-${Environment}"
+      InstanceAlias: "headset"
       IdentityManagementType: CONNECT_MANAGED
       Attributes:
         InboundCalls: true

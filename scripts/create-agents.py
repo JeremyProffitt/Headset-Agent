@@ -261,7 +261,7 @@ def store_ssm_parameter(ssm_client, name, value, description):
 
 def main():
     parser = argparse.ArgumentParser(description='Create Bedrock agents for Headset Support')
-    parser.add_argument('--environment', '-e', default='dev', choices=['dev', 'staging', 'prod'],
+    parser.add_argument('--environment', '-e', default='prod', choices=['prod'],
                         help='Deployment environment')
     parser.add_argument('--region', '-r', default='us-east-1', help='AWS region')
     parser.add_argument('--model-provider', '-m', default='anthropic', choices=['anthropic', 'llama'],
