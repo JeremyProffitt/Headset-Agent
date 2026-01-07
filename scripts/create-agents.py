@@ -159,9 +159,9 @@ def create_agent(client, agent_config, role_arn, model_id, environment):
         return None
 
 
-def wait_for_agent(client, agent_id, timeout=120):
-    """Wait for agent to be in PREPARED or NOT_PREPARED state"""
-    print(f"Waiting for agent {agent_id} to be ready...")
+def wait_for_agent_ready(client, agent_id, target_states, timeout=120):
+    """Wait for agent to reach one of the target states"""
+    print(f"Waiting for agent {agent_id} to reach state: {target_states}...")
     start_time = time.time()
 
     while time.time() - start_time < timeout:
@@ -170,7 +170,7 @@ def wait_for_agent(client, agent_id, timeout=120):
             status = response['agent']['agentStatus']
             print(f"  Agent status: {status}")
 
-            if status in ['PREPARED', 'NOT_PREPARED']:
+            if status in target_states:
                 return status
             elif status == 'FAILED':
                 print(f"  Agent failed: {response['agent'].get('failureReasons', 'Unknown')}")
@@ -185,8 +185,30 @@ def wait_for_agent(client, agent_id, timeout=120):
     return None
 
 
+def wait_for_agent(client, agent_id, timeout=120):
+    """Wait for agent to be in PREPARED or NOT_PREPARED state (legacy wrapper)"""
+    return wait_for_agent_ready(client, agent_id, ['PREPARED', 'NOT_PREPARED'], timeout)
+
+
 def prepare_agent(client, agent_id):
     """Prepare an agent for deployment"""
+    # First wait for agent to exit Creating state
+    print(f"Waiting for agent {agent_id} to finish creating...")
+    ready_status = wait_for_agent_ready(client, agent_id, ['NOT_PREPARED', 'PREPARED', 'FAILED'], timeout=120)
+
+    if ready_status == 'FAILED':
+        print(f"Agent {agent_id} is in FAILED state, cannot prepare")
+        return 'FAILED'
+
+    if ready_status == 'PREPARED':
+        print(f"Agent {agent_id} is already prepared")
+        return 'PREPARED'
+
+    if ready_status is None:
+        print(f"Timeout waiting for agent {agent_id} to finish creating")
+        return None
+
+    # Now prepare the agent
     print(f"Preparing agent {agent_id}...")
     try:
         client.prepare_agent(agentId=agent_id)
@@ -301,12 +323,15 @@ def main():
                 agent_id,
                 "Bedrock Supervisor Agent ID"
             )
-            store_ssm_parameter(
-                ssm_client,
-                f"/headset-agent/{args.environment}/supervisor-agent-alias",
-                alias_id,
-                "Bedrock Supervisor Agent Alias ID"
-            )
+            if alias_id:
+                store_ssm_parameter(
+                    ssm_client,
+                    f"/headset-agent/{args.environment}/supervisor-agent-alias",
+                    alias_id,
+                    "Bedrock Supervisor Agent Alias ID"
+                )
+            else:
+                print("Warning: Skipping alias SSM parameter - alias was not created")
 
     print("\n=== Agent Creation Complete ===")
     for agent_key, agent_id in agent_ids.items():
