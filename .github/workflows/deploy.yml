@@ -244,7 +244,39 @@ jobs:
           STACK_NAME="agent-headset-${ENV}"
           EXISTING_CONNECT="${{ steps.connect.outputs.instance_id }}"
 
+          empty_s3_buckets() {
+            # Find and empty all S3 buckets in the stack
+            echo "Finding S3 buckets in stack..."
+            BUCKETS=$(aws cloudformation describe-stack-resources --stack-name "$STACK_NAME" \
+              --query "StackResources[?ResourceType=='AWS::S3::Bucket'].PhysicalResourceId" \
+              --output text 2>/dev/null || echo "")
+
+            for BUCKET in $BUCKETS; do
+              if [ -n "$BUCKET" ] && [ "$BUCKET" != "None" ]; then
+                echo "Emptying S3 bucket: $BUCKET"
+                # Delete all object versions (required for versioned buckets)
+                aws s3api list-object-versions --bucket "$BUCKET" --output json 2>/dev/null | \
+                  jq -r '.Versions[]? | "\(.Key)\t\(.VersionId)"' | \
+                  while IFS=$'\t' read -r key version; do
+                    [ -n "$key" ] && aws s3api delete-object --bucket "$BUCKET" --key "$key" --version-id "$version" 2>/dev/null || true
+                  done
+                # Delete all delete markers
+                aws s3api list-object-versions --bucket "$BUCKET" --output json 2>/dev/null | \
+                  jq -r '.DeleteMarkers[]? | "\(.Key)\t\(.VersionId)"' | \
+                  while IFS=$'\t' read -r key version; do
+                    [ -n "$key" ] && aws s3api delete-object --bucket "$BUCKET" --key "$key" --version-id "$version" 2>/dev/null || true
+                  done
+                # Also try simple delete for non-versioned objects
+                aws s3 rm "s3://$BUCKET" --recursive 2>/dev/null || true
+                echo "Bucket $BUCKET emptied"
+              fi
+            done
+          }
+
           delete_stack() {
+            # First, empty any S3 buckets in the stack
+            empty_s3_buckets
+
             echo "Deleting stack $STACK_NAME..."
             aws cloudformation delete-stack --stack-name "$STACK_NAME"
             echo "Waiting for stack deletion to complete..."
@@ -264,8 +296,9 @@ jobs:
                 --query "StackResources[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceType,ResourceStatusReason]" \
                 --output table || true
 
-              # Retry deletion - sometimes resources need multiple attempts
-              echo "Retrying stack deletion..."
+              # Try emptying S3 buckets again and retry deletion
+              echo "Retrying with bucket cleanup..."
+              empty_s3_buckets
               aws cloudformation delete-stack --stack-name "$STACK_NAME"
               sleep 30
               aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
