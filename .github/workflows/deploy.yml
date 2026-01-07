@@ -217,6 +217,27 @@ jobs:
             echo "instance_id=" >> $GITHUB_OUTPUT
           fi
 
+      - name: Clean up failed stack if necessary
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          STACK_NAME="agent-headset-${ENV}"
+
+          # Check if stack exists and is in a failed state
+          STACK_STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
+          if [ "$STACK_STATUS" == "ROLLBACK_COMPLETE" ] || [ "$STACK_STATUS" == "DELETE_FAILED" ]; then
+            echo "Stack $STACK_NAME is in $STACK_STATUS state. Deleting..."
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            echo "Waiting for stack deletion to complete..."
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
+            echo "Stack deleted successfully"
+          elif [ "$STACK_STATUS" == "DOES_NOT_EXIST" ]; then
+            echo "Stack does not exist, proceeding with fresh deployment"
+          else
+            echo "Stack exists in state: $STACK_STATUS"
+          fi
+
       - name: SAM Deploy
         id: deploy
         run: |
