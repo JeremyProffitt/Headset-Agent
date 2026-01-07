@@ -585,12 +585,29 @@ def main():
     connect_client = get_connect_client(args.region)
     ssm_client = get_ssm_client(args.region)
 
-    # Step 1: Get Connect instance ID from SSM (created by CloudFormation)
+    # Step 1: Get Connect instance - prefer querying Connect API directly for ACTIVE instances
     print("\n--- Step 1: Get Connect Instance ---")
-    instance_id = get_ssm_parameter(ssm_client, f"/headset-agent/{args.environment}/connect/instance-id")
+
+    # First try to find an ACTIVE instance directly from Connect API
+    instance_id = None
+    try:
+        response = connect_client.list_instances()
+        for instance in response.get('InstanceSummaryList', []):
+            if instance.get('InstanceStatus') == 'ACTIVE':
+                instance_id = instance['Id']
+                print(f"Found ACTIVE Connect instance: {instance_id} (alias: {instance.get('InstanceAlias', 'none')})")
+                break
+    except Exception as e:
+        print(f"Error listing Connect instances: {e}")
+
+    # Fallback to SSM parameter if no active instance found via API
+    if not instance_id:
+        instance_id = get_ssm_parameter(ssm_client, f"/headset-agent/{args.environment}/connect/instance-id")
+        if instance_id:
+            print(f"Using Connect instance from SSM: {instance_id}")
 
     if not instance_id:
-        print("WARN: Connect instance not yet created by CloudFormation.")
+        print("WARN: No active Connect instance found.")
         print("      The SAM stack must complete successfully first.")
         return 0  # Don't fail - CloudFormation might still be running
 
