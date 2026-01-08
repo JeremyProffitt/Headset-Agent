@@ -32,6 +32,69 @@ type NovaSonicRequest struct {
 	Config      *models.NovaSonicConfig `json:"config,omitempty"`
 }
 
+// ConnectContactFlowEvent represents an Amazon Connect contact flow Lambda invocation
+type ConnectContactFlowEvent struct {
+	Name    string                       `json:"Name"`
+	Details ConnectContactFlowDetails    `json:"Details"`
+}
+
+// ConnectContactFlowDetails contains the contact details from Connect
+type ConnectContactFlowDetails struct {
+	ContactData ConnectContactData       `json:"ContactData"`
+	Parameters  map[string]string        `json:"Parameters"`
+}
+
+// ConnectContactData contains contact information
+type ConnectContactData struct {
+	Attributes          map[string]string `json:"Attributes"`
+	Channel             string            `json:"Channel"`
+	ContactID           string            `json:"ContactId"`
+	CustomerEndpoint    *ConnectEndpoint  `json:"CustomerEndpoint"`
+	InitialContactID    string            `json:"InitialContactId"`
+	InitiationMethod    string            `json:"InitiationMethod"`
+	InstanceARN         string            `json:"InstanceARN"`
+	MediaStreams        *MediaStreams     `json:"MediaStreams"`
+	PreviousContactID   string            `json:"PreviousContactId"`
+	Queue               *ConnectQueue     `json:"Queue"`
+	SystemEndpoint      *ConnectEndpoint  `json:"SystemEndpoint"`
+}
+
+// ConnectEndpoint represents a phone endpoint
+type ConnectEndpoint struct {
+	Address string `json:"Address"`
+	Type    string `json:"Type"`
+}
+
+// ConnectQueue represents a Connect queue
+type ConnectQueue struct {
+	ARN  string `json:"ARN"`
+	Name string `json:"Name"`
+}
+
+// MediaStreams contains media streaming information
+type MediaStreams struct {
+	Customer CustomerMediaStreams `json:"Customer"`
+}
+
+// CustomerMediaStreams contains customer audio stream info
+type CustomerMediaStreams struct {
+	Audio CustomerAudio `json:"Audio"`
+}
+
+// CustomerAudio contains audio stream details
+type CustomerAudio struct {
+	StartFragmentNumber string `json:"StartFragmentNumber"`
+	StartTimestamp      string `json:"StartTimestamp"`
+	StreamARN           string `json:"StreamARN"`
+}
+
+// ConnectLambdaResponse is the response format for Connect contact flows
+type ConnectLambdaResponse struct {
+	TextOutput          string `json:"textOutput,omitempty"`
+	Status              string `json:"status,omitempty"`
+	EscalationRequested string `json:"escalation_requested,omitempty"`
+}
+
 // NovaSonicResponse represents the streaming response
 type NovaSonicResponse struct {
 	SessionID    string             `json:"sessionId"`
@@ -269,11 +332,88 @@ func handleSessionEnd(ctx context.Context, request NovaSonicRequest) (*NovaSonic
 	}, nil
 }
 
+// handleConnectContactFlow handles Amazon Connect contact flow Lambda invocations
+func handleConnectContactFlow(ctx context.Context, event ConnectContactFlowEvent) (*ConnectLambdaResponse, error) {
+	log.Printf("=== CONNECT CONTACT FLOW HANDLER START ===")
+	log.Printf("Contact ID: %s", event.Details.ContactData.ContactID)
+	log.Printf("Channel: %s", event.Details.ContactData.Channel)
+	log.Printf("Initiation Method: %s", event.Details.ContactData.InitiationMethod)
+
+	// Extract persona from contact attributes
+	personaID := ""
+	if event.Details.ContactData.Attributes != nil {
+		personaID = event.Details.ContactData.Attributes["persona_id"]
+	}
+	if personaID == "" {
+		personaID = os.Getenv("DEFAULT_PERSONA")
+		if personaID == "" {
+			personaID = "tangerine"
+		}
+	}
+	log.Printf("Using persona: %s", personaID)
+
+	// Load persona configuration
+	p, err := personaLoader.Load(ctx, personaID)
+	if err != nil {
+		log.Printf("Error loading persona %s: %v, using default", personaID, err)
+		p = persona.DefaultPersona()
+	}
+
+	// Get agent config from SSM
+	agentIDParam := os.Getenv("SUPERVISOR_AGENT_ID_PARAM")
+	agentAliasParam := os.Getenv("SUPERVISOR_AGENT_ALIAS_PARAM")
+
+	var agentID, agentAlias string
+	if agentIDParam != "" {
+		idResult, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{Name: &agentIDParam})
+		if err == nil && idResult.Parameter.Value != nil {
+			agentID = *idResult.Parameter.Value
+		}
+	}
+	if agentAliasParam != "" {
+		aliasResult, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{Name: &agentAliasParam})
+		if err == nil && aliasResult.Parameter.Value != nil {
+			agentAlias = *aliasResult.Parameter.Value
+		}
+	}
+
+	// Check if agent is configured
+	if agentID == "" || agentID == "PLACEHOLDER" || agentAlias == "" || agentAlias == "PLACEHOLDER" {
+		log.Printf("Supervisor agent not configured (ID: %s, Alias: %s)", agentID, agentAlias)
+		// Return a greeting message while agent is being configured
+		greeting := "Hello! I'm your headset support assistant. The system is currently being set up. Please try again in a few minutes."
+		if p != nil && len(p.Phrases.Greeting) > 0 {
+			greeting = p.Phrases.Greeting[0] + " I'm still getting set up. Please call back in a few minutes."
+		}
+		return &ConnectLambdaResponse{
+			TextOutput: greeting,
+			Status:     "complete",
+		}, nil
+	}
+
+	// For initial contact flow invocation, return a greeting
+	// In a full implementation, this would handle bidirectional streaming with Nova Sonic
+	greeting := "Hello! I'm your headset support assistant. How can I help you today?"
+	if p != nil && len(p.Phrases.Greeting) > 0 {
+		greeting = p.Phrases.Greeting[0]
+	}
+
+	log.Printf("Returning greeting: %s", greeting)
+	return &ConnectLambdaResponse{
+		TextOutput:          greeting,
+		Status:              "ready",
+		EscalationRequested: "false",
+	}, nil
+}
+
 // handleRequest is the main Lambda handler
 func handleRequest(ctx context.Context, event json.RawMessage) (interface{}, error) {
+	log.Printf("Received event: %s", string(event))
+
 	// Try to parse as API Gateway event (for function URL)
 	var apiEvent events.APIGatewayV2HTTPRequest
 	if err := json.Unmarshal(event, &apiEvent); err == nil && apiEvent.RequestContext.HTTP.Method != "" {
+		log.Printf("Detected API Gateway V2 event")
 		// Parse the request body
 		var request NovaSonicRequest
 		if err := json.Unmarshal([]byte(apiEvent.Body), &request); err != nil {
@@ -302,13 +442,25 @@ func handleRequest(ctx context.Context, event json.RawMessage) (interface{}, err
 		}, nil
 	}
 
-	// Direct Lambda invocation
-	var request NovaSonicRequest
-	if err := json.Unmarshal(event, &request); err != nil {
-		log.Printf("Error parsing event: %v", err)
-		return nil, err
+	// Try to parse as Amazon Connect contact flow event
+	var connectEvent ConnectContactFlowEvent
+	if err := json.Unmarshal(event, &connectEvent); err == nil && connectEvent.Details.ContactData.ContactID != "" {
+		log.Printf("Detected Amazon Connect contact flow event")
+		return handleConnectContactFlow(ctx, connectEvent)
 	}
 
+	// Direct Lambda invocation with NovaSonicRequest
+	var request NovaSonicRequest
+	if err := json.Unmarshal(event, &request); err != nil {
+		log.Printf("Error parsing event as NovaSonicRequest: %v", err)
+		// Return a generic error response that Connect can handle
+		return &ConnectLambdaResponse{
+			TextOutput: "I'm sorry, I couldn't process that request. Please try again.",
+			Status:     "error",
+		}, nil
+	}
+
+	log.Printf("Processing direct NovaSonicRequest invocation")
 	return handleStreamingRequest(ctx, request)
 }
 

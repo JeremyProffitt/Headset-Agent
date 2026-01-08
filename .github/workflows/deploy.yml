@@ -605,6 +605,49 @@ jobs:
             --environment "${{ needs.setup.outputs.environment }}" \
             --region "${{ env.AWS_REGION }}"
 
+      - name: Verify contact flow configuration
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+
+          # Get Connect instance ID
+          INSTANCE_ID=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/instance-id" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+
+          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+            echo "=== Contact Flow Configuration Check ==="
+            echo "Instance ID: $INSTANCE_ID"
+            echo ""
+
+            # List contact flows and their IDs
+            echo "Contact flows in instance:"
+            aws connect list-contact-flows --instance-id "$INSTANCE_ID" \
+              --contact-flow-types CONTACT_FLOW \
+              --query 'ContactFlowSummaryList[*].[Name,Id,ContactFlowState]' \
+              --output table 2>/dev/null || echo "Could not list contact flows"
+
+            # Get and display Lex contact flow content for debugging
+            LEX_FLOW_ID=$(aws connect list-contact-flows --instance-id "$INSTANCE_ID" \
+              --contact-flow-types CONTACT_FLOW \
+              --query "ContactFlowSummaryList[?contains(Name, 'Lex')].Id | [0]" \
+              --output text 2>/dev/null || echo "")
+
+            if [ -n "$LEX_FLOW_ID" ] && [ "$LEX_FLOW_ID" != "None" ]; then
+              echo ""
+              echo "=== Lex Contact Flow Content (checking for KVS references) ==="
+              FLOW_CONTENT=$(aws connect describe-contact-flow --instance-id "$INSTANCE_ID" \
+                --contact-flow-id "$LEX_FLOW_ID" --query 'ContactFlow.Content' --output text 2>/dev/null || echo "{}")
+
+              # Check for KVS/media streaming references
+              if echo "$FLOW_CONTENT" | grep -qi "kinesis\|kvs\|mediastream\|StartMediaStreaming"; then
+                echo "WARNING: Contact flow contains media streaming/KVS references!"
+                echo "This may cause 'KVS Lambda trigger' errors."
+                echo "Consider recreating the contact flow from CloudFormation."
+              else
+                echo "No KVS/media streaming references found in Lex contact flow."
+              fi
+            fi
+          fi
+
   validate-deployment:
     name: Validate Deployment
     runs-on: ubuntu-latest
@@ -656,6 +699,25 @@ jobs:
             echo "Supervisor Agent ID: $AGENT_ID"
           fi
 
+      - name: Print phone numbers
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+
+          echo ""
+          echo "========================================"
+          echo "       HEADSET AGENT PHONE NUMBERS"
+          echo "========================================"
+          echo ""
+
+          LEX_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-lex" --query 'Parameter.Value' --output text 2>/dev/null || echo "Not configured")
+          NOVA_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-nova-sonic" --query 'Parameter.Value' --output text 2>/dev/null || echo "Not configured")
+
+          echo "  Lex Path (Path A):        ${LEX_PHONE}"
+          echo "  Nova Sonic Path (Path B): ${NOVA_PHONE}"
+          echo ""
+          echo "========================================"
+          echo ""
+
       - name: Deployment summary
         run: |
           ENV="${{ needs.setup.outputs.environment }}"
@@ -668,12 +730,6 @@ jobs:
           echo "Paths deployed:"
           echo "  - Lex Path (A): ${{ needs.setup.outputs.deploy_lex }}"
           echo "  - Nova Sonic Path (B): ${{ needs.setup.outputs.deploy_nova_sonic }}"
-          echo ""
-          echo "Connect Status:"
-          LEX_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-lex" --query 'Parameter.Value' --output text 2>/dev/null || echo "Not configured")
-          NOVA_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-nova-sonic" --query 'Parameter.Value' --output text 2>/dev/null || echo "Not configured")
-          echo "  - Lex Phone: ${LEX_PHONE}"
-          echo "  - Nova Sonic Phone: ${NOVA_PHONE}"
 
   notify-failure:
     name: Notify on Failure
