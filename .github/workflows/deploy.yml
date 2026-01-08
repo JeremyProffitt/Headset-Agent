@@ -599,6 +599,32 @@ jobs:
 
           echo "Phone number parameter check complete"
 
+      - name: List existing phone numbers in Connect
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+
+          # Get Connect instance ID
+          INSTANCE_ID=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/instance-id" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+
+          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+            echo "=== Existing Phone Numbers in Connect Instance ==="
+            echo "Instance ID: $INSTANCE_ID"
+            echo ""
+
+            # List all phone numbers
+            aws connect list-phone-numbers \
+              --instance-id "$INSTANCE_ID" \
+              --query 'PhoneNumberSummaryList[*].{Phone:PhoneNumber,Type:PhoneNumberType,Status:PhoneNumberCountryCode}' \
+              --output table 2>/dev/null || echo "No phone numbers found or unable to list"
+
+            echo ""
+            echo "To release unused phone numbers:"
+            echo "1. Go to AWS Console → Amazon Connect → Phone numbers"
+            echo "2. Select unused numbers and release them"
+            echo ""
+          fi
+
       - name: Setup Connect resources
         run: |
           python scripts/setup-connect.py \
