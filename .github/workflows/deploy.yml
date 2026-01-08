@@ -699,37 +699,66 @@ jobs:
             echo "Supervisor Agent ID: $AGENT_ID"
           fi
 
-      - name: Print phone numbers
-        run: |
-          ENV="${{ needs.setup.outputs.environment }}"
-
-          echo ""
-          echo "========================================"
-          echo "       HEADSET AGENT PHONE NUMBERS"
-          echo "========================================"
-          echo ""
-
-          LEX_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-lex" --query 'Parameter.Value' --output text 2>/dev/null || echo "Not configured")
-          NOVA_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-nova-sonic" --query 'Parameter.Value' --output text 2>/dev/null || echo "Not configured")
-
-          echo "  Lex Path (Path A):        ${LEX_PHONE}"
-          echo "  Nova Sonic Path (Path B): ${NOVA_PHONE}"
-          echo ""
-          echo "========================================"
-          echo ""
-
-      - name: Deployment summary
+      - name: Deployment summary and phone numbers
         run: |
           ENV="${{ needs.setup.outputs.environment }}"
           STACK_NAME="agent-headset-${ENV}"
 
-          echo "=== Deployment Complete ==="
-          echo "Environment: ${ENV}"
-          echo "Stack: ${STACK_NAME}"
+          # Get phone numbers from SSM
+          LEX_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-lex" --query 'Parameter.Value' --output text 2>/dev/null || echo "Not configured")
+          NOVA_PHONE=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/phone-number-nova-sonic" --query 'Parameter.Value' --output text 2>/dev/null || echo "Not configured")
+
+          # Get Connect instance ID
+          INSTANCE_ID=$(aws ssm get-parameter --name "/headset-agent/${ENV}/connect/instance-id" --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+
+          # Get contact flow names
+          LEX_FLOW_NAME="HeadsetSupport-Lex-${ENV}"
+          NOVA_FLOW_NAME="HeadsetSupport-NovaSonic-${ENV}"
+
           echo ""
-          echo "Paths deployed:"
-          echo "  - Lex Path (A): ${{ needs.setup.outputs.deploy_lex }}"
-          echo "  - Nova Sonic Path (B): ${{ needs.setup.outputs.deploy_nova_sonic }}"
+          echo "╔════════════════════════════════════════════════════════════════╗"
+          echo "║                    DEPLOYMENT COMPLETE                          ║"
+          echo "╠════════════════════════════════════════════════════════════════╣"
+          echo "║  Environment: ${ENV}"
+          echo "║  Stack: ${STACK_NAME}"
+          echo "║  Connect Instance: ${INSTANCE_ID}"
+          echo "╠════════════════════════════════════════════════════════════════╣"
+          echo "║                      PHONE NUMBERS                              ║"
+          echo "╠════════════════════════════════════════════════════════════════╣"
+          echo "║"
+          echo "║  PATH A - Amazon Lex"
+          echo "║  ────────────────────────────────────────"
+          if [ "$LEX_PHONE" != "Not configured" ] && [ "$LEX_PHONE" != "PENDING" ] && [ -n "$LEX_PHONE" ]; then
+            echo "║  📞 Phone: ${LEX_PHONE}"
+          else
+            echo "║  📞 Phone: Not yet assigned"
+          fi
+          echo "║  🤖 Bot: HeadsetTroubleshooterBot-${ENV}"
+          echo "║  📋 Flow: ${LEX_FLOW_NAME}"
+          echo "║  📝 Description: Traditional Lex voice bot with Bedrock backend"
+          echo "║"
+          echo "║  PATH B - Nova Sonic"
+          echo "║  ────────────────────────────────────────"
+          if [ "$NOVA_PHONE" != "Not configured" ] && [ "$NOVA_PHONE" != "PENDING" ] && [ -n "$NOVA_PHONE" ]; then
+            echo "║  📞 Phone: ${NOVA_PHONE}"
+          else
+            echo "║  📞 Phone: Not yet assigned"
+          fi
+          echo "║  🤖 Lambda: headset-nova-sonic-${ENV}"
+          echo "║  📋 Flow: ${NOVA_FLOW_NAME}"
+          echo "║  📝 Description: Direct Bedrock streaming with Nova Sonic voice"
+          echo "║"
+          echo "╚════════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          # Verify phone numbers are associated with correct flows
+          if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ]; then
+            echo "=== Phone Number Associations ==="
+            aws connect list-phone-numbers-v2 \
+              --target-arn "arn:aws:connect:${{ env.AWS_REGION }}:$(aws sts get-caller-identity --query Account --output text):instance/${INSTANCE_ID}" \
+              --query 'ListPhoneNumbersSummaryList[*].[PhoneNumber,PhoneNumberDescription]' \
+              --output table 2>/dev/null || echo "Could not list phone number associations"
+          fi
 
   notify-failure:
     name: Notify on Failure
