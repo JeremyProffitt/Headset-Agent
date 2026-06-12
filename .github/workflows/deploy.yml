@@ -463,6 +463,7 @@ jobs:
             --s3-bucket "headset-agent-sam-${{ needs.validate.outputs.aws_account_id }}-${{ env.AWS_REGION }}" \
             --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset \
+            --tags Project=Headset-Agent CostCenter=voice-ai Environment=prod ManagedBy=sam DeployedVia=github-actions Owner=jeremy \
             --parameter-overrides $PARAMS
 
           echo "Stack deployment complete: $STACK_NAME"
