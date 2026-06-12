@@ -182,6 +182,14 @@ func kbConfig() (kbID, modelID string) {
 	return kbID, modelID
 }
 
+// guardrailConfig returns the Bedrock Guardrail ID and published version from
+// the environment (template.yaml sets GUARDRAIL_ID and GUARDRAIL_VERSION on the
+// function via !GetAtt). When either value is absent the caller should leave
+// the guardrail unset — the RetrieveAndGenerate path degrades gracefully.
+func guardrailConfig() (id, version string) {
+	return os.Getenv("GUARDRAIL_ID"), os.Getenv("GUARDRAIL_VERSION")
+}
+
 // ---------------------------------------------------------------------------
 // B-07: Lex slots → triage classification + KB metadata filters
 // ---------------------------------------------------------------------------
@@ -541,6 +549,7 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 	if kbID, modelID := kbConfig(); kbID != "" {
 		// A-08: Lambda-side retrieval — answer directly from the knowledge
 		// base instead of depending on the supervisor agent.
+		gID, gVersion := guardrailConfig()
 		answer, ragErr := agentClient.RetrieveAndGenerate(ctx, agents.RetrieveAndGenerateRequest{
 			KnowledgeBaseID: kbID,
 			ModelID:         modelID,
@@ -548,7 +557,9 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 			Persona:         p,
 			// B-07: /chat shares the metadata filter when the front-end has
 			// stored connection_type/brand on the session (parity with voice).
-			FilterAnyOf: kbFilters(sess),
+			FilterAnyOf:      kbFilters(sess),
+			GuardrailID:      gID,
+			GuardrailVersion: gVersion,
 		})
 		if ragErr != nil || answer == nil || strings.TrimSpace(answer.Text) == "" {
 			if ragErr != nil {
@@ -775,12 +786,15 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 				// grounding template still enforces results-only answers.
 				query = question + " (context: currently troubleshooting using " + string(kbDoc) + ")"
 			}
+			gID, gVersion := guardrailConfig()
 			answer, err := agentClient.RetrieveAndGenerate(ffCtx, agents.RetrieveAndGenerateRequest{
-				KnowledgeBaseID: kbID,
-				ModelID:         modelID,
-				Query:           query,
-				Persona:         p,
-				FilterAnyOf:     kbFilters(sess),
+				KnowledgeBaseID:  kbID,
+				ModelID:          modelID,
+				Query:            query,
+				Persona:          p,
+				FilterAnyOf:      kbFilters(sess),
+				GuardrailID:      gID,
+				GuardrailVersion: gVersion,
 			})
 			if err != nil {
 				return "", err
@@ -829,12 +843,15 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 			slog.String("session_id", event.SessionID),
 			slog.String("transcript", logging.Truncate(transcript, 80)),
 		)
+		gID, gVersion := guardrailConfig()
 		answer, ragErr := agentClient.RetrieveAndGenerate(ctx, agents.RetrieveAndGenerateRequest{
-			KnowledgeBaseID: kbID,
-			ModelID:         modelID,
-			Query:           transcript,
-			Persona:         p,
-			FilterAnyOf:     kbFilters(sess),
+			KnowledgeBaseID:  kbID,
+			ModelID:          modelID,
+			Query:            transcript,
+			Persona:          p,
+			FilterAnyOf:      kbFilters(sess),
+			GuardrailID:      gID,
+			GuardrailVersion: gVersion,
 		})
 		if ragErr != nil || answer == nil || strings.TrimSpace(answer.Text) == "" {
 			if ragErr != nil {

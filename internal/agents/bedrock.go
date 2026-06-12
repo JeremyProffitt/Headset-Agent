@@ -141,6 +141,14 @@ type RetrieveAndGenerateRequest struct {
 	// filter on a specific brand would exclude all generic docs and starve
 	// retrieval. Each entry is ANDed with the others and with Filters.
 	FilterAnyOf map[string][]string
+	// GuardrailID is the Bedrock Guardrail identifier (A-09). When BOTH
+	// GuardrailID and GuardrailVersion are non-empty, the guardrail is attached
+	// to the GenerationConfiguration so it applies on the RetrieveAndGenerate
+	// path (the primary/effective answer path). Leave empty to skip (graceful).
+	GuardrailID string
+	// GuardrailVersion is the published version string of the guardrail (A-09).
+	// Must be non-empty when GuardrailID is set; ignored when GuardrailID is empty.
+	GuardrailVersion string
 }
 
 // KBAnswer is a generated, KB-grounded answer plus best-effort citations.
@@ -176,23 +184,35 @@ func (c *BedrockClient) RetrieveAndGenerate(ctx context.Context, req RetrieveAnd
 		slog.String("kb_id", req.KnowledgeBaseID),
 		slog.String("model", req.ModelID),
 		slog.Int("filter_count", len(req.Filters)+len(req.FilterAnyOf)),
+		slog.Bool("guardrail", req.GuardrailID != ""),
 	)
 	slog.Debug("retrieve-and-generate query",
 		slog.String("query_preview", logging.Truncate(req.Query, 80)),
 	)
+
+	// A-09: attach the guardrail to GenerationConfiguration when both fields
+	// are provided. Only the RetrieveAndGenerate path is the live answer path,
+	// so this is where the guardrail must be wired to actually take effect.
+	genCfg := &types.GenerationConfiguration{
+		PromptTemplate: &types.PromptTemplate{
+			TextPromptTemplate: aws.String(groundedPromptTemplate(req.Persona)),
+		},
+	}
+	if req.GuardrailID != "" && req.GuardrailVersion != "" {
+		genCfg.GuardrailConfiguration = &types.GuardrailConfiguration{
+			GuardrailId:      aws.String(req.GuardrailID),
+			GuardrailVersion: aws.String(req.GuardrailVersion),
+		}
+	}
 
 	out, err := c.client.RetrieveAndGenerate(ctx, &bedrockagentruntime.RetrieveAndGenerateInput{
 		Input: &types.RetrieveAndGenerateInput{Text: aws.String(req.Query)},
 		RetrieveAndGenerateConfiguration: &types.RetrieveAndGenerateConfiguration{
 			Type: types.RetrieveAndGenerateTypeKnowledgeBase,
 			KnowledgeBaseConfiguration: &types.KnowledgeBaseRetrieveAndGenerateConfiguration{
-				KnowledgeBaseId: aws.String(req.KnowledgeBaseID),
-				ModelArn:        aws.String(req.ModelID),
-				GenerationConfiguration: &types.GenerationConfiguration{
-					PromptTemplate: &types.PromptTemplate{
-						TextPromptTemplate: aws.String(groundedPromptTemplate(req.Persona)),
-					},
-				},
+				KnowledgeBaseId:         aws.String(req.KnowledgeBaseID),
+				ModelArn:                aws.String(req.ModelID),
+				GenerationConfiguration: genCfg,
 				RetrievalConfiguration: &types.KnowledgeBaseRetrievalConfiguration{
 					VectorSearchConfiguration: &types.KnowledgeBaseVectorSearchConfiguration{
 						NumberOfResults: aws.Int32(kbNumberOfResults),

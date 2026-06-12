@@ -942,3 +942,36 @@ func TestHandleLexRequest_SlotsFlowIntoRetrievalFilters(t *testing.T) {
 		t.Errorf("persisted connection_type=%q, want usb", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// A-09: guardrail ID + version are forwarded to RetrieveAndGenerate
+// ---------------------------------------------------------------------------
+
+// TestHandleLexRequest_GuardrailForwardedOnGenericKBTurn verifies that when
+// GUARDRAIL_ID and GUARDRAIL_VERSION are set in the environment, a generic
+// (non-triage) Lex KB turn carries both values on the RetrieveAndGenerateRequest.
+func TestHandleLexRequest_GuardrailForwardedOnGenericKBTurn(t *testing.T) {
+	setupMocks(t)
+	t.Setenv("KB_ID", "kb-guardrail-test")
+	t.Setenv("GUARDRAIL_ID", "gr-test-id")
+	t.Setenv("GUARDRAIL_VERSION", "2")
+
+	mock := &mockAgentInvoker{ragText: "Plug the cable in firmly."}
+	agentClient = mock
+
+	ctx := context.Background()
+	// "tell me about audio" does not match any triage keyword → generic KB turn.
+	_, err := handleLexRequest(ctx, makeLexEvent("sess-guardrail-lex", "tell me about audio settings"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.lastRAGRequest == nil {
+		t.Fatal("expected RetrieveAndGenerate to be called on the generic KB turn")
+	}
+	if mock.lastRAGRequest.GuardrailID != "gr-test-id" {
+		t.Errorf("GuardrailID=%q, want gr-test-id", mock.lastRAGRequest.GuardrailID)
+	}
+	if mock.lastRAGRequest.GuardrailVersion != "2" {
+		t.Errorf("GuardrailVersion=%q, want 2", mock.lastRAGRequest.GuardrailVersion)
+	}
+}

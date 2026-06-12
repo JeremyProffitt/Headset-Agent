@@ -746,6 +746,89 @@ func TestGetAgentStatus_Success(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Tests: A-09 guardrail configuration on RetrieveAndGenerate
+// ---------------------------------------------------------------------------
+
+// TestRetrieveAndGenerate_GuardrailSetWhenBothProvided asserts that when
+// GuardrailID and GuardrailVersion are both non-empty, the GenerationConfiguration
+// carries the correct GuardrailConfiguration.
+func TestRetrieveAndGenerate_GuardrailSetWhenBothProvided(t *testing.T) {
+	mock := &mockAgentRuntime{ragOutput: ragSuccessOutput("Check your USB port.", "s3://kb/doc.md")}
+	c := newTestClient(mock)
+
+	_, err := c.RetrieveAndGenerate(context.Background(), RetrieveAndGenerateRequest{
+		KnowledgeBaseID:  "KB123",
+		ModelID:          "model-1",
+		Query:            "no sound",
+		GuardrailID:      "gr-abc123",
+		GuardrailVersion: "1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	in := mock.lastRAGInput
+	if in == nil {
+		t.Fatal("RetrieveAndGenerate not called")
+	}
+	gc := in.RetrieveAndGenerateConfiguration.KnowledgeBaseConfiguration.GenerationConfiguration.GuardrailConfiguration
+	if gc == nil {
+		t.Fatal("GuardrailConfiguration is nil, expected it to be set")
+	}
+	if gc.GuardrailId == nil || *gc.GuardrailId != "gr-abc123" {
+		t.Errorf("GuardrailId=%v, want gr-abc123", gc.GuardrailId)
+	}
+	if gc.GuardrailVersion == nil || *gc.GuardrailVersion != "1" {
+		t.Errorf("GuardrailVersion=%v, want 1", gc.GuardrailVersion)
+	}
+}
+
+// TestRetrieveAndGenerate_GuardrailNilWhenIDMissing asserts that when
+// GuardrailID is empty (even if GuardrailVersion is set), GuardrailConfiguration
+// is nil so no guardrail is inadvertently applied.
+func TestRetrieveAndGenerate_GuardrailNilWhenIDMissing(t *testing.T) {
+	mock := &mockAgentRuntime{ragOutput: ragSuccessOutput("Check your USB port.", "s3://kb/doc.md")}
+	c := newTestClient(mock)
+
+	_, err := c.RetrieveAndGenerate(context.Background(), RetrieveAndGenerateRequest{
+		KnowledgeBaseID:  "KB123",
+		ModelID:          "model-1",
+		Query:            "no sound",
+		GuardrailID:      "", // missing
+		GuardrailVersion: "1",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	gc := mock.lastRAGInput.RetrieveAndGenerateConfiguration.KnowledgeBaseConfiguration.GenerationConfiguration.GuardrailConfiguration
+	if gc != nil {
+		t.Errorf("GuardrailConfiguration should be nil when GuardrailID is empty, got %+v", gc)
+	}
+}
+
+// TestRetrieveAndGenerate_GuardrailNilWhenVersionMissing asserts that when
+// GuardrailVersion is empty (even if GuardrailID is set), GuardrailConfiguration
+// is nil.
+func TestRetrieveAndGenerate_GuardrailNilWhenVersionMissing(t *testing.T) {
+	mock := &mockAgentRuntime{ragOutput: ragSuccessOutput("Check your USB port.", "s3://kb/doc.md")}
+	c := newTestClient(mock)
+
+	_, err := c.RetrieveAndGenerate(context.Background(), RetrieveAndGenerateRequest{
+		KnowledgeBaseID:  "KB123",
+		ModelID:          "model-1",
+		Query:            "no sound",
+		GuardrailID:      "gr-abc123",
+		GuardrailVersion: "", // missing
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	gc := mock.lastRAGInput.RetrieveAndGenerateConfiguration.KnowledgeBaseConfiguration.GenerationConfiguration.GuardrailConfiguration
+	if gc != nil {
+		t.Errorf("GuardrailConfiguration should be nil when GuardrailVersion is empty, got %+v", gc)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Note on remaining uncovered statements
 // ---------------------------------------------------------------------------
 //

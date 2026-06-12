@@ -321,6 +321,97 @@ Resources:
             OverlapPercentage: 20
 
   # =============================================================
+  # BEDROCK GUARDRAIL (A-09: denied topics + content + PII + grounding)
+  # =============================================================
+  # Applied to RetrieveAndGenerate (primary/effective path) and the Bedrock
+  # supervisor agent (belt-and-suspenders). The Lambda reads GUARDRAIL_ID and
+  # GUARDRAIL_VERSION from env vars and passes them on the GenerationConfiguration.
+  HeadsetGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub "headset-guardrail-${Environment}"
+      Description: Guardrail for the headset support agent — blocks denied topics, PII, and harmful content
+      BlockedInputMessaging: "I'm sorry, but I can't help with that. I can only help troubleshoot your headset. For anything else, I can connect you to a person."
+      BlockedOutputsMessaging: "I'm sorry, but I can't help with that. I can only help troubleshoot your headset. For anything else, I can connect you to a person."
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: HATE
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: INSULTS
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: SEXUAL
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: VIOLENCE
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: MISCONDUCT
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+          - Type: PROMPT_ATTACK
+            InputStrength: HIGH
+            OutputStrength: NONE
+      WordPolicyConfig:
+        ManagedWordListsConfig:
+          - Type: PROFANITY
+      TopicPolicyConfig:
+        TopicsConfig:
+          - Name: Payments
+            Definition: "Taking, processing, or requesting payment card numbers, billing information, refunds, or any financial transaction details from the caller."
+            Examples:
+              - "Can I pay you with my credit card?"
+              - "Take my card number"
+              - "Process a refund to my card"
+              - "What is the charge for this service?"
+            Type: DENY
+          - Name: LegalAdvice
+            Definition: "Providing legal opinions, advice, representation, or interpretation of laws, contracts, or legal rights on behalf of any party."
+            Examples:
+              - "Should I sue them?"
+              - "Is this contract binding?"
+              - "What are my legal rights here?"
+            Type: DENY
+          - Name: MedicalAdvice
+            Definition: "Providing medical diagnosis, treatment recommendations, medication guidance, or health advice for any physical or mental condition."
+            Examples:
+              - "What medication should I take?"
+              - "Do I have hearing loss?"
+              - "Is this headset causing my headaches?"
+            Type: DENY
+      SensitiveInformationPolicyConfig:
+        PiiEntitiesConfig:
+          - Type: CREDIT_DEBIT_CARD_NUMBER
+            Action: BLOCK
+          - Type: CREDIT_DEBIT_CARD_CVV
+            Action: BLOCK
+          - Type: CREDIT_DEBIT_CARD_EXPIRY
+            Action: BLOCK
+          - Type: US_BANK_ACCOUNT_NUMBER
+            Action: BLOCK
+          - Type: PIN
+            Action: BLOCK
+          - Type: PHONE
+            Action: ANONYMIZE
+          - Type: EMAIL
+            Action: ANONYMIZE
+          - Type: ADDRESS
+            Action: ANONYMIZE
+      ContextualGroundingPolicyConfig:
+        FiltersConfig:
+          - Type: GROUNDING
+            Threshold: 0.7
+          - Type: RELEVANCE
+            Threshold: 0.5
+
+  HeadsetGuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt HeadsetGuardrail.GuardrailId
+      Description: Published version of the headset guardrail for production use
+
+  # =============================================================
   # DYNAMODB TABLE FOR PERSONAS
   # =============================================================
   PersonaTable:
@@ -394,6 +485,9 @@ Resources:
           DEFAULT_PERSONA: !Ref DefaultPersona
           BEDROCK_MODEL_SUPERVISOR: !Ref BedrockModelSupervisor
           BEDROCK_MODEL_SUBAGENT: !Ref BedrockModelSubagent
+          # A-09: guardrail applied to RetrieveAndGenerate GenerationConfiguration
+          GUARDRAIL_ID: !GetAtt HeadsetGuardrail.GuardrailId
+          GUARDRAIL_VERSION: !GetAtt HeadsetGuardrailVersion.Version
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -450,6 +544,12 @@ Resources:
               Action:
                 - polly:SynthesizeSpeech
               Resource: '*'
+            - Sid: GuardrailApply
+              Effect: Allow
+              Action:
+                - bedrock:ApplyGuardrail
+              Resource:
+                - !GetAtt HeadsetGuardrail.GuardrailArn
       Events:
         ChatApiPost:
           Type: HttpApi
@@ -1452,6 +1552,24 @@ Resources:
       Type: String
       Value: !GetAtt HeadsetKnowledgeBase.KnowledgeBaseArn
       Description: Bedrock Knowledge Base ARN (for scoped bedrock:Retrieve)
+
+  # A-09: guardrail ID and published version stored for external tooling
+  # (e.g. create-agents.py can read these to attach the guardrail to the agent).
+  GuardrailIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/guardrail-id"
+      Type: String
+      Value: !GetAtt HeadsetGuardrail.GuardrailId
+      Description: Bedrock Guardrail ID (A-09)
+
+  GuardrailVersionParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/guardrail-version"
+      Type: String
+      Value: !GetAtt HeadsetGuardrailVersion.Version
+      Description: Bedrock Guardrail published version (A-09)
 
   ConnectInstanceIdParam:
     Type: AWS::SSM::Parameter

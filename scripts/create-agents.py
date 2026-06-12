@@ -105,6 +105,37 @@ def get_kb_id(ssm_client, environment):
         return None
 
 
+def get_guardrail_config(ssm_client, environment):
+    """Read the guardrail ID and version from SSM (A-09, populated by CloudFormation).
+
+    Returns (guardrail_id, guardrail_version) when both are present and usable,
+    or (None, None) when absent or still PLACEHOLDER. A missing guardrail is
+    non-fatal: the agent will be created/updated without one.
+    """
+    id_param = f"/headset-agent/{environment}/guardrail-id"
+    ver_param = f"/headset-agent/{environment}/guardrail-version"
+    try:
+        id_resp = ssm_client.get_parameter(Name=id_param)
+        guardrail_id = id_resp['Parameter']['Value']
+        if not guardrail_id or guardrail_id == 'PLACEHOLDER':
+            print(f"WARNING: SSM parameter {id_param} has no usable value ({guardrail_id!r}) — skipping guardrail attach")
+            return None, None
+    except ClientError as e:
+        print(f"WARNING: could not read SSM parameter {id_param}: {e} — skipping guardrail attach")
+        return None, None
+
+    try:
+        ver_resp = ssm_client.get_parameter(Name=ver_param)
+        guardrail_version = ver_resp['Parameter']['Value']
+        if not guardrail_version or guardrail_version == 'PLACEHOLDER':
+            print(f"WARNING: SSM parameter {ver_param} has no usable value ({guardrail_version!r}) — skipping guardrail attach")
+            return None, None
+        return guardrail_id, guardrail_version
+    except ClientError as e:
+        print(f"WARNING: could not read SSM parameter {ver_param}: {e} — skipping guardrail attach")
+        return None, None
+
+
 def check_agent_exists(client, agent_name):
     """Check if an agent with the given name exists; return its ID or None"""
     try:
@@ -151,10 +182,25 @@ def delete_orphaned_agents(client, environment):
     return remaining
 
 
-def create_or_update_agent(client, agent_config, role_arn, model_id, environment):
-    """Create the supervisor agent, or update it in place if it exists."""
+def create_or_update_agent(client, agent_config, role_arn, model_id, environment,
+                           guardrail_id=None, guardrail_version=None):
+    """Create the supervisor agent, or update it in place if it exists.
+
+    When guardrail_id and guardrail_version are both provided, the guardrail is
+    attached to the agent (belt-and-suspenders alongside the RetrieveAndGenerate
+    guardrail). When absent the kwarg is omitted entirely so existing behaviour
+    is unchanged. A guardrail-attach failure prints a warning but does not crash.
+    """
     agent_name = f"{agent_config['name']}-{environment}"
     existing_id = check_agent_exists(client, agent_name)
+
+    # Build optional guardrail kwarg only when both values are present.
+    guardrail_kwargs = {}
+    if guardrail_id and guardrail_version:
+        guardrail_kwargs['guardrailConfiguration'] = {
+            'guardrailIdentifier': guardrail_id,
+            'guardrailVersion': guardrail_version,
+        }
 
     if existing_id:
         print(f"Agent {agent_name} already exists (ID: {existing_id}), updating...")
@@ -166,10 +212,26 @@ def create_or_update_agent(client, agent_config, role_arn, model_id, environment
                 description=agent_config['description'],
                 instruction=agent_config['instruction'],
                 foundationModel=model_id,
-                idleSessionTTLInSeconds=600
+                idleSessionTTLInSeconds=600,
+                **guardrail_kwargs
             )
         except ClientError as e:
-            print(f"Error updating agent: {e}")
+            if guardrail_kwargs:
+                print(f"WARNING: failed to attach guardrail during update — continuing without it: {e}")
+                try:
+                    client.update_agent(
+                        agentId=existing_id,
+                        agentName=agent_name,
+                        agentResourceRoleArn=role_arn,
+                        description=agent_config['description'],
+                        instruction=agent_config['instruction'],
+                        foundationModel=model_id,
+                        idleSessionTTLInSeconds=600
+                    )
+                except ClientError as e2:
+                    print(f"Error updating agent: {e2}")
+            else:
+                print(f"Error updating agent: {e}")
         return existing_id
 
     print(f"Creating agent: {agent_name}")
@@ -180,10 +242,26 @@ def create_or_update_agent(client, agent_config, role_arn, model_id, environment
             description=agent_config['description'],
             instruction=agent_config['instruction'],
             foundationModel=model_id,
-            idleSessionTTLInSeconds=600
+            idleSessionTTLInSeconds=600,
+            **guardrail_kwargs
         )
         return response['agent']['agentId']
     except ClientError as e:
+        if guardrail_kwargs:
+            print(f"WARNING: failed to attach guardrail during create — retrying without it: {e}")
+            try:
+                response = client.create_agent(
+                    agentName=agent_name,
+                    agentResourceRoleArn=role_arn,
+                    description=agent_config['description'],
+                    instruction=agent_config['instruction'],
+                    foundationModel=model_id,
+                    idleSessionTTLInSeconds=600
+                )
+                return response['agent']['agentId']
+            except ClientError as e2:
+                print(f"Error creating agent {agent_name}: {e2}")
+                return None
         print(f"Error creating agent {agent_name}: {e}")
         return None
 
@@ -453,12 +531,20 @@ def main():
         sys.exit(1)
     print(f"Using knowledge base: {kb_id}")
 
+    # A-09: guardrail is optional — absence is non-fatal, agent runs without it.
+    guardrail_id, guardrail_version = get_guardrail_config(ssm_client, args.environment)
+    if guardrail_id and guardrail_version:
+        print(f"Using guardrail: {guardrail_id} (version {guardrail_version})")
+    else:
+        print("Guardrail not configured — agent will be created/updated without one")
+
     # 1. Remove the orphaned sub-agents from the old multi-agent topology.
     orphans_remaining = delete_orphaned_agents(bedrock_client, args.environment)
 
     # 2. Create/update the single supervisor agent.
     agent_id = create_or_update_agent(
-        bedrock_client, SUPERVISOR_AGENT, role_arn, model_id, args.environment)
+        bedrock_client, SUPERVISOR_AGENT, role_arn, model_id, args.environment,
+        guardrail_id=guardrail_id, guardrail_version=guardrail_version)
     if not agent_id:
         print("ERROR: Could not create or update the supervisor agent.")
         sys.exit(1)
