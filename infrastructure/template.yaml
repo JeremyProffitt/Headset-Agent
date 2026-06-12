@@ -148,6 +148,169 @@ Resources:
           Value: HeadsetSupportAgent
 
   # =============================================================
+  # RAG VECTOR STORE — AMAZON S3 VECTORS (WS-A-04, Q-A decision)
+  # =============================================================
+  # Decision (Q-A): Amazon S3 Vectors is the Bedrock-native vector store.
+  # It is GA in us-east-1 and fully CloudFormation-supported
+  # (AWS::S3Vectors::VectorBucket + AWS::S3Vectors::Index), so no imperative
+  # provisioning script is needed and OpenSearch Serverless (~$175/mo idle) is
+  # avoided entirely. Cost is consumption-based (pennies at this corpus size):
+  # ~$0.06/GB-month storage + per-request query/ingest fees. With 38 small docs
+  # the index is well under 1 GB, so monthly cost is effectively a few cents.
+  #
+  # Teardown: the vector bucket can only be deleted when EMPTY. On a Bedrock KB
+  # with the default DELETE data-deletion policy, deleting the KB/DataSource
+  # purges the vectors first, after which CFN can delete the index then the
+  # bucket. If a stack delete ever stalls on a non-empty vector bucket, empty it
+  # with `aws s3vectors list-vectors` + `delete-vectors` (or delete the KB
+  # first), mirroring the existing S3 bucket-emptying logic in deploy.yml.
+  KbVectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      # Vector-bucket names: lowercase letters, numbers, hyphens only, 3-63 chars.
+      # KBBucketName is already "headset-kb-<acct>"; append a suffix + env.
+      VectorBucketName: !Sub "${KBBucketName}-vec-${Environment}"
+      # NOTE: AWS::S3Vectors::VectorBucket does not support a Tags property.
+
+  # Vector index sized for Amazon Titan Text Embeddings v2 (1024 dims, cosine,
+  # float32). AMAZON_BEDROCK_TEXT is declared non-filterable per Bedrock's S3
+  # Vectors requirement (the chunk text exceeds the filterable-metadata size
+  # limit and must not be used as a filter key). The remaining sidecar keys
+  # (symptom, connection_type, brand, platform, tree_id) stay filterable so
+  # metadata filtering works on Retrieve.
+  KbVectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt KbVectorBucket.VectorBucketArn
+      IndexName: !Sub "${KBBucketName}-idx-${Environment}"
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - AMAZON_BEDROCK_TEXT
+      # NOTE: AWS::S3Vectors::Index does not support a Tags property.
+
+  # =============================================================
+  # BEDROCK KNOWLEDGE BASE SERVICE ROLE (WS-A-05, least-privilege)
+  # =============================================================
+  # Scoped to: invoke ONLY the Titan v2 embedding model, read ONLY the KB docs
+  # bucket, and operate ONLY this S3 Vectors bucket+index. No '*' resources
+  # except where the action does not support resource scoping.
+  KnowledgeBaseServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "HeadsetKbServiceRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      Policies:
+        - PolicyName: KbEmbeddingModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeTitanEmbedding
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+        - PolicyName: KbSourceBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadKbDocs
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt KnowledgeBaseBucket.Arn
+                  - !Sub "${KnowledgeBaseBucket.Arn}/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+        - PolicyName: KbS3VectorsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3VectorsReadWrite
+                Effect: Allow
+                Action:
+                  - s3vectors:GetIndex
+                  - s3vectors:GetVectorBucket
+                  - s3vectors:PutVectors
+                  - s3vectors:GetVectors
+                  - s3vectors:QueryVectors
+                  - s3vectors:ListVectors
+                  - s3vectors:DeleteVectors
+                Resource:
+                  - !GetAtt KbVectorBucket.VectorBucketArn
+                  - !GetAtt KbVectorIndex.IndexArn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  # =============================================================
+  # BEDROCK KNOWLEDGE BASE + DATA SOURCE (WS-A-05)
+  # =============================================================
+  # Titan Text Embeddings v2 (1024 dims) over the S3 Vectors index above.
+  HeadsetKnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub "HeadsetSupportKB-${Environment}"
+      Description: Headset troubleshooting knowledge base (S3 Vectors + Titan v2)
+      RoleArn: !GetAtt KnowledgeBaseServiceRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: 1024
+              EmbeddingDataType: FLOAT32
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          IndexArn: !GetAtt KbVectorIndex.IndexArn
+      Tags:
+        Environment: !Ref Environment
+        Project: HeadsetSupportAgent
+
+  # Data source = the existing KB docs bucket. FIXED_SIZE chunking ~300 tokens
+  # with 20% overlap (A-05 spec). The .metadata.json sidecars are picked up
+  # automatically by Bedrock for metadata filtering. DataDeletionPolicy DELETE
+  # so vectors are purged on teardown (lets the vector bucket be deleted empty).
+  HeadsetKbDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref HeadsetKnowledgeBase
+      Name: !Sub "HeadsetKbDocs-${Environment}"
+      Description: Headset KB markdown docs synced from the knowledge-base/ tree
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt KnowledgeBaseBucket.Arn
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: 300
+            OverlapPercentage: 20
+
+  # =============================================================
   # DYNAMODB TABLE FOR PERSONAS
   # =============================================================
   PersonaTable:
@@ -211,6 +374,13 @@ Resources:
           KB_BUCKET_NAME: !Ref KnowledgeBaseBucket
           SUPERVISOR_AGENT_ID_PARAM: !Sub "/headset-agent/${Environment}/supervisor-agent-id"
           SUPERVISOR_AGENT_ALIAS_PARAM: !Sub "/headset-agent/${Environment}/supervisor-agent-alias"
+          # WS-A-11: KB retrieval config. Direct value (KB_ID/KB_ARN) plus the SSM
+          # param paths so the handler can read either way. A-07/A-08 wires the
+          # actual bedrock:Retrieve call; the config + IAM are made available here.
+          KB_ID: !Ref HeadsetKnowledgeBase
+          KB_ARN: !GetAtt HeadsetKnowledgeBase.KnowledgeBaseArn
+          KB_ID_PARAM: !Sub "/headset-agent/${Environment}/kb-id"
+          KB_DATA_SOURCE_ID_PARAM: !Sub "/headset-agent/${Environment}/kb-data-source-id"
           DEFAULT_PERSONA: !Ref DefaultPersona
           BEDROCK_MODEL_SUPERVISOR: !Ref BedrockModelSupervisor
           BEDROCK_MODEL_SUBAGENT: !Ref BedrockModelSubagent
@@ -253,6 +423,14 @@ Resources:
                 - ssm:GetParameter
               Resource:
                 - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/headset-agent/${Environment}/*"
+            # WS-A-11: explicit least-privilege Retrieve scoped to THIS KB ARN.
+            # (A-07/A-08 implements the actual retrieval call in the handler.)
+            - Sid: KnowledgeBaseRetrieve
+              Effect: Allow
+              Action:
+                - bedrock:Retrieve
+              Resource:
+                - !GetAtt HeadsetKnowledgeBase.KnowledgeBaseArn
             - Sid: PollyAccess
               Effect: Allow
               Action:
@@ -1044,6 +1222,33 @@ Resources:
       Value: "PLACEHOLDER"
       Description: Bedrock Supervisor Agent Alias (updated by create-agents script)
 
+  # WS-A-05: Bedrock Knowledge Base identifiers for the Lambda retrieval path
+  # (A-07/A-08 will call bedrock:Retrieve using these). Populated directly by
+  # CloudFormation — no PLACEHOLDER, the KB/DataSource are created in-stack.
+  KnowledgeBaseIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/kb-id"
+      Type: String
+      Value: !Ref HeadsetKnowledgeBase
+      Description: Bedrock Knowledge Base ID (S3 Vectors store)
+
+  KnowledgeBaseDataSourceIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/kb-data-source-id"
+      Type: String
+      Value: !GetAtt HeadsetKbDataSource.DataSourceId
+      Description: Bedrock Knowledge Base S3 data source ID
+
+  KnowledgeBaseArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/kb-arn"
+      Type: String
+      Value: !GetAtt HeadsetKnowledgeBase.KnowledgeBaseArn
+      Description: Bedrock Knowledge Base ARN (for scoped bedrock:Retrieve)
+
   ConnectInstanceIdParam:
     Type: AWS::SSM::Parameter
     Properties:
@@ -1378,6 +1583,26 @@ Outputs:
     Value: !Ref KnowledgeBaseBucket
     Export:
       Name: !Sub "${AWS::StackName}-KBBucket"
+
+  KnowledgeBaseId:
+    Description: Bedrock Knowledge Base ID (S3 Vectors store)
+    Value: !Ref HeadsetKnowledgeBase
+    Export:
+      Name: !Sub "${AWS::StackName}-KnowledgeBaseId"
+
+  KnowledgeBaseArn:
+    Description: Bedrock Knowledge Base ARN
+    Value: !GetAtt HeadsetKnowledgeBase.KnowledgeBaseArn
+    Export:
+      Name: !Sub "${AWS::StackName}-KnowledgeBaseArn"
+
+  KnowledgeBaseDataSourceId:
+    Description: Bedrock Knowledge Base S3 data source ID
+    Value: !GetAtt HeadsetKbDataSource.DataSourceId
+
+  KbVectorBucketArn:
+    Description: S3 Vectors bucket ARN backing the knowledge base
+    Value: !GetAtt KbVectorBucket.VectorBucketArn
 
   PersonaTableName:
     Description: DynamoDB table for persona configurations

@@ -487,6 +487,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: pip install boto3
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -494,15 +502,18 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Sync KB documents to S3
+      # WS-A-06: s3-sync the docs + start a Bedrock ingestion job and poll to
+      # COMPLETE. This step is fail-closed (no continue-on-error / `|| true`):
+      # any sync error, FAILED/STOPPED ingestion, or poll timeout fails the job
+      # and therefore the deploy. The KB docs bucket name is resolved by the
+      # script from the data source's S3 config, and the kb-id / data-source-id
+      # come from the SSM params CloudFormation populated in deploy-sam.
+      - name: Sync KB docs and run ingestion job
         run: |
-          ENV="${{ needs.setup.outputs.environment }}"
-          BUCKET="headset-kb-${{ needs.validate.outputs.aws_account_id }}-${ENV}"
-
-          aws s3 sync knowledge-base/ "s3://${BUCKET}/" \
-            --exclude ".git/*" \
-            --exclude ".DS_Store" \
-            --delete
+          python scripts/sync-knowledge-base.py \
+            --environment "${{ needs.setup.outputs.environment }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --bucket "headset-kb-${{ needs.validate.outputs.aws_account_id }}-${{ needs.setup.outputs.environment }}"
 
   deploy-personas:
     name: Deploy Personas
