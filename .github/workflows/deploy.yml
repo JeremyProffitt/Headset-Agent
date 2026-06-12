@@ -805,6 +805,8 @@ jobs:
           fi
 
       - name: Setup Connect resources
+        env:
+          ALLOW_PHONE_CLAIM: "true"
         run: |
           python scripts/setup-connect.py \
             --environment "${{ needs.setup.outputs.environment }}" \
