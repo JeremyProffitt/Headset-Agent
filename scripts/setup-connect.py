@@ -503,56 +503,88 @@ def resolve_phone_for_path(
     Idempotent resolution of a phone number for one path (Lex or Nova Sonic).
 
     Strategy (in order):
-      1. Reuse SSM: if the SSM param holds a number that is still CLAIMED in
-         this instance, keep it and ensure it is associated with flow_id. Return
-         the PhoneNumberId without claiming anything new.
-      2. Reuse existing claimed: pick any CLAIMED number that is not yet assigned
-         to one of our flows (i.e., ContactFlowId is None / unset), associate it
-         with flow_id, write the SSM param. Return the PhoneNumberId.
-      3. Claim new: only if no reusable number exists.
+      1. Reuse SSM + exact flow match: if the SSM param holds a number that is
+         still CLAIMED in this instance AND already associated with flow_id,
+         adopt it immediately (no re-association needed). Idempotency fast-path.
+      2. Reuse SSM + re-associate: same SSM number is still claimed but pointed
+         at a different (stale) flow — re-associate to flow_id and adopt it.
+      3. Reuse ANY claimed number not yet assigned this run: pick the first
+         available record (regardless of its current ContactFlowId — stale flow
+         associations are fine; re-associating re-points the number). Associate
+         with flow_id, write SSM.
+      4. Claim new: ONLY if all_claimed_numbers is completely empty (zero numbers
+         exist in the instance). If there are claimed numbers but none could be
+         selected (all UNKNOWN), return None rather than claiming and compounding
+         the quota problem.
+
+    Numbers whose ContactFlowId is 'UNKNOWN' are skipped in step 3 (fail-safe:
+    cannot determine current state, so don't touch them).
 
     Returns the PhoneNumberId that was assigned (str), or None on failure.
     Modifies already_assigned_ids in-place by adding the assigned ID.
     """
-    # --- Step 1: Reuse SSM ---
-    existing_ssm_value = get_ssm_parameter(ssm_client, ssm_param)
-    if existing_ssm_value and existing_ssm_value not in ('PLACEHOLDER', 'PENDING'):
-        # Find the corresponding claimed record
-        for rec in all_claimed_numbers:
-            if rec['PhoneNumber'] == existing_ssm_value:
-                print(f"  [{path_name}] SSM param matches claimed number {existing_ssm_value} - reusing")
-                # Ensure it is associated with the correct flow
-                if flow_id and rec.get('ContactFlowId') != flow_id:
-                    print(f"  [{path_name}] Re-associating phone to flow {flow_id}")
-                    associate_phone_with_flow(client, instance_id, rec['PhoneNumberId'], flow_id)
-                already_assigned_ids.add(rec['PhoneNumberId'])
-                return rec['PhoneNumberId']
-        # SSM value not found among claimed numbers - fall through to reuse/claim
-        print(f"  [{path_name}] SSM value {existing_ssm_value} not found among claimed numbers - will reuse or claim")
-
-    # --- Step 2: Reuse an existing claimed number not yet assigned to any flow ---
-    for rec in all_claimed_numbers:
-        if rec['PhoneNumberId'] in already_assigned_ids:
-            continue  # already spoken for
-        flow = rec.get('ContactFlowId')
-        if flow == 'UNKNOWN':
-            continue  # can't determine status - skip safely
-        if flow is None:
-            # Unassociated - take it
-            print(f"  [{path_name}] Reusing unassigned claimed number {rec['PhoneNumber']} (ID: {rec['PhoneNumberId']})")
-            if flow_id:
-                associate_phone_with_flow(client, instance_id, rec['PhoneNumberId'], flow_id)
-            save_to_ssm(ssm_client, ssm_param, rec['PhoneNumber'],
-                        f"Phone number for {path_name} path")
-            already_assigned_ids.add(rec['PhoneNumberId'])
-            return rec['PhoneNumberId']
-
-    # --- Step 3: Claim new ---
-    print(f"  [{path_name}] No reusable number found - claiming a new one")
     if not flow_id:
-        print(f"  [{path_name}] Contact flow not found - skipping claim")
+        print(f"  [{path_name}] Contact flow not found - cannot assign phone number")
         return None
 
+    # --- Step 1 & 2: Reuse SSM-recorded number (already assigned to this path) ---
+    existing_ssm_value = get_ssm_parameter(ssm_client, ssm_param)
+    if existing_ssm_value and existing_ssm_value not in ('PLACEHOLDER', 'PENDING'):
+        for rec in all_claimed_numbers:
+            if rec['PhoneNumber'] == existing_ssm_value:
+                if rec['PhoneNumberId'] in already_assigned_ids:
+                    # Shouldn't happen (same number for two paths?) but guard it
+                    print(f"  [{path_name}] SSM number {existing_ssm_value} already taken by another path - will pick a different one")
+                    break
+                current_flow = rec.get('ContactFlowId')
+                if current_flow == flow_id:
+                    # Step 1: perfect match — already on the right flow
+                    print(f"  [{path_name}] SSM number {existing_ssm_value} is already associated with the correct flow - adopting (no change needed)")
+                elif current_flow == 'UNKNOWN':
+                    print(f"  [{path_name}] SSM number {existing_ssm_value} status UNKNOWN - skipping SSM reuse, will pick another")
+                    break
+                else:
+                    # Step 2: SSM number exists but points at a stale/different flow - re-associate
+                    print(f"  [{path_name}] SSM number {existing_ssm_value} is claimed (current flow: {current_flow}) - re-associating to flow {flow_id}")
+                    associate_phone_with_flow(client, instance_id, rec['PhoneNumberId'], flow_id)
+                    # Update in-memory record so release pass sees the new state
+                    rec['ContactFlowId'] = flow_id
+                already_assigned_ids.add(rec['PhoneNumberId'])
+                # SSM already has the right value; write it again for the log confirmation
+                save_to_ssm(ssm_client, ssm_param, rec['PhoneNumber'],
+                            f"Phone number for {path_name} path")
+                return rec['PhoneNumberId']
+        # SSM value not found among claimed numbers (released externally?) - fall through
+        print(f"  [{path_name}] SSM value {existing_ssm_value} not found among claimed numbers - will pick any available")
+
+    # --- Step 3: Reuse ANY claimed number not yet assigned this run ---
+    # This handles the case where all 6 numbers have stale flow associations:
+    # we simply re-point one of them at our flow. ContactFlowId==None is NOT
+    # required here — any non-UNKNOWN number is fair game.
+    for rec in all_claimed_numbers:
+        if rec['PhoneNumberId'] in already_assigned_ids:
+            continue  # already spoken for by another path this run
+        current_flow = rec.get('ContactFlowId')
+        if current_flow == 'UNKNOWN':
+            print(f"  [{path_name}] Skipping number {rec['PhoneNumber']}: association status UNKNOWN (fail-safe)")
+            continue
+        # Take this number regardless of its current flow association
+        action = "associating" if current_flow is None else f"re-associating (was on flow {current_flow})"
+        print(f"  [{path_name}] Reusing claimed number {rec['PhoneNumber']} (ID: {rec['PhoneNumberId']}) - {action} to flow {flow_id}")
+        associate_phone_with_flow(client, instance_id, rec['PhoneNumberId'], flow_id)
+        rec['ContactFlowId'] = flow_id  # update in-memory record
+        save_to_ssm(ssm_client, ssm_param, rec['PhoneNumber'],
+                    f"Phone number for {path_name} path")
+        already_assigned_ids.add(rec['PhoneNumberId'])
+        return rec['PhoneNumberId']
+
+    # --- Step 4: Claim new — ONLY if instance has zero claimed numbers at all ---
+    if all_claimed_numbers:
+        # There are claimed numbers but all were UNKNOWN — do not claim more
+        print(f"  [{path_name}] All claimed numbers have UNKNOWN status - cannot assign safely, skipping claim")
+        return None
+
+    print(f"  [{path_name}] No claimed numbers exist in instance - claiming a new one")
     new_phone = claim_phone_number(
         client, instance_id,
         phone_type='TOLL_FREE',
@@ -564,7 +596,7 @@ def resolve_phone_for_path(
         phone_id = new_phone.get('PhoneNumberId')
         if phone_id:
             associate_phone_with_flow(client, instance_id, phone_id, flow_id)
-            # Add to the in-memory list so orphan cleanup sees it
+            # Add to the in-memory list so the release pass sees it
             all_claimed_numbers.append({
                 'PhoneNumberId': phone_id,
                 'PhoneNumber': new_phone['PhoneNumber'],
@@ -580,36 +612,53 @@ def resolve_phone_for_path(
         return None
 
 
-def release_orphaned_phone_numbers(client, all_claimed_numbers, assigned_ids):
+def release_extra_phone_numbers(client, all_claimed_numbers, assigned_ids, needed_count):
     """
-    Release phone numbers that are:
-      (a) claimed to this instance,
-      (b) NOT one of the assigned numbers (Lex / Nova), AND
-      (c) NOT associated with any contact flow (ContactFlowId is None).
+    Release every claimed number that is NOT in assigned_ids.
 
-    Numbers whose ContactFlowId is 'UNKNOWN' are skipped (fail-safe: cannot
-    determine association, so do not release).
+    HARD SAFETY GATE: release is ONLY attempted when every needed path was
+    successfully assigned, i.e. len(assigned_ids) == needed_count. If any
+    assignment failed (partial run), this function skips all releases and logs
+    a warning. This prevents a buggy run from stripping needed numbers.
 
-    Per-number try/except: one failure does not abort the rest.
+    Additional per-number safety:
+      - Numbers whose ContactFlowId is 'UNKNOWN' are never released (fail-safe:
+        we cannot determine their state).
+      - Per-number try/except: one release failure does not abort the rest.
+
+    Args:
+        client:             boto3 Connect client
+        all_claimed_numbers: snapshot list from list_all_instance_phone_numbers
+        assigned_ids:       set of PhoneNumberIds successfully assigned this run
+        needed_count:       expected number of assigned IDs (1 or 2)
     """
+    # --- SAFETY GATE ---
+    if len(assigned_ids) != needed_count:
+        print(
+            f"  WARNING: Assignment incomplete "
+            f"(assigned {len(assigned_ids)}/{needed_count} needed paths). "
+            f"Skipping ALL releases to avoid stripping numbers on a partial run."
+        )
+        return
+
+    extras = [r for r in all_claimed_numbers if r['PhoneNumberId'] not in assigned_ids]
+    if not extras:
+        print(f"  No extra phone numbers to release (instance has exactly {needed_count} number(s) - all assigned)")
+        return
+
+    print(f"  {len(extras)} extra number(s) to release (keeping {needed_count} assigned number(s))")
     released = 0
-    for rec in all_claimed_numbers:
+    for rec in extras:
         phone_id = rec['PhoneNumberId']
         phone_num = rec.get('PhoneNumber', phone_id)
+        current_flow = rec.get('ContactFlowId')
 
-        if phone_id in assigned_ids:
-            continue  # in use by one of our paths
-
-        flow = rec.get('ContactFlowId')
-        if flow == 'UNKNOWN':
-            print(f"  SKIP release of {phone_num}: association status unknown (fail-safe)")
-            continue
-        if flow is not None:
-            print(f"  SKIP release of {phone_num}: associated with flow {flow} (in use)")
+        if current_flow == 'UNKNOWN':
+            print(f"  SKIP release of {phone_num} (ID: {phone_id}): association status UNKNOWN (fail-safe)")
             continue
 
-        # Safe to release: claimed, not assigned to us, not associated with any flow
-        print(f"  Releasing orphaned phone number {phone_num} (ID: {phone_id}) - claimed but not associated with any flow")
+        flow_info = f"flow {current_flow}" if current_flow else "no flow"
+        print(f"  Releasing extra number {phone_num} (ID: {phone_id}, currently on {flow_info}) - not needed by Lex or Nova Sonic")
         try:
             if release_phone_number(client, phone_id):
                 released += 1
@@ -617,9 +666,9 @@ def release_orphaned_phone_numbers(client, all_claimed_numbers, assigned_ids):
             print(f"  Error releasing {phone_num}: {e} - skipping")
 
     if released:
-        print(f"  Released {released} orphaned phone number(s)")
+        print(f"  Released {released} extra phone number(s); {needed_count} number(s) remain assigned")
     else:
-        print(f"  No orphaned phone numbers to release")
+        print(f"  No numbers were released (all extras had UNKNOWN status or release failed)")
 
 
 def main():
@@ -751,12 +800,14 @@ def main():
         else:
             print("\nNova Sonic contact flow not found - skipping Nova Sonic phone number")
 
-        # --- Release orphaned numbers ---
-        # Release any number that is claimed to this instance, is NOT one of
-        # our two assigned numbers, and is NOT associated with any contact flow.
-        # Numbers with unknown association status are skipped (fail-safe).
-        print("\nChecking for orphaned phone numbers to release...")
-        release_orphaned_phone_numbers(connect_client, all_claimed, assigned_ids)
+        # --- Release extra numbers ---
+        # Release every claimed number that is NOT one of the assigned ones.
+        # SAFETY GATE inside release_extra_phone_numbers: if any needed path
+        # failed assignment (len(assigned_ids) < needed_count), ALL releases
+        # are skipped to prevent stripping numbers on a partial/buggy run.
+        needed_count = 1 + (1 if nova_flow_id else 0)
+        print(f"\nChecking for extra phone numbers to release (needed: {needed_count}, assigned: {len(assigned_ids)})...")
+        release_extra_phone_numbers(connect_client, all_claimed, assigned_ids, needed_count)
 
     # Summary
     print("\n=== Connect Setup Summary ===")

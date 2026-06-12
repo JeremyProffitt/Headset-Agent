@@ -187,8 +187,14 @@ Resources:
       Dimension: 1024
       DistanceMetric: cosine
       MetadataConfiguration:
+        # Bedrock KB on S3 Vectors REQUIRES both of these as non-filterable — the
+        # chunk text AND Bedrock's source-metadata blob each exceed the 2048-byte
+        # filterable-metadata cap (ingestion fails "Filterable metadata must have at
+        # most 2048 bytes" if either is filterable). The sidecar keys (symptom/
+        # connection_type/brand/platform/tree_id) stay filterable for Retrieve.
         NonFilterableMetadataKeys:
           - AMAZON_BEDROCK_TEXT
+          - AMAZON_BEDROCK_METADATA
       # NOTE: AWS::S3Vectors::Index does not support a Tags property.
 
   # =============================================================
