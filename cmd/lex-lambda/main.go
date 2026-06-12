@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"os"
 	"sync"
 
@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/headset-support-agent/internal/agents"
 	"github.com/headset-support-agent/internal/handlers"
+	"github.com/headset-support-agent/internal/logging"
 	"github.com/headset-support-agent/internal/persona"
 )
 
@@ -99,6 +100,8 @@ type ChatMessage struct {
 }
 
 func init() {
+	logging.Init()
+
 	ctx := context.Background()
 	region := os.Getenv("AWS_REGION")
 	if region == "" {
@@ -107,7 +110,8 @@ func init() {
 
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
-		log.Fatalf("failed to load AWS config: %v", err)
+		slog.Error("failed to load AWS config", slog.String("error", err.Error()))
+		panic("failed to load AWS config: " + err.Error())
 	}
 
 	agentClient = agents.NewBedrockClient(cfg)
@@ -142,7 +146,7 @@ func loadAgentConfig(ctx context.Context) (agentID, agentAlias string) {
 	agentAliasParam := os.Getenv("SUPERVISOR_AGENT_ALIAS_PARAM")
 
 	if agentIDParam == "" || agentAliasParam == "" {
-		log.Printf("SSM parameter paths not configured")
+		slog.Warn("SSM parameter paths not configured — SUPERVISOR_AGENT_ID_PARAM/SUPERVISOR_AGENT_ALIAS_PARAM unset")
 		return "", ""
 	}
 
@@ -151,7 +155,10 @@ func loadAgentConfig(ctx context.Context) (agentID, agentAlias string) {
 		Name: &agentIDParam,
 	})
 	if err != nil {
-		log.Printf("Failed to get agent ID from SSM: %v", err)
+		slog.Error("failed to get agent ID from SSM",
+			slog.String("param", agentIDParam),
+			slog.String("error", err.Error()),
+		)
 		return "", ""
 	}
 	agentConfig.agentID = *idResult.Parameter.Value
@@ -161,7 +168,10 @@ func loadAgentConfig(ctx context.Context) (agentID, agentAlias string) {
 		Name: &agentAliasParam,
 	})
 	if err != nil {
-		log.Printf("Failed to get agent alias from SSM: %v", err)
+		slog.Error("failed to get agent alias from SSM",
+			slog.String("param", agentAliasParam),
+			slog.String("error", err.Error()),
+		)
 		return "", ""
 	}
 	agentConfig.agentAlias = *aliasResult.Parameter.Value
@@ -172,18 +182,24 @@ func loadAgentConfig(ctx context.Context) (agentID, agentAlias string) {
 		agentConfig.loaded = true
 	}
 
-	log.Printf("Loaded agent config from SSM: ID=%s, Alias=%s", agentConfig.agentID, agentConfig.agentAlias)
+	slog.Info("loaded agent config from SSM",
+		slog.String("agent_id", agentConfig.agentID),
+		slog.String("alias_id", agentConfig.agentAlias),
+	)
 	return agentConfig.agentID, agentConfig.agentAlias
 }
 
 // handleAPIRequest handles HTTP API Gateway requests
 func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
-	log.Printf("Received API request: path=%s, method=%s", request.RawPath, request.RequestContext.HTTP.Method)
+	slog.Info("received API request",
+		slog.String("path", request.RawPath),
+		slog.String("method", request.RequestContext.HTTP.Method),
+	)
 
 	// Parse the request body
 	var chatReq ChatRequest
 	if err := json.Unmarshal([]byte(request.Body), &chatReq); err != nil {
-		log.Printf("Error parsing request body: %v", err)
+		slog.Error("error parsing request body", slog.String("error", err.Error()))
 		return events.APIGatewayV2HTTPResponse{
 			StatusCode: 400,
 			Headers:    map[string]string{"Content-Type": "application/json"},
@@ -206,8 +222,37 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 	// Load persona configuration
 	p, err := personaLoader.Load(ctx, personaID)
 	if err != nil {
-		log.Printf("Error loading persona %s: %v, using default", personaID, err)
+		slog.Warn("error loading persona; using default",
+			slog.String("persona_id", personaID),
+			slog.String("error", err.Error()),
+		)
 		p = persona.DefaultPersona()
+	}
+
+	// Check for payment solicitation BEFORE calling Bedrock.
+	// Return a safe refusal without echoing any digits or storing card data.
+	if handlers.DetectPaymentSolicitation(chatReq.InputTranscript) {
+		slog.Info("payment solicitation detected — returning refusal",
+			slog.String("session_id", chatReq.SessionID),
+			slog.Bool("payment_blocked", true),
+		)
+		refusalMsg := "For your security, I can't take any payment or card details — I only help with headset troubleshooting. Please don't share card numbers here. If you need billing help I can connect you to a person."
+		chatResp := ChatResponse{
+			Messages: []ChatMessage{
+				{Content: refusalMsg},
+			},
+		}
+		respBody, _ := json.Marshal(chatResp)
+		return events.APIGatewayV2HTTPResponse{
+			StatusCode: 200,
+			Headers: map[string]string{
+				"Content-Type":                 "application/json",
+				"Access-Control-Allow-Origin":  "*",
+				"Access-Control-Allow-Methods": "POST, OPTIONS",
+				"Access-Control-Allow-Headers": "Content-Type, X-Session-Id, X-Persona-Id",
+			},
+			Body: string(respBody),
+		}, nil
 	}
 
 	// Load supervisor agent configuration from SSM
@@ -215,7 +260,10 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 
 	var responseMessage string
 	if agentID == "" || agentID == "PLACEHOLDER" || agentAlias == "" || agentAlias == "PLACEHOLDER" {
-		log.Printf("Supervisor agent not configured (ID: %s, Alias: %s)", agentID, agentAlias)
+		slog.Warn("supervisor agent not configured",
+			slog.String("agent_id", agentID),
+			slog.String("alias_id", agentAlias),
+		)
 		responseMessage = "Hello! I'm setting up right now. The system is being configured. Please try again in a few minutes."
 	} else {
 		// Invoke Bedrock supervisor agent
@@ -227,7 +275,10 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 			Persona:      p,
 		})
 		if err != nil {
-			log.Printf("Error invoking Bedrock agent: %v", err)
+			slog.Error("error invoking Bedrock agent",
+				slog.String("session_id", chatReq.SessionID),
+				slog.String("error", err.Error()),
+			)
 			responseMessage = "I'm having a bit of trouble connecting. Let me try that again."
 		} else {
 			responseMessage = response.OutputText
@@ -256,10 +307,15 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 
 // handleLexRequest handles Lex V2 requests
 func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Response, error) {
-	log.Printf("=== LEX HANDLER START ===")
-	log.Printf("Received Lex event: sessionId=%s, inputMode=%s, invocationSource=%s",
-		event.SessionID, event.InputMode, event.InvocationSource)
-	log.Printf("  InputTranscript: '%s'", event.InputTranscript)
+	slog.Info("lex handler start",
+		slog.String("session_id", event.SessionID),
+		slog.String("input_mode", event.InputMode),
+		slog.String("invocation_source", event.InvocationSource),
+	)
+	slog.Debug("lex input transcript",
+		slog.String("session_id", event.SessionID),
+		slog.String("transcript", logging.Truncate(event.InputTranscript, 80)),
+	)
 
 	// Extract transcript
 	transcript := event.InputTranscript
@@ -285,7 +341,9 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 
 	// Handle empty transcript
 	if transcript == "" {
-		log.Printf("Empty transcript received - returning welcome prompt")
+		slog.Info("empty transcript received — returning welcome prompt",
+			slog.String("session_id", event.SessionID),
+		)
 		personaID := event.SessionState.SessionAttributes["persona_id"]
 		if personaID == "" {
 			personaID = os.Getenv("DEFAULT_PERSONA")
@@ -315,8 +373,21 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 
 	p, err := personaLoader.Load(ctx, personaID)
 	if err != nil {
-		log.Printf("Error loading persona %s: %v, using default", personaID, err)
+		slog.Warn("error loading persona; using default",
+			slog.String("persona_id", personaID),
+			slog.String("error", err.Error()),
+		)
 		p = persona.DefaultPersona()
+	}
+
+	// Check for payment solicitation BEFORE escalation and BEFORE calling Bedrock.
+	// If detected, return a safe refusal without echoing any digits.
+	if handlers.DetectPaymentSolicitation(transcript) {
+		slog.Info("payment solicitation detected — returning refusal",
+			slog.String("session_id", event.SessionID),
+			slog.Bool("payment_blocked", true),
+		)
+		return handlers.BuildPaymentRefusalResponse(p, event.SessionState.SessionAttributes), nil
 	}
 
 	// Check for escalation triggers
@@ -334,7 +405,11 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 	agentID, agentAlias := loadAgentConfig(ctx)
 
 	if agentID == "" || agentID == "PLACEHOLDER" || agentAlias == "" || agentAlias == "PLACEHOLDER" {
-		log.Printf("Supervisor agent not configured")
+		slog.Warn("supervisor agent not configured",
+			slog.String("session_id", event.SessionID),
+			slog.String("agent_id", agentID),
+			slog.String("alias_id", agentAlias),
+		)
 		return handlers.BuildSuccessResponse(
 			p,
 			"Hello! I'm setting up right now. The system is being configured. Please try again in a few minutes.",
@@ -342,8 +417,14 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 		), nil
 	}
 
-	// Invoke Bedrock supervisor agent
-	log.Printf("Invoking Bedrock agent with transcript: '%s'", transcript)
+	// Invoke Bedrock supervisor agent — log transcript at DEBUG only (PII risk)
+	slog.Info("invoking bedrock agent for lex turn",
+		slog.String("session_id", event.SessionID),
+	)
+	slog.Debug("lex turn transcript",
+		slog.String("session_id", event.SessionID),
+		slog.String("transcript", logging.Truncate(transcript, 80)),
+	)
 	response, err := agentClient.InvokeAgent(ctx, agents.InvokeAgentInput{
 		AgentID:      agentID,
 		AgentAliasID: agentAlias,
@@ -352,12 +433,15 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 		Persona:      p,
 	})
 	if err != nil {
-		log.Printf("Error invoking Bedrock agent: %v", err)
+		slog.Error("error invoking bedrock agent",
+			slog.String("session_id", event.SessionID),
+			slog.String("error", err.Error()),
+		)
 		return handlers.BuildErrorResponse(p, "I'm having a bit of trouble connecting. Let me try that again."), nil
 	}
 
 	if response == nil || response.OutputText == "" {
-		log.Printf("Empty response from Bedrock agent")
+		slog.Warn("empty response from bedrock agent", slog.String("session_id", event.SessionID))
 		return handlers.BuildErrorResponse(p, "I'm sorry, I didn't catch that. Could you please rephrase your question?"), nil
 	}
 
@@ -374,7 +458,7 @@ func handleRequest(ctx context.Context, event json.RawMessage) (interface{}, err
 	// Fall back to Lex V2 event
 	var lexEvent LexV2Event
 	if err := json.Unmarshal(event, &lexEvent); err != nil {
-		log.Printf("Error parsing event: %v", err)
+		slog.Error("error parsing lambda event", slog.String("error", err.Error()))
 		return nil, err
 	}
 	return handleLexRequest(ctx, lexEvent)

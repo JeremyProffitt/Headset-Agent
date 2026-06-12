@@ -1,0 +1,133 @@
+# =============================================================================
+# Bootstrap GitHub OIDC Trust Foundation (WS-D-04 / SEC-3)
+# =============================================================================
+#
+# CHICKEN-AND-EGG: keyless OIDC auth requires the IAM OIDC provider + deploy role
+# to already exist, but creating them requires AWS credentials. This ONE-TIME,
+# manually-triggered (workflow_dispatch) workflow therefore bootstraps the trust
+# foundation using the EXISTING static IAM user keys (secrets AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY) that the current pipeline already uses.
+#
+# It deploys infrastructure/oidc-bootstrap.yaml as the standalone CloudFormation
+# stack `headset-oidc-bootstrap` (separate from the app stack agent-headset-prod).
+#
+# AFTER this runs successfully, WS-D-05 will:
+#   1. Swap deploy.yml / destroy.yml / pr-validation.yml from static keys to
+#      `role-to-assume: <HeadsetDeployRole ARN>` + `permissions: id-token: write`.
+#   2. Deactivate the static AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.
+# This workflow itself is the LAST consumer of the static keys.
+# =============================================================================
+
+name: Bootstrap OIDC Trust Foundation
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "bootstrap" to confirm creating the OIDC trust foundation'
+        required: true
+        default: ''
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: headset-oidc-bootstrap
+  GITHUB_ORG: JeremyProffitt
+  GITHUB_REPO: Headset-Agent
+
+jobs:
+  bootstrap:
+    name: Deploy OIDC Bootstrap Stack
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "bootstrap" ]; then
+            echo "::error::Confirmation phrase mismatch. Type 'bootstrap' to proceed."
+            exit 1
+          fi
+          echo "Confirmation accepted."
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check required secrets
+        run: |
+          missing=""
+          [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && missing="$missing AWS_ACCESS_KEY_ID"
+          [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] && missing="$missing AWS_SECRET_ACCESS_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required secrets:$missing"
+            exit 1
+          fi
+          echo "All required secrets are configured."
+
+      # One-time bootstrap uses the EXISTING static keys (chicken-and-egg).
+      - name: Configure AWS credentials (static keys — bootstrap only)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Show target account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "Deploying OIDC bootstrap into AWS account: $ACCOUNT_ID"
+
+      - name: Validate CloudFormation template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://infrastructure/oidc-bootstrap.yaml
+
+      - name: Deploy OIDC bootstrap stack
+        run: |
+          aws cloudformation deploy \
+            --template-file infrastructure/oidc-bootstrap.yaml \
+            --stack-name "${STACK_NAME}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              GitHubOrg="${GITHUB_ORG}" \
+              GitHubRepo="${GITHUB_REPO}" \
+            --region "${AWS_REGION}"
+
+      - name: Echo output role ARNs and next steps
+        run: |
+          DEPLOY_ROLE_ARN=$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='DeployRoleArn'].OutputValue | [0]" --output text)
+          PR_ROLE_ARN=$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='PRRoleArn'].OutputValue | [0]" --output text)
+          OIDC_ARN=$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='OIDCProviderArn'].OutputValue | [0]" --output text)
+          BOUNDARY_ARN=$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='PermissionsBoundaryArn'].OutputValue | [0]" --output text)
+
+          echo "=================================================================="
+          echo "OIDC BOOTSTRAP COMPLETE"
+          echo "=================================================================="
+          echo "OIDC Provider ARN     : ${OIDC_ARN}"
+          echo "HeadsetDeployRole ARN : ${DEPLOY_ROLE_ARN}"
+          echo "HeadsetPRRole ARN     : ${PR_ROLE_ARN}"
+          echo "PermissionsBoundary   : ${BOUNDARY_ARN}"
+          echo "------------------------------------------------------------------"
+          echo "NEXT (WS-D-05):"
+          echo "  1. Use HeadsetDeployRole ARN above as 'role-to-assume' in"
+          echo "     deploy.yml and destroy.yml; add 'permissions: id-token: write'."
+          echo "  2. Use HeadsetPRRole ARN as 'role-to-assume' in pr-validation.yml."
+          echo "  3. Once OIDC deploys are verified green, DEACTIVATE the static"
+          echo "     AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY keys."
+          echo "=================================================================="
+
+          {
+            echo "## OIDC Bootstrap Complete"
+            echo ""
+            echo "| Output | ARN |"
+            echo "|--------|-----|"
+            echo "| OIDC Provider | \`${OIDC_ARN}\` |"
+            echo "| HeadsetDeployRole | \`${DEPLOY_ROLE_ARN}\` |"
+            echo "| HeadsetPRRole | \`${PR_ROLE_ARN}\` |"
+            echo "| Permissions Boundary | \`${BOUNDARY_ARN}\` |"
+            echo ""
+            echo "**WS-D-05**: set \`HeadsetDeployRole\` ARN as \`role-to-assume\` in deploy/destroy workflows, \`HeadsetPRRole\` in pr-validation, add \`id-token: write\`, then deactivate static keys."
+          } >> "$GITHUB_STEP_SUMMARY"

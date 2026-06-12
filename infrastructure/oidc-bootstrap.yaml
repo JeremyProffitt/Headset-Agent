@@ -1,0 +1,1043 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# =============================================================================
+# Headset Support Agent — GitHub OIDC Trust Foundation (WS-D-04 / SEC-3)
+# =============================================================================
+#
+# WHAT THIS IS
+# ------------
+# A STANDALONE CloudFormation template (NOT part of the main application stack
+# `agent-headset-prod`). It is deployed once into the AWS account via the
+# `.github/workflows/bootstrap-oidc.yml` workflow under the stack name
+# `headset-oidc-bootstrap`.
+#
+# It establishes keyless CI/CD by creating:
+#   1. A GitHub Actions OIDC identity provider in IAM.
+#   2. HeadsetDeployRole  — least-privilege deploy role assumed by main/release
+#      pipelines, bounded by a permissions boundary.
+#   3. HeadsetPRRole       — read-only role assumed by pull_request validation.
+#   4. HeadsetDeployBoundary — the permissions boundary managed policy that caps
+#      everything HeadsetDeployRole (and any role it creates) can ever do.
+#
+# THE CHICKEN-AND-EGG PROBLEM
+# ---------------------------
+# To assume a role via OIDC, the OIDC provider + role must already exist. But to
+# CREATE the OIDC provider + role we need AWS credentials. We therefore bootstrap
+# ONCE using the EXISTING static IAM user keys (secrets AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY) that the current pipeline already uses. After this stack
+# exists, WS-D-05 swaps deploy.yml / destroy.yml / pr-validation.yml from static
+# keys to:
+#       permissions:
+#         id-token: write   # request the OIDC token
+#         contents: read
+#       ...
+#       - uses: aws-actions/configure-aws-credentials@v4
+#         with:
+#           role-to-assume: <HeadsetDeployRole ARN from this stack's output>
+#           aws-region: us-east-1
+# and then DEACTIVATES the static access keys. This file (WS-D-04) only AUTHORS
+# the trust foundation — it does not touch any existing workflow.
+#
+# =============================================================================
+
+Description: >-
+  GitHub OIDC identity provider and least-privilege CI/CD roles for the Headset
+  Support Agent (repo JeremyProffitt/Headset-Agent). One-time bootstrap stack
+  `headset-oidc-bootstrap`; not part of the application stack agent-headset-prod.
+
+# -----------------------------------------------------------------------------
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: JeremyProffitt
+    Description: GitHub organization / user that owns the repository.
+
+  GitHubRepo:
+    Type: String
+    Default: Headset-Agent
+    Description: GitHub repository name (without the owner prefix).
+
+# -----------------------------------------------------------------------------
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # 1. GitHub Actions OIDC provider.
+  #
+  # Audience is sts.amazonaws.com (the value configure-aws-credentials requests).
+  # ThumbprintList: AWS now validates GitHub's TLS certificate chain against
+  # trusted public CAs at the moment of AssumeRoleWithWebIdentity, so this
+  # thumbprint is largely VESTIGIAL — the API still requires the field to be
+  # present, so we include GitHub's well-known intermediate-CA thumbprint.
+  # ---------------------------------------------------------------------------
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        # Well-known GitHub Actions OIDC thumbprint (vestigial; see note above).
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  # ---------------------------------------------------------------------------
+  # 2. Permissions boundary managed policy.
+  #
+  # Caps the maximum effective permission of HeadsetDeployRole AND of any IAM
+  # role HeadsetDeployRole creates (the deploy role is required to attach THIS
+  # boundary to every role it creates — enforced by a condition in the deploy
+  # policy below). This is the hard ceiling: even if a deploy-policy statement is
+  # too broad, the effective permission is the intersection of policy AND
+  # boundary. Region is pinned to us-east-1 and account to this account.
+  # ---------------------------------------------------------------------------
+  HeadsetDeployBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: HeadsetDeployBoundary
+      Description: >-
+        Permissions boundary capping the Headset deploy role and roles it creates
+        to the project's services in us-east-1 within this account.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Allow the project services within this region/account. Service-level
+          # ceiling; the deploy policy below is the finer-grained grant. The
+          # intersection is what actually applies.
+          - Sid: ServiceCeiling
+            Effect: Allow
+            Action:
+              - cloudformation:*
+              - s3:*
+              - lambda:*
+              - dynamodb:*
+              - ssm:*
+              - sns:*
+              - sqs:*
+              - logs:*
+              - cloudwatch:*
+              - kms:*
+              - events:*
+              - connect:*
+              - lex:*
+              - bedrock:*
+              - ses:*
+              - ecs:*
+              - ecr:*
+              - kinesisvideo:*
+              - application-autoscaling:*
+              - elasticloadbalancing:*
+              - ec2:Describe*
+              - servicequotas:GetServiceQuota
+              - servicequotas:ListServiceQuotas
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:RequestedRegion: us-east-1
+          # IAM is global (no region); allow it unconditionally at the boundary
+          # but only for project-prefixed roles/policies and service-linked roles.
+          - Sid: IamCeiling
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:GetRole
+              - iam:UpdateRole
+              - iam:UpdateAssumeRolePolicy
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:ListRoleTags
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRolePolicy
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
+              - iam:PassRole
+              - iam:CreatePolicy
+              - iam:DeletePolicy
+              - iam:GetPolicy
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicyVersion
+              - iam:GetPolicyVersion
+              - iam:ListPolicyVersions
+              - iam:CreateServiceLinkedRole
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/agent-headset-*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/headset-*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/HeadsetSupport*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/BedrockAgentRole-*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/LexServiceRole-*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:policy/agent-headset-*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:policy/headset-*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:policy/HeadsetSupport*"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/*"
+          # Explicitly DENY any attempt to alter the OIDC trust foundation or the
+          # boundary itself — the deploy role must never be able to escalate by
+          # rewriting its own guardrails or the provider that authenticates it.
+          - Sid: ProtectTrustFoundation
+            Effect: Deny
+            Action:
+              - iam:CreateOpenIDConnectProvider
+              - iam:DeleteOpenIDConnectProvider
+              - iam:UpdateOpenIDConnectProviderThumbprint
+              - iam:AddClientIDToOpenIDConnectProvider
+              - iam:RemoveClientIDFromOpenIDConnectProvider
+            Resource: "*"
+          - Sid: ProtectBoundaryAndCiRoles
+            Effect: Deny
+            Action:
+              - iam:DeletePolicy
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicyVersion
+              - iam:DeleteRole
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:UpdateAssumeRolePolicy
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:policy/HeadsetDeployBoundary"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/HeadsetDeployRole"
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/HeadsetPRRole"
+
+  # ---------------------------------------------------------------------------
+  # 3. HeadsetDeployRole — assumed by main / release pipelines via OIDC.
+  #
+  # TRUST: web identity from the GitHub OIDC provider ONLY, with:
+  #   :aud = sts.amazonaws.com
+  #   :sub StringLike one of:
+  #       repo:JeremyProffitt/Headset-Agent:ref:refs/heads/main
+  #       repo:JeremyProffitt/Headset-Agent:ref:refs/heads/release/*
+  # workflow_dispatch runs on those refs produce the same `ref:refs/heads/...`
+  # sub, so they are covered without a separate :environment claim.
+  # ---------------------------------------------------------------------------
+  HeadsetDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: HeadsetDeployRole
+      Description: >-
+        Least-privilege CI/CD deploy role for the Headset Support Agent,
+        assumed by GitHub Actions on main and release/* via OIDC.
+      MaxSessionDuration: 3600
+      PermissionsBoundary: !Ref HeadsetDeployBoundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main"
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/release/*"
+      Policies:
+        - PolicyName: HeadsetDeployPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+
+              # --- CloudFormation / SAM: create & manage the application stack
+              # and the SAM-managed transform changesets. ---
+              - Sid: CloudFormation
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:ValidateTemplate
+                Resource:
+                  - !Sub "arn:aws:cloudformation:us-east-1:${AWS::AccountId}:stack/agent-headset-*/*"
+                  # SAM uses the transform-managed serverless changeset under the
+                  # aws:transform name in some flows.
+                  - !Sub "arn:aws:cloudformation:us-east-1:aws:transform/Serverless-*"
+
+              # --- S3: SAM artifact bucket (headset-agent-sam-*), Knowledge Base
+              # bucket (headset-kb-*) for KB doc sync, and chat bucket
+              # (headset-chat-*) created by the stack. ---
+              - Sid: S3Buckets
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:GetBucketVersioning
+                  - s3:PutBucketVersioning
+                  - s3:GetBucketTagging
+                  - s3:PutBucketTagging
+                  - s3:GetEncryptionConfiguration
+                  - s3:PutEncryptionConfiguration
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketAcl
+                  - s3:PutBucketAcl
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                  - s3:GetBucketCORS
+                  - s3:PutBucketCORS
+                  - s3:ListBucketVersions
+                Resource:
+                  - !Sub "arn:aws:s3:::headset-agent-sam-${AWS::AccountId}-us-east-1"
+                  - !Sub "arn:aws:s3:::headset-kb-*"
+                  - !Sub "arn:aws:s3:::headset-chat-*"
+              - Sid: S3Objects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetObjectVersion
+                  - s3:DeleteObjectVersion
+                  - s3:ListMultipartUploadParts
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !Sub "arn:aws:s3:::headset-agent-sam-${AWS::AccountId}-us-east-1/*"
+                  - !Sub "arn:aws:s3:::headset-kb-*/*"
+                  - !Sub "arn:aws:s3:::headset-chat-*/*"
+
+              # --- Lambda: create/update the lex-orchestrator and nova-sonic
+              # functions, manage their permissions and event sources. ---
+              - Sid: Lambda
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:ListVersionsByFunction
+                  - lambda:PublishVersion
+                  - lambda:CreateAlias
+                  - lambda:UpdateAlias
+                  - lambda:DeleteAlias
+                  - lambda:GetAlias
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:GetPolicy
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                  - lambda:InvokeFunction
+                  - lambda:CreateEventSourceMapping
+                  - lambda:DeleteEventSourceMapping
+                  - lambda:GetEventSourceMapping
+                  - lambda:UpdateEventSourceMapping
+                Resource:
+                  - !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:headset-*"
+                  - !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:agent-headset-*"
+
+              # --- IAM: SAM creates NAMED roles (CAPABILITY_NAMED_IAM) such as
+              # BedrockAgentRole-*, LexServiceRole-*, and Lambda execution roles.
+              # Scope strictly to project name prefixes; PassRole is needed so
+              # CloudFormation can hand these roles to Lambda/Bedrock/Lex/Connect.
+              # iam:* is intentionally NOT granted. ---
+              - Sid: IamProjectRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:ListRoleTags
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:GetPolicy
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicyVersions
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/agent-headset-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/headset-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/HeadsetSupport*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/BedrockAgentRole-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/LexServiceRole-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:policy/agent-headset-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:policy/headset-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:policy/HeadsetSupport*"
+              # CreateRole MUST attach the permissions boundary — prevents the
+              # deploy role from minting a role more powerful than itself.
+              - Sid: IamCreateRoleRequiresBoundary
+                Effect: Deny
+                Action:
+                  - iam:CreateRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+                Condition:
+                  StringNotEquals:
+                    iam:PermissionsBoundary: !Ref HeadsetDeployBoundary
+              # PassRole limited to project roles, and only to the services that
+              # legitimately consume them.
+              - Sid: IamPassRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/agent-headset-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/headset-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/HeadsetSupport*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/BedrockAgentRole-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/LexServiceRole-*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - lambda.amazonaws.com
+                      - bedrock.amazonaws.com
+                      - lexv2.amazonaws.com
+                      - connect.amazonaws.com
+                      - ecs-tasks.amazonaws.com
+                      - events.amazonaws.com
+                      - kinesisvideo.amazonaws.com
+              # Service-linked roles for Connect, Lex, ECS, Application Auto
+              # Scaling, etc. are created on first use.
+              - Sid: IamServiceLinkedRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/*"
+
+              # --- DynamoDB: PersonaConfigurations-* and HeadsetAgentSessions-*
+              # tables; put-item is used to load persona JSON during deploy. ---
+              - Sid: DynamoDB
+                Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:UpdateTable
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:UpdateTimeToLive
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:ListTagsOfResource
+                  - dynamodb:TagResource
+                  - dynamodb:UntagResource
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub "arn:aws:dynamodb:us-east-1:${AWS::AccountId}:table/PersonaConfigurations-*"
+                  - !Sub "arn:aws:dynamodb:us-east-1:${AWS::AccountId}:table/HeadsetAgentSessions-*"
+                  - !Sub "arn:aws:dynamodb:us-east-1:${AWS::AccountId}:table/PersonaConfigurations-*/index/*"
+                  - !Sub "arn:aws:dynamodb:us-east-1:${AWS::AccountId}:table/HeadsetAgentSessions-*/index/*"
+
+              # --- SSM Parameter Store: all config lives under /headset-agent/*.
+              # (No Secrets Manager — per project policy.) ---
+              - Sid: SSMParameters
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                  - ssm:DeleteParameter
+                  - ssm:DeleteParameters
+                  - ssm:DescribeParameters
+                  - ssm:AddTagsToResource
+                  - ssm:RemoveTagsFromResource
+                  - ssm:ListTagsForResource
+                Resource:
+                  - !Sub "arn:aws:ssm:us-east-1:${AWS::AccountId}:parameter/headset-agent/*"
+              # DescribeParameters does not support resource-level scoping.
+              - Sid: SSMDescribe
+                Effect: Allow
+                Action:
+                  - ssm:DescribeParameters
+                Resource: "*"
+
+              # --- SNS: alarm / notification topics created by the stack. ---
+              - Sid: SNS
+                Effect: Allow
+                Action:
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetTopicAttributes
+                  - sns:SetTopicAttributes
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                  - sns:ListSubscriptionsByTopic
+                  - sns:TagResource
+                  - sns:UntagResource
+                  - sns:ListTagsForResource
+                Resource:
+                  - !Sub "arn:aws:sns:us-east-1:${AWS::AccountId}:headset-*"
+                  - !Sub "arn:aws:sns:us-east-1:${AWS::AccountId}:agent-headset-*"
+
+              # --- CloudWatch Logs: Lambda log groups /aws/lambda/headset-* and
+              # any /headset-agent/* log groups. ---
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                  - logs:AssociateKmsKey
+                Resource:
+                  - !Sub "arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/headset-*"
+                  - !Sub "arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/headset-*:*"
+                  - !Sub "arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/headset-agent/*"
+                  - !Sub "arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/headset-agent/*:*"
+                  - !Sub "arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/ecs/headset-*"
+                  - !Sub "arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/ecs/headset-*:*"
+
+              # --- CloudWatch alarms & dashboards. Alarm/dashboard APIs do not
+              # support fine resource scoping, so they are gated on region by the
+              # boundary's aws:RequestedRegion=us-east-1 condition. ---
+              - Sid: CloudWatchAlarmsDashboards
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:EnableAlarmActions
+                  - cloudwatch:DisableAlarmActions
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:DeleteDashboards
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:ListDashboards
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                  - cloudwatch:ListTagsForResource
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: "*"
+
+              # --- KMS: customer-managed keys for encrypting logs / data. Key
+              # admin/use scoped by region via boundary; KMS keys are referenced
+              # by random key-id ARN so resource-level pinning isn't practical at
+              # create time. Aliases are project-prefixed. ---
+              - Sid: KMS
+                Effect: Allow
+                Action:
+                  - kms:CreateKey
+                  - kms:DescribeKey
+                  - kms:EnableKeyRotation
+                  - kms:DisableKeyRotation
+                  - kms:GetKeyRotationStatus
+                  - kms:GetKeyPolicy
+                  - kms:PutKeyPolicy
+                  - kms:ScheduleKeyDeletion
+                  - kms:CancelKeyDeletion
+                  - kms:TagResource
+                  - kms:UntagResource
+                  - kms:ListResourceTags
+                  - kms:CreateAlias
+                  - kms:DeleteAlias
+                  - kms:UpdateAlias
+                  - kms:ListAliases
+                  - kms:CreateGrant
+                  - kms:ListGrants
+                  - kms:RevokeGrant
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+
+              # --- EventBridge: scheduled rules / event rules created by the
+              # stack (e.g. periodic jobs, Connect/Lex event routing). ---
+              - Sid: EventBridge
+                Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:DescribeRule
+                  - events:EnableRule
+                  - events:DisableRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                  - events:ListTargetsByRule
+                  - events:TagResource
+                  - events:UntagResource
+                  - events:ListTagsForResource
+                Resource:
+                  - !Sub "arn:aws:events:us-east-1:${AWS::AccountId}:rule/headset-*"
+                  - !Sub "arn:aws:events:us-east-1:${AWS::AccountId}:rule/agent-headset-*"
+
+              # --- Amazon Connect: instances, contact flows, queues, hours of
+              # operation, users, phone numbers, Lex/Lambda integration
+              # associations. Connect ARNs nest the random instance id, so
+              # resource pinning at create time isn't feasible; region-gated. ---
+              - Sid: Connect
+                Effect: Allow
+                Action:
+                  - connect:CreateInstance
+                  - connect:DeleteInstance
+                  - connect:DescribeInstance
+                  - connect:ListInstances
+                  - connect:UpdateInstanceAttribute
+                  - connect:DescribeInstanceAttribute
+                  - connect:CreateContactFlow
+                  - connect:UpdateContactFlowContent
+                  - connect:UpdateContactFlowName
+                  - connect:DeleteContactFlow
+                  - connect:DescribeContactFlow
+                  - connect:ListContactFlows
+                  - connect:CreateQueue
+                  - connect:UpdateQueueStatus
+                  - connect:DescribeQueue
+                  - connect:ListQueues
+                  - connect:CreateHoursOfOperation
+                  - connect:UpdateHoursOfOperation
+                  - connect:DescribeHoursOfOperation
+                  - connect:ListHoursOfOperations
+                  - connect:CreateUser
+                  - connect:UpdateUserIdentityInfo
+                  - connect:DescribeUser
+                  - connect:ListUsers
+                  - connect:ListSecurityProfiles
+                  - connect:ListRoutingProfiles
+                  - connect:CreateRoutingProfile
+                  - connect:SearchAvailablePhoneNumbers
+                  - connect:ClaimPhoneNumber
+                  - connect:ReleasePhoneNumber
+                  - connect:ListPhoneNumbers
+                  - connect:ListPhoneNumbersV2
+                  - connect:DescribePhoneNumber
+                  - connect:AssociatePhoneNumberContactFlow
+                  - connect:DisassociatePhoneNumberContactFlow
+                  - connect:CreateIntegrationAssociation
+                  - connect:DeleteIntegrationAssociation
+                  - connect:ListIntegrationAssociations
+                  - connect:AssociateBot
+                  - connect:DisassociateBot
+                  - connect:ListBots
+                  - connect:TagResource
+                  - connect:UntagResource
+                  - connect:ListTagsForResource
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+              # Connect instance creation also touches connect-managed directory /
+              # describe APIs that have no resource scoping.
+              - Sid: ConnectSupport
+                Effect: Allow
+                Action:
+                  - ds:DescribeDirectories
+                  - ds:CheckAlias
+                  - profile:ListDomains
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+
+              # --- Amazon Lex V2: bot, bot version, alias, intents, slots,
+              # locales. Lex ARNs use random bot ids; region-gated. ---
+              - Sid: LexV2
+                Effect: Allow
+                Action:
+                  - lex:CreateBot
+                  - lex:UpdateBot
+                  - lex:DeleteBot
+                  - lex:DescribeBot
+                  - lex:ListBots
+                  - lex:CreateBotVersion
+                  - lex:DeleteBotVersion
+                  - lex:DescribeBotVersion
+                  - lex:CreateBotAlias
+                  - lex:UpdateBotAlias
+                  - lex:DeleteBotAlias
+                  - lex:DescribeBotAlias
+                  - lex:ListBotAliases
+                  - lex:CreateBotLocale
+                  - lex:UpdateBotLocale
+                  - lex:DescribeBotLocale
+                  - lex:BuildBotLocale
+                  - lex:CreateIntent
+                  - lex:UpdateIntent
+                  - lex:DeleteIntent
+                  - lex:DescribeIntent
+                  - lex:CreateSlot
+                  - lex:UpdateSlot
+                  - lex:DescribeSlot
+                  - lex:CreateSlotType
+                  - lex:UpdateSlotType
+                  - lex:DescribeSlotType
+                  - lex:TagResource
+                  - lex:UntagResource
+                  - lex:ListTagsForResource
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+
+              # --- Amazon Bedrock: agents, agent aliases, agent runtime invoke,
+              # knowledge bases, data sources, ingestion jobs, guardrails, and
+              # invoking foundation models. Many Bedrock ARNs use random ids;
+              # region-gated. ---
+              - Sid: Bedrock
+                Effect: Allow
+                Action:
+                  - bedrock:CreateAgent
+                  - bedrock:UpdateAgent
+                  - bedrock:DeleteAgent
+                  - bedrock:GetAgent
+                  - bedrock:ListAgents
+                  - bedrock:PrepareAgent
+                  - bedrock:CreateAgentActionGroup
+                  - bedrock:UpdateAgentActionGroup
+                  - bedrock:GetAgentActionGroup
+                  - bedrock:ListAgentActionGroups
+                  - bedrock:CreateAgentAlias
+                  - bedrock:UpdateAgentAlias
+                  - bedrock:DeleteAgentAlias
+                  - bedrock:GetAgentAlias
+                  - bedrock:ListAgentAliases
+                  - bedrock:AssociateAgentKnowledgeBase
+                  - bedrock:DisassociateAgentKnowledgeBase
+                  - bedrock:CreateKnowledgeBase
+                  - bedrock:UpdateKnowledgeBase
+                  - bedrock:DeleteKnowledgeBase
+                  - bedrock:GetKnowledgeBase
+                  - bedrock:ListKnowledgeBases
+                  - bedrock:CreateDataSource
+                  - bedrock:UpdateDataSource
+                  - bedrock:DeleteDataSource
+                  - bedrock:GetDataSource
+                  - bedrock:ListDataSources
+                  - bedrock:StartIngestionJob
+                  - bedrock:GetIngestionJob
+                  - bedrock:ListIngestionJobs
+                  - bedrock:CreateGuardrail
+                  - bedrock:UpdateGuardrail
+                  - bedrock:DeleteGuardrail
+                  - bedrock:GetGuardrail
+                  - bedrock:ListGuardrails
+                  - bedrock:CreateGuardrailVersion
+                  - bedrock:TagResource
+                  - bedrock:UntagResource
+                  - bedrock:ListTagsForResource
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:InvokeAgent
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListFoundationModels
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+
+              # --- Amazon SES: email sending identity / config used by the
+              # agent for notifications. ---
+              - Sid: SES
+                Effect: Allow
+                Action:
+                  - ses:VerifyEmailIdentity
+                  - ses:VerifyDomainIdentity
+                  - ses:GetIdentityVerificationAttributes
+                  - ses:DeleteIdentity
+                  - ses:ListIdentities
+                  - ses:CreateEmailIdentity
+                  - ses:DeleteEmailIdentity
+                  - ses:GetEmailIdentity
+                  - ses:ListEmailIdentities
+                  - ses:CreateConfigurationSet
+                  - ses:DeleteConfigurationSet
+                  - ses:GetConfigurationSet
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                  - ses:TagResource
+                  - ses:UntagResource
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+
+              # --- ECS / Fargate + ECR (WS-H Nova Sonic streaming service): task
+              # definitions, services, clusters, and the image repository. ---
+              - Sid: EcsFargate
+                Effect: Allow
+                Action:
+                  - ecs:CreateCluster
+                  - ecs:DeleteCluster
+                  - ecs:DescribeClusters
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:CreateService
+                  - ecs:UpdateService
+                  - ecs:DeleteService
+                  - ecs:DescribeServices
+                  - ecs:ListServices
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                  - ecs:TagResource
+                  - ecs:UntagResource
+                  - ecs:ListTagsForResource
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+              - Sid: Ecr
+                Effect: Allow
+                Action:
+                  - ecr:CreateRepository
+                  - ecr:DeleteRepository
+                  - ecr:DescribeRepositories
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:SetRepositoryPolicy
+                  - ecr:GetRepositoryPolicy
+                  - ecr:TagResource
+                  - ecr:UntagResource
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+
+              # --- Kinesis Video Streams (Nova Sonic call media ingest). ---
+              - Sid: KinesisVideo
+                Effect: Allow
+                Action:
+                  - kinesisvideo:CreateStream
+                  - kinesisvideo:DeleteStream
+                  - kinesisvideo:DescribeStream
+                  - kinesisvideo:ListStreams
+                  - kinesisvideo:GetDataEndpoint
+                  - kinesisvideo:TagStream
+                  - kinesisvideo:UntagStream
+                  - kinesisvideo:ListTagsForStream
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+
+              # --- ECS/Fargate autoscaling + load balancing (Nova Sonic service
+              # behind an NLB/ALB with target-tracking scaling). ---
+              - Sid: ScalingAndLB
+                Effect: Allow
+                Action:
+                  - application-autoscaling:RegisterScalableTarget
+                  - application-autoscaling:DeregisterScalableTarget
+                  - application-autoscaling:DescribeScalableTargets
+                  - application-autoscaling:PutScalingPolicy
+                  - application-autoscaling:DeleteScalingPolicy
+                  - application-autoscaling:DescribeScalingPolicies
+                  - elasticloadbalancing:CreateLoadBalancer
+                  - elasticloadbalancing:DeleteLoadBalancer
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:CreateTargetGroup
+                  - elasticloadbalancing:DeleteTargetGroup
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:CreateListener
+                  - elasticloadbalancing:DeleteListener
+                  - elasticloadbalancing:DescribeListeners
+                  - elasticloadbalancing:ModifyTargetGroupAttributes
+                  - elasticloadbalancing:AddTags
+                  - elasticloadbalancing:RemoveTags
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+              # ECS networking placement needs to read VPC/subnet/SG metadata.
+              - Sid: Ec2DescribeForEcs
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeAvailabilityZones
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+
+              # --- Service Quotas (read) — pipeline checks phone-number / model
+              # quotas before claiming/provisioning. ---
+              - Sid: ServiceQuotasRead
+                Effect: Allow
+                Action:
+                  - servicequotas:GetServiceQuota
+                  - servicequotas:ListServiceQuotas
+                Resource: "*"
+
+              # --- STS: the pipeline calls get-caller-identity to resolve the
+              # account id. ---
+              - Sid: StsIdentity
+                Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: "*"
+
+  # ---------------------------------------------------------------------------
+  # 4. HeadsetPRRole — assumed by pull_request validation jobs via OIDC.
+  #
+  # TRUST: web identity with :aud = sts.amazonaws.com and
+  #   :sub StringEquals repo:JeremyProffitt/Headset-Agent:pull_request
+  # (the fixed `pull_request` sub GitHub emits for PR-triggered runs, regardless
+  # of source branch). READ-ONLY: describe/list/get/validate only — never mutate.
+  # ---------------------------------------------------------------------------
+  HeadsetPRRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: HeadsetPRRole
+      Description: >-
+        Read-only role for PR validation of the Headset Support Agent, assumed by
+        GitHub Actions pull_request runs via OIDC.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:pull_request"
+      Policies:
+        - PolicyName: HeadsetPRReadOnlyPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read-only describe/list/get/validate across the project's
+              # services — enough to lint/validate templates and confirm current
+              # resource state during PR checks, nothing mutating.
+              - Sid: ReadOnlyValidation
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStacks
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:ListFunctions
+                  - dynamodb:DescribeTable
+                  - dynamodb:ListTables
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                  - ssm:DescribeParameters
+                  - sns:ListTopics
+                  - sns:GetTopicAttributes
+                  - logs:DescribeLogGroups
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:ListDashboards
+                  - events:ListRules
+                  - events:DescribeRule
+                  - connect:ListInstances
+                  - connect:DescribeInstance
+                  - connect:ListContactFlows
+                  - connect:ListPhoneNumbersV2
+                  - lex:ListBots
+                  - lex:DescribeBot
+                  - lex:ListBotAliases
+                  - bedrock:ListAgents
+                  - bedrock:GetAgent
+                  - bedrock:ListKnowledgeBases
+                  - bedrock:ListGuardrails
+                  - ecs:DescribeClusters
+                  - ecs:ListServices
+                  - ecr:DescribeRepositories
+                  - kinesisvideo:ListStreams
+                  - iam:GetRole
+                  - iam:ListAttachedRolePolicies
+                  - sts:GetCallerIdentity
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: us-east-1
+              # IAM and STS are global services (no region); list them separately
+              # without the region condition so they are not silently denied.
+              - Sid: GlobalReadOnly
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRoles
+                  - sts:GetCallerIdentity
+                Resource: "*"
+
+# -----------------------------------------------------------------------------
+Outputs:
+  OIDCProviderArn:
+    Description: ARN of the GitHub Actions OIDC identity provider.
+    Value: !Ref GitHubOIDCProvider
+    Export:
+      Name: Headset-OIDCProviderArn
+
+  DeployRoleArn:
+    Description: >-
+      ARN of HeadsetDeployRole. WS-D-05 sets this as role-to-assume in
+      deploy.yml / destroy.yml.
+    Value: !GetAtt HeadsetDeployRole.Arn
+    Export:
+      Name: Headset-DeployRoleArn
+
+  PRRoleArn:
+    Description: >-
+      ARN of HeadsetPRRole. WS-D-05 sets this as role-to-assume in
+      pr-validation.yml.
+    Value: !GetAtt HeadsetPRRole.Arn
+    Export:
+      Name: Headset-PRRoleArn
+
+  PermissionsBoundaryArn:
+    Description: ARN of the HeadsetDeployBoundary permissions boundary managed policy.
+    Value: !Ref HeadsetDeployBoundary
+    Export:
+      Name: Headset-DeployBoundaryArn

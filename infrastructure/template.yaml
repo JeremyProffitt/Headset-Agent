@@ -438,6 +438,27 @@ Resources:
     Properties:
       LogGroupName: !Sub "/aws/lambda/headset-lex-orchestrator-${Environment}"
       RetentionInDays: !If [IsProd, 90, 14]
+      # WS-D-03 (SEC-2): mask caller PII in logs even if a code path leaks it.
+      DataProtectionPolicy:
+        Name: headset-lex-pii-protection
+        Version: "2021-06-01"
+        Statement:
+          - Sid: audit-pii
+            DataIdentifier:
+              - arn:aws:dataprotection::aws:data-identifier/PhoneNumber-US
+              - arn:aws:dataprotection::aws:data-identifier/Name
+              - arn:aws:dataprotection::aws:data-identifier/Address
+            Operation:
+              Audit:
+                FindingsDestination: {}
+          - Sid: deidentify-pii
+            DataIdentifier:
+              - arn:aws:dataprotection::aws:data-identifier/PhoneNumber-US
+              - arn:aws:dataprotection::aws:data-identifier/Name
+              - arn:aws:dataprotection::aws:data-identifier/Address
+            Operation:
+              Deidentify:
+                MaskConfig: {}
 
   NovaSonicLambdaLogGroup:
     Type: AWS::Logs::LogGroup
@@ -445,6 +466,26 @@ Resources:
     Properties:
       LogGroupName: !Sub "/aws/lambda/headset-nova-sonic-${Environment}"
       RetentionInDays: !If [IsProd, 90, 14]
+      DataProtectionPolicy:
+        Name: headset-nova-pii-protection
+        Version: "2021-06-01"
+        Statement:
+          - Sid: audit-pii
+            DataIdentifier:
+              - arn:aws:dataprotection::aws:data-identifier/PhoneNumber-US
+              - arn:aws:dataprotection::aws:data-identifier/Name
+              - arn:aws:dataprotection::aws:data-identifier/Address
+            Operation:
+              Audit:
+                FindingsDestination: {}
+          - Sid: deidentify-pii
+            DataIdentifier:
+              - arn:aws:dataprotection::aws:data-identifier/PhoneNumber-US
+              - arn:aws:dataprotection::aws:data-identifier/Name
+              - arn:aws:dataprotection::aws:data-identifier/Address
+            Operation:
+              Deidentify:
+                MaskConfig: {}
 
   # =============================================================
   # API GATEWAY FOR WEB CHAT
@@ -867,6 +908,171 @@ Resources:
       Value: "PENDING"
       Description: Phone number for Nova Sonic path (Path B) - claimed by setup-connect script
 
+  # =============================================================
+  # OBSERVABILITY & ALERTING (WS-F-01 SNS, WS-F-02 alarms)
+  # =============================================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "headset-alerts-${Environment}"
+      DisplayName: Headset Agent Alerts
+
+  # Email subscription requires a one-time manual confirmation click by the
+  # recipient (AWS sends a confirmation email). Until confirmed, alarms publish
+  # but no email is delivered.
+  AlertTopicEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: proffitt.jeremy@gmail.com
+
+  # --- Lex orchestrator Lambda alarms ---
+  LexErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployLex
+    Properties:
+      AlarmName: !Sub "headset-lex-errors-${Environment}"
+      AlarmDescription: "Lex orchestrator Lambda is erroring"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LexOrchestratorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  LexDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployLex
+    Properties:
+      AlarmName: !Sub "headset-lex-duration-p95-${Environment}"
+      AlarmDescription: "Lex orchestrator p95 duration > 20s (approaching the 25s agent timeout)"
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LexOrchestratorFunction
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 20000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  LexThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployLex
+    Properties:
+      AlarmName: !Sub "headset-lex-throttles-${Environment}"
+      AlarmDescription: "Lex orchestrator Lambda is being throttled"
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LexOrchestratorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # --- Nova Sonic Lambda alarms (streaming function: errors + throttles only;
+  #     Duration is intentionally not alarmed because it is long-lived) ---
+  NovaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployNovaSonic
+    Properties:
+      AlarmName: !Sub "headset-nova-errors-${Environment}"
+      AlarmDescription: "Nova Sonic Lambda is erroring"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NovaSonicFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  NovaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployNovaSonic
+    Properties:
+      AlarmName: !Sub "headset-nova-throttles-${Environment}"
+      AlarmDescription: "Nova Sonic Lambda is being throttled"
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NovaSonicFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # --- Bedrock alarms by ModelId. Inference profiles emit AWS/Bedrock metrics
+  #     under the underlying foundation-model id; if the dimension does not match
+  #     the alarm sits at INSUFFICIENT_DATA (notBreaching) which is harmless. ---
+  BedrockSupervisorServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "headset-bedrock-supervisor-server-errors-${Environment}"
+      AlarmDescription: "Bedrock supervisor model server errors"
+      Namespace: AWS/Bedrock
+      MetricName: InvocationServerErrors
+      Dimensions:
+        - Name: ModelId
+          Value: anthropic.claude-3-5-sonnet-20241022-v2:0
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  BedrockSupervisorThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "headset-bedrock-supervisor-throttles-${Environment}"
+      AlarmDescription: "Bedrock supervisor model invocation throttles"
+      Namespace: AWS/Bedrock
+      MetricName: InvocationThrottles
+      Dimensions:
+        - Name: ModelId
+          Value: anthropic.claude-3-5-sonnet-20241022-v2:0
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
 Outputs:
   # Shared Outputs
   KnowledgeBaseBucketName:
@@ -884,6 +1090,12 @@ Outputs:
   SessionTableName:
     Description: DynamoDB table for session state
     Value: !Ref SessionTable
+
+  AlertTopicArn:
+    Description: SNS topic ARN for operational alerts
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-AlertTopic"
 
   BedrockAgentRoleArn:
     Description: IAM role ARN for Bedrock agents

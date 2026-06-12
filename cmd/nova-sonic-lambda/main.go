@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"os"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/headset-support-agent/internal/agents"
+	"github.com/headset-support-agent/internal/logging"
 	"github.com/headset-support-agent/internal/models"
 	"github.com/headset-support-agent/internal/persona"
 )
@@ -106,6 +107,8 @@ type NovaSonicResponse struct {
 }
 
 func init() {
+	logging.Init()
+
 	ctx := context.Background()
 	region := os.Getenv("AWS_REGION")
 	if region == "" {
@@ -114,7 +117,8 @@ func init() {
 
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
-		log.Fatalf("failed to load AWS config: %v", err)
+		slog.Error("failed to load AWS config", slog.String("error", err.Error()))
+		panic("failed to load AWS config: " + err.Error())
 	}
 
 	agentClient = agents.NewBedrockClient(cfg)
@@ -156,9 +160,11 @@ func mapPersonaToNovaSonicVoice(personaID string) string {
 
 // handleStreamingRequest handles Nova Sonic streaming requests
 func handleStreamingRequest(ctx context.Context, request NovaSonicRequest) (*NovaSonicResponse, error) {
-	log.Printf("=== NOVA SONIC HANDLER START ===")
-	log.Printf("SessionID: %s, Action: %s, PersonaID: %s",
-		request.SessionID, request.Action, request.PersonaID)
+	slog.Info("nova sonic handler start",
+		slog.String("session_id", request.SessionID),
+		slog.String("action", request.Action),
+		slog.String("persona_id", request.PersonaID),
+	)
 
 	// Load persona configuration
 	personaID := request.PersonaID
@@ -171,7 +177,10 @@ func handleStreamingRequest(ctx context.Context, request NovaSonicRequest) (*Nov
 
 	p, err := personaLoader.Load(ctx, personaID)
 	if err != nil {
-		log.Printf("Error loading persona %s: %v, using default", personaID, err)
+		slog.Warn("error loading persona; using default",
+			slog.String("persona_id", personaID),
+			slog.String("error", err.Error()),
+		)
 		p = persona.DefaultPersona()
 	}
 
@@ -208,7 +217,7 @@ func handleStreamingRequest(ctx context.Context, request NovaSonicRequest) (*Nov
 
 // handleSessionStart initializes a new Nova Sonic session
 func handleSessionStart(ctx context.Context, request NovaSonicRequest, p *models.Persona, config *models.NovaSonicConfig) (*NovaSonicResponse, error) {
-	log.Printf("Starting Nova Sonic session: %s", request.SessionID)
+	slog.Info("starting nova sonic session", slog.String("session_id", request.SessionID))
 
 	// Generate welcome message audio
 	welcomeMessage := "Hello! I'm your headset support assistant. How can I help you today?"
@@ -234,7 +243,7 @@ func handleAudioInput(ctx context.Context, request NovaSonicRequest, p *models.P
 		}, nil
 	}
 
-	log.Printf("Processing audio chunk for session: %s", request.SessionID)
+	slog.Info("processing audio chunk", slog.String("session_id", request.SessionID))
 
 	// Decode audio from base64
 	_, err := base64.StdEncoding.DecodeString(request.AudioChunk.Content)
@@ -268,7 +277,11 @@ func handleTextInput(ctx context.Context, request NovaSonicRequest, p *models.Pe
 		}, nil
 	}
 
-	log.Printf("Processing text input for session: %s - '%s'", request.SessionID, request.TextInput)
+	slog.Info("processing text input", slog.String("session_id", request.SessionID))
+	slog.Debug("text input content",
+		slog.String("session_id", request.SessionID),
+		slog.String("text", logging.Truncate(request.TextInput, 80)),
+	)
 
 	// Get agent config from SSM
 	agentIDParam := os.Getenv("SUPERVISOR_AGENT_ID_PARAM")
@@ -306,7 +319,10 @@ func handleTextInput(ctx context.Context, request NovaSonicRequest, p *models.Pe
 		Persona:      p,
 	})
 	if err != nil {
-		log.Printf("Error invoking Bedrock agent: %v", err)
+		slog.Error("error invoking bedrock agent",
+			slog.String("session_id", request.SessionID),
+			slog.String("error", err.Error()),
+		)
 		return &NovaSonicResponse{
 			SessionID: request.SessionID,
 			Status:    "error",
@@ -324,7 +340,7 @@ func handleTextInput(ctx context.Context, request NovaSonicRequest, p *models.Pe
 
 // handleSessionEnd closes a Nova Sonic session
 func handleSessionEnd(ctx context.Context, request NovaSonicRequest) (*NovaSonicResponse, error) {
-	log.Printf("Ending Nova Sonic session: %s", request.SessionID)
+	slog.Info("ending nova sonic session", slog.String("session_id", request.SessionID))
 
 	return &NovaSonicResponse{
 		SessionID: request.SessionID,
@@ -334,10 +350,18 @@ func handleSessionEnd(ctx context.Context, request NovaSonicRequest) (*NovaSonic
 
 // handleConnectContactFlow handles Amazon Connect contact flow Lambda invocations
 func handleConnectContactFlow(ctx context.Context, event ConnectContactFlowEvent) (*ConnectLambdaResponse, error) {
-	log.Printf("=== CONNECT CONTACT FLOW HANDLER START ===")
-	log.Printf("Contact ID: %s", event.Details.ContactData.ContactID)
-	log.Printf("Channel: %s", event.Details.ContactData.Channel)
-	log.Printf("Initiation Method: %s", event.Details.ContactData.InitiationMethod)
+	// contactId is not PII — safe to log at INFO.
+	// CustomerEndpoint.Address IS a phone number (ANI) — hash it before logging.
+	var aniHash string
+	if event.Details.ContactData.CustomerEndpoint != nil {
+		aniHash = logging.HashANI(event.Details.ContactData.CustomerEndpoint.Address)
+	}
+	slog.Info("connect contact flow handler start",
+		slog.String("contact_id", event.Details.ContactData.ContactID),
+		slog.String("channel", event.Details.ContactData.Channel),
+		slog.String("initiation_method", event.Details.ContactData.InitiationMethod),
+		slog.String("ani_hash", aniHash),
+	)
 
 	// Extract persona from contact attributes
 	personaID := ""
@@ -350,12 +374,15 @@ func handleConnectContactFlow(ctx context.Context, event ConnectContactFlowEvent
 			personaID = "tangerine"
 		}
 	}
-	log.Printf("Using persona: %s", personaID)
+	slog.Info("using persona", slog.String("persona_id", personaID))
 
 	// Load persona configuration
 	p, err := personaLoader.Load(ctx, personaID)
 	if err != nil {
-		log.Printf("Error loading persona %s: %v, using default", personaID, err)
+		slog.Warn("error loading persona; using default",
+			slog.String("persona_id", personaID),
+			slog.String("error", err.Error()),
+		)
 		p = persona.DefaultPersona()
 	}
 
@@ -379,7 +406,11 @@ func handleConnectContactFlow(ctx context.Context, event ConnectContactFlowEvent
 
 	// Check if agent is configured
 	if agentID == "" || agentID == "PLACEHOLDER" || agentAlias == "" || agentAlias == "PLACEHOLDER" {
-		log.Printf("Supervisor agent not configured (ID: %s, Alias: %s)", agentID, agentAlias)
+		slog.Warn("supervisor agent not configured",
+			slog.String("contact_id", event.Details.ContactData.ContactID),
+			slog.String("agent_id", agentID),
+			slog.String("alias_id", agentAlias),
+		)
 		// Return a greeting message while agent is being configured
 		greeting := "Hello! I'm your headset support assistant. The system is currently being set up. Please try again in a few minutes."
 		if p != nil && len(p.Phrases.Greeting) > 0 {
@@ -398,7 +429,7 @@ func handleConnectContactFlow(ctx context.Context, event ConnectContactFlowEvent
 		greeting = p.Phrases.Greeting[0]
 	}
 
-	log.Printf("Returning greeting: %s", greeting)
+	slog.Info("returning greeting to connect", slog.String("contact_id", event.Details.ContactData.ContactID))
 	return &ConnectLambdaResponse{
 		TextOutput:          greeting,
 		Status:              "ready",
@@ -408,12 +439,13 @@ func handleConnectContactFlow(ctx context.Context, event ConnectContactFlowEvent
 
 // handleRequest is the main Lambda handler
 func handleRequest(ctx context.Context, event json.RawMessage) (interface{}, error) {
-	log.Printf("Received event: %s", string(event))
+	// NOTE: Do NOT log the raw event body — it may contain ANI or transcript text.
+	// The event type is detected by inspection; each handler logs its own entry point.
 
 	// Try to parse as API Gateway event (for function URL)
 	var apiEvent events.APIGatewayV2HTTPRequest
 	if err := json.Unmarshal(event, &apiEvent); err == nil && apiEvent.RequestContext.HTTP.Method != "" {
-		log.Printf("Detected API Gateway V2 event")
+		slog.Info("detected API gateway V2 event")
 		// Parse the request body
 		var request NovaSonicRequest
 		if err := json.Unmarshal([]byte(apiEvent.Body), &request); err != nil {
@@ -445,14 +477,14 @@ func handleRequest(ctx context.Context, event json.RawMessage) (interface{}, err
 	// Try to parse as Amazon Connect contact flow event
 	var connectEvent ConnectContactFlowEvent
 	if err := json.Unmarshal(event, &connectEvent); err == nil && connectEvent.Details.ContactData.ContactID != "" {
-		log.Printf("Detected Amazon Connect contact flow event")
+		slog.Info("detected amazon connect contact flow event")
 		return handleConnectContactFlow(ctx, connectEvent)
 	}
 
 	// Direct Lambda invocation with NovaSonicRequest
 	var request NovaSonicRequest
 	if err := json.Unmarshal(event, &request); err != nil {
-		log.Printf("Error parsing event as NovaSonicRequest: %v", err)
+		slog.Error("error parsing event as nova sonic request", slog.String("error", err.Error()))
 		// Return a generic error response that Connect can handle
 		return &ConnectLambdaResponse{
 			TextOutput: "I'm sorry, I couldn't process that request. Please try again.",
@@ -460,7 +492,7 @@ func handleRequest(ctx context.Context, event json.RawMessage) (interface{}, err
 		}, nil
 	}
 
-	log.Printf("Processing direct NovaSonicRequest invocation")
+	slog.Info("processing direct nova sonic request invocation")
 	return handleStreamingRequest(ctx, request)
 }
 

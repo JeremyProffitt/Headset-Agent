@@ -3,7 +3,7 @@ package agents
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockagentruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockagentruntime/types"
+	"github.com/headset-support-agent/internal/logging"
 	"github.com/headset-support-agent/internal/models"
 )
 
@@ -59,8 +60,11 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 	// Build enhanced system context
 	enhancedInput := buildSystemContext(input.InputText, input.Persona)
 
-	log.Printf("Invoking Bedrock agent: agentId=%s, aliasId=%s, sessionId=%s",
-		input.AgentID, input.AgentAliasID, input.SessionID)
+	slog.Info("invoking bedrock agent",
+		slog.String("agent_id", input.AgentID),
+		slog.String("alias_id", input.AgentAliasID),
+		slog.String("session_id", input.SessionID),
+	)
 
 	result, err := c.client.InvokeAgent(ctx, &bedrockagentruntime.InvokeAgentInput{
 		AgentId:      aws.String(input.AgentID),
@@ -75,10 +79,13 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 	if err != nil {
 		// Check for context deadline exceeded
 		if ctx.Err() == context.DeadlineExceeded {
-			log.Printf("Bedrock agent invocation timed out after 25 seconds")
+			slog.Error("bedrock agent invocation timed out", slog.String("session_id", input.SessionID))
 			return nil, fmt.Errorf("agent invocation timed out")
 		}
-		log.Printf("Error invoking Bedrock agent: %v", err)
+		slog.Error("error invoking bedrock agent",
+			slog.String("session_id", input.SessionID),
+			slog.String("error", err.Error()),
+		)
 		return nil, err
 	}
 
@@ -88,7 +95,10 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 		return nil, err
 	}
 
-	log.Printf("Agent response: %s", truncateString(responseText, 200))
+	slog.Debug("agent response",
+		slog.String("session_id", input.SessionID),
+		slog.String("response_preview", logging.Truncate(responseText, 200)),
+	)
 
 	return &models.AgentResponse{
 		OutputText: responseText,
@@ -109,19 +119,21 @@ func processResponseStream(reader bedrockagentruntime.ResponseStreamReader) (str
 		case *types.ResponseStreamMemberChunk:
 			chunk := string(v.Value.Bytes)
 			outputText.WriteString(chunk)
-			log.Printf("Received chunk: %s", truncateString(chunk, 100))
+			slog.Debug("received response chunk",
+				slog.String("chunk_preview", logging.Truncate(chunk, 100)),
+			)
 		case *types.ResponseStreamMemberTrace:
 			// Log trace events for debugging
 			if v.Value.Trace != nil {
-				log.Printf("Trace event received")
+				slog.Debug("trace event received")
 			}
 		default:
-			log.Printf("Unknown event type: %T", v)
+			slog.Warn("unknown stream event type", slog.String("type", fmt.Sprintf("%T", v)))
 		}
 	}
 
 	if err := reader.Err(); err != nil {
-		log.Printf("Stream error: %v", err)
+		slog.Error("response stream error", slog.String("error", err.Error()))
 		return "", err
 	}
 
@@ -174,7 +186,11 @@ func (c *BedrockClient) GetAgentStatus(ctx context.Context, agentID, aliasID str
 	})
 
 	if err != nil {
-		log.Printf("Agent health check failed: %v", err)
+		slog.Error("agent health check failed",
+			slog.String("agent_id", agentID),
+			slog.String("alias_id", aliasID),
+			slog.String("error", err.Error()),
+		)
 		return false, err
 	}
 
