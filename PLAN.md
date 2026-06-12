@@ -141,7 +141,7 @@ Tasks: E-4.* (Spanish + multi-language, deferred from M3 per Q-E), per-path KPI 
 
 | ID | St | Task | Files / resources | Model | Deps | DoD |
 |---|---|---|---|---|---|---|
-| B-01 | `[ ]` | Session store package: Load/Save `models.Session` against `SessionTable` (TTL refresh); typed accessors for current_tree, current_step, attempted_steps, failed_steps, frustration_count, pace_rate, last_response, low_asr_count, no_match_count | new `internal/session/store.go`+test; `internal/models/types.go` (`TriageState`) | Sonnet | — | Round-trip tests pass; TTL set; concurrent-turn safety via conditional write on `LastActivity` |
+| B-01 | `[x]` | Session store package: Load/Save `models.Session` against `SessionTable` (TTL refresh); typed accessors for current_tree, current_step, attempted_steps, failed_steps, frustration_count, pace_rate, last_response, low_asr_count, no_match_count | new `internal/session/store.go`+test; `internal/models/types.go` (`TriageState`) | Sonnet | — | Round-trip tests pass; TTL set; concurrent-turn safety via conditional write on `LastActivity` |
 | B-02 | `[ ]` | Wire session store into the Lex handler (and `/chat` parity): load at top, merge to session attrs, persist after response (incl. escalation/Close) | `cmd/lex-lambda/main.go` | Sonnet | B-01 | 5-turn call: state survives in DynamoDB; chat shares the store; graceful degrade + log on read failure |
 | B-03 | `[x]` | **Design the triage state machine** (CC-2): trees-as-data schema (step id, read-aloud key, yes/no/other transitions, KB doc ref, escalation terminals incl. "≥2 reboots"), top-level symptom fork, and the agent contract (who says what) | design section here; `internal/triage/types.go` | Opus | — | Every §1 branch maps to a schema instance, no "misc" escape; sign-off before B-04 |
 | B-04 | `[ ]` | Implement the engine + tree data: pre-flight + Trees 1–8 (terminals → reasons/RMA), symptom classifier (slot/keyword first, single Haiku `Converse` fallback) | new `internal/triage/{engine,trees,classify}.go`+tests; `cmd/lex-lambda/main.go` | Fable | B-01,B-03,A-01 | Table-driven tests walk every path; scripted Tree-8 reaches RMA in order; classifier picks correct tree on the 8 index utterances |
@@ -350,7 +350,10 @@ Append entries under the relevant milestone using this template (copy per entry)
 - Files: infrastructure/template.yaml, scripts/setup-connect.py, .github/workflows/deploy.yml, infrastructure/contact-flow-lex.json, docs/recording-policy.md, cmd/canary-lambda/* (+ go.mod/go.sum cloudwatch dep).
 
 ### M1 Working Log
-_(empty)_
+
+---
+**[2026-06-12] Claude(Opus orchestrator) — B-01 session store [x]**
+- (Sonnet subagent) `internal/session/store.go` + `store_test.go` — `Store` over `SessionTable` mirroring persona.Loader's mockable `dynamoAPI` pattern. `Load` (miss → fresh Session, no error), `Save` (TTL = now+24h per SEC-6, sets LastActivity, **conditional write on last_activity → `ErrConcurrentUpdate`** on ConditionalCheckFailed). Typed accessors (GetInt/SetInt/GetStringSlice/AppendAttemptedStep + named methods) over Session.Attributes. **Key reconciliation:** re-exports triage's 9 `Attr*` consts as session `Key*` (identical strings, asserted by a test); adds session-only keys (attempted_steps, last_response, pace_rate, low_asr_count, no_match_count) per design-doc §8. Did NOT edit triage/types.go. **B-02 must use `session.Key*` / the named methods.** 88.2% coverage; build/vet/test green. Inert until B-02 wires it in.
 
 ### M2 Working Log
 _(empty)_

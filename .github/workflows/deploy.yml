@@ -143,6 +143,19 @@ jobs:
             -o cmd/nova-sonic-lambda/bootstrap \
             ./cmd/nova-sonic-lambda/
 
+      - name: Build Config-Drift Canary Lambda (WS-F-04)
+        run: |
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
+            -ldflags="-s -w" \
+            -o cmd/canary-lambda/bootstrap \
+            ./cmd/canary-lambda/
+
+      - name: Upload Canary Lambda artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-lambda-binary
+          path: cmd/canary-lambda/bootstrap
+
       - name: Upload Lex Lambda artifact
         if: needs.setup.outputs.deploy_lex == 'true'
         uses: actions/upload-artifact@v4
@@ -180,10 +193,17 @@ jobs:
           name: nova-sonic-lambda-binary
           path: cmd/nova-sonic-lambda/
 
+      - name: Download Canary Lambda artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: canary-lambda-binary
+          path: cmd/canary-lambda/
+
       - name: Make binaries executable
         run: |
           chmod +x cmd/lex-lambda/bootstrap 2>/dev/null || true
           chmod +x cmd/nova-sonic-lambda/bootstrap 2>/dev/null || true
+          chmod +x cmd/canary-lambda/bootstrap 2>/dev/null || true
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
