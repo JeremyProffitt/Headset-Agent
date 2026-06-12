@@ -1249,9 +1249,12 @@ Resources:
       Handler: bootstrap
       CodeUri: ../cmd/canary-lambda/
       Description: Config-drift canary — emits CloudWatch metrics for PLACEHOLDER/PENDING SSM params
-      # Keep at 1 so a mis-configured EventBridge rule cannot spin up
-      # multiple concurrent checks and multiply metric datapoints.
-      ReservedConcurrentExecutions: 1
+      # NOTE (WS-F-08 blocked): this AWS account's Lambda concurrency limit is so low
+      # that reserving ANY concurrency drops the unreserved pool below the minimum of
+      # 10 (CFN: "decreases account's UnreservedConcurrentExecution below [10]").
+      # ReservedConcurrentExecutions is therefore omitted here AND cannot be set on
+      # the Lex/Nova functions until a Service Quotas increase is requested. Tracked
+      # under WS-F-08. The hourly EventBridge schedule already bounds canary invocations.
       Environment:
         Variables:
           ENVIRONMENT: !Ref Environment
