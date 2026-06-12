@@ -8,6 +8,7 @@ Designed to run in GitHub Actions pipeline.
 import argparse
 import boto3
 import json
+import os
 import time
 import sys
 from botocore.exceptions import ClientError
