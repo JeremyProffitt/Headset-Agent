@@ -18,6 +18,7 @@ import (
 	"github.com/headset-support-agent/internal/models"
 	"github.com/headset-support-agent/internal/persona"
 	"github.com/headset-support-agent/internal/session"
+	"github.com/headset-support-agent/internal/triage"
 )
 
 // sessionStorer is the interface the handler uses for session persistence.
@@ -44,7 +45,16 @@ var (
 	personaLoader personaLoaderI // set in init(); overridable in tests
 	ssmClient     *ssm.Client
 	sessStore     sessionStorer // set in init(); overridable in tests
-	agentConfig   struct {
+
+	// B-05: the deterministic triage engine, built once over the compiled-in
+	// trees (no I/O). Stateless and safe for concurrent invocations.
+	triageEngine = triage.NewDefaultEngine()
+	// B-05: keyword-only symptom classifier (nil LLM fallback — a supported,
+	// deterministic configuration per classify.go). B-07 may inject a Bedrock
+	// Converse LLM for ambiguous openers.
+	triageClassifier = triage.NewClassifier(nil)
+
+	agentConfig struct {
 		sync.RWMutex
 		agentID    string
 		agentAlias string
@@ -556,14 +566,57 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 	// ensures the next turn starts from the correct accumulated value).
 	if escalationDecision.FrustrationDelta > 0 {
 		session.SetFrustrationCount(sess, frustrationCount+escalationDecision.FrustrationDelta)
+		// Mirror the fresh value into the Lex turn attributes: the load-merge
+		// lets echoed Lex attrs win on collision, so a stale echoed counter
+		// would otherwise clobber the store value on the next turn.
+		event.SessionState.SessionAttributes[session.KeyFrustrationCount] = sess.Attributes[session.KeyFrustrationCount]
 	}
 
 	if escalationDecision.ShouldEscalate {
+		// Mark the triage flow ended so a resumed session does not keep
+		// navigating the tree after the warm transfer.
+		session.SetBool(sess, session.KeyEscalated, true)
+		session.SetString(sess, session.KeyEscalationReason, escalationDecision.Reason)
 		resp := handlers.BuildEscalationResponse(p, escalationDecision, event.SessionState.SessionAttributes)
 		// BuildEscalationResponse mutates sessionAttrs in-place (sets
 		// escalation_requested / reason / priority). Those mutations are
 		// reflected in event.SessionState.SessionAttributes and will be
 		// written into the session by saveSession below.
+		saveSession(ctx, sess, event.SessionState.SessionAttributes)
+		return resp, nil
+	}
+
+	// B-05 (CC-3): drive the deterministic triage engine. The engine owns
+	// navigation (which step / transition / terminal); Bedrock only answers
+	// free-form side questions, so the flow keeps working when Bedrock is
+	// unavailable. Falls through to the generic agent path when the turn is
+	// not a triage turn (no symptom classified yet, or the flow ended).
+	freeForm := func(ffCtx context.Context, sessionID, question string, kbDoc triage.KBDocRef) (string, error) {
+		aID, aAlias := loadAgentConfig(ffCtx)
+		if aID == "" || aID == "PLACEHOLDER" || aAlias == "" || aAlias == "PLACEHOLDER" {
+			return "", errors.New("supervisor agent not configured")
+		}
+		prompt := question
+		if kbDoc != "" {
+			prompt = "Answer the user's question briefly, in at most two spoken sentences, grounded in the knowledge-base document \"" + string(kbDoc) + "\": " + question
+		}
+		r, err := agentClient.InvokeAgent(ffCtx, agents.InvokeAgentInput{
+			AgentID:      aID,
+			AgentAliasID: aAlias,
+			SessionID:    sessionID,
+			InputText:    prompt,
+			Persona:      p,
+		})
+		if err != nil {
+			return "", err
+		}
+		return r.OutputText, nil
+	}
+	if resp, handled := handlers.HandleTriageTurn(ctx, handlers.TriageDeps{
+		Engine:     triageEngine,
+		Classifier: triageClassifier,
+		FreeForm:   freeForm,
+	}, sess, transcript, p, event.SessionState.SessionAttributes); handled {
 		saveSession(ctx, sess, event.SessionState.SessionAttributes)
 		return resp, nil
 	}

@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/headset-support-agent/internal/agents"
+	"github.com/headset-support-agent/internal/handlers"
 	"github.com/headset-support-agent/internal/models"
 	"github.com/headset-support-agent/internal/session"
 )
@@ -308,11 +309,260 @@ func TestHandleLexRequest_SessionLoadErrorDoesNotFailTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error despite Load failure, got: %v", err)
 	}
-	// We should get a valid success response (Bedrock stub returned text).
+	// We should get a valid response. ("my headset crackles" classifies as
+	// distorted_audio, so B-05 triage handles the turn on a fresh session —
+	// the load failure degrades gracefully to an empty session either way.)
 	if len(resp.Messages) == 0 {
 		t.Fatal("expected at least one message in response")
 	}
+	if strings.TrimSpace(resp.Messages[0].Content) == "" {
+		t.Error("expected a non-empty response message")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// B-05: scripted multi-turn triage flow (mock store + mock agent + real engine)
+// ---------------------------------------------------------------------------
+
+// TestHandleLexRequest_TriageMicFlowResolves walks the mic symptom end to end:
+// symptom classified → pre-flight presented → six "no" answers hand off to
+// Tree 2 → two failed fix steps increment failed_steps and record
+// attempted_steps → a diagnostic "yes" branches → "yes that fixed it" resolves
+// and Closes the dialog.
+func TestHandleLexRequest_TriageMicFlowResolves(t *testing.T) {
+	store := setupMocks(t)
+	ctx := context.Background()
+	sid := "sess-triage-mic"
+
+	turns := []struct {
+		transcript  string
+		wantTree    string
+		wantStep    string
+		wantFailed  int
+		wantClose   bool
+		wantContent string // substring expected in the spoken message
+	}{
+		// Turn 1: classify mic_not_working, start pre-flight.
+		{"they can't hear me on calls", "preflight", "preflight.s1", 0, false, "USB port"},
+		// Turns 2-6: pre-flight items fail one by one (no fix-step counting).
+		{"no, that didn't help", "preflight", "preflight.s2", 0, false, "selected device"},
+		{"no, that didn't help", "preflight", "preflight.s3", 0, false, "hardware mute"},
+		{"no, that didn't help", "preflight", "preflight.s4", 0, false, "volume"},
+		{"no, that didn't help", "preflight", "preflight.s5", 0, false, "one app"},
+		{"no, that didn't help", "preflight", "preflight.s6", 0, false, "restart"},
+		// Turn 7: pre-flight exhausted → $symptom routes into Tree 2.
+		{"no, that didn't help", "tree2", "tree2.s1", 0, false, "hardware mute"},
+		// Turn 8: tree2.s1 is a fix step → failed_steps=1, advance to s2.
+		{"no it didn't work", "tree2", "tree2.s2", 1, false, "microphone"},
+		// Turn 9: tree2.s2 fails too → failed_steps=2, advance to s3.
+		{"nope, no change", "tree2", "tree2.s3", 2, false, "level bar"},
+		// Turn 10: diagnostic step — "yes the bar moves" goes to the
+		// softphone/permissions path (no failed_steps increment).
+		{"yes the bar moves", "tree2", "tree2.s4", 2, false, "microphone permission"},
+		// Turn 11: the fix worked → resolved terminal, Close.
+		{"yes that fixed it", "tree2", "tree2.s4", 2, true, "all set"},
+	}
+
+	for i, tc := range turns {
+		turnNum := i + 1
+		resp, err := handleLexRequest(ctx, makeLexEvent(sid, tc.transcript))
+		if err != nil {
+			t.Fatalf("turn %d: unexpected error: %v", turnNum, err)
+		}
+		if len(resp.Messages) == 0 {
+			t.Fatalf("turn %d: expected a message", turnNum)
+		}
+		if !strings.Contains(resp.Messages[0].Content, tc.wantContent) {
+			t.Errorf("turn %d: message %q does not contain %q",
+				turnNum, resp.Messages[0].Content, tc.wantContent)
+		}
+		wantDialog := "ElicitIntent"
+		if tc.wantClose {
+			wantDialog = "Close"
+		}
+		if resp.SessionState.DialogAction.Type != wantDialog {
+			t.Errorf("turn %d: dialog action %q, want %q",
+				turnNum, resp.SessionState.DialogAction.Type, wantDialog)
+		}
+
+		stored, loadErr := store.Load(ctx, sid)
+		if loadErr != nil {
+			t.Fatalf("turn %d: load failed: %v", turnNum, loadErr)
+		}
+		if got := session.GetCurrentTree(stored); got != tc.wantTree {
+			t.Errorf("turn %d: current_tree=%q, want %q", turnNum, got, tc.wantTree)
+		}
+		if got := session.GetCurrentStep(stored); got != tc.wantStep {
+			t.Errorf("turn %d: current_step=%q, want %q", turnNum, got, tc.wantStep)
+		}
+		if got := session.GetFailedSteps(stored); got != tc.wantFailed {
+			t.Errorf("turn %d: failed_steps=%d, want %d", turnNum, got, tc.wantFailed)
+		}
+	}
+
+	// Final state: symptom recorded, resolution flagged with disposition, and
+	// attempted_steps carries the full trail (6 pre-flight + tree2 s1/s2/s3/s4).
+	stored, _ := store.Load(ctx, sid)
+	if got := stored.Attributes["symptom"]; got != "mic_not_working" {
+		t.Errorf("symptom=%q, want mic_not_working", got)
+	}
+	if stored.Attributes["resolved"] != "true" {
+		t.Errorf("resolved=%q, want true", stored.Attributes["resolved"])
+	}
+	if got := stored.Attributes["disposition"]; got != "contained_resolved" {
+		t.Errorf("disposition=%q, want contained_resolved", got)
+	}
+	attempted := session.GetAttemptedSteps(stored)
+	if len(attempted) != 10 {
+		t.Errorf("attempted_steps has %d entries, want 10: %v", len(attempted), attempted)
+	}
+	for _, want := range []string{"preflight.s1", "preflight.s6", "tree2.s1", "tree2.s2", "tree2.s4"} {
+		found := false
+		for _, s := range attempted {
+			if s == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("attempted_steps missing %q: %v", want, attempted)
+		}
+	}
+}
+
+// TestHandleLexRequest_TriageRMATerminalEscalates drives Tree 3 to its RMA
+// terminal and verifies the engine terminal flows through the
+// BuildEscalationResponse path: escalation_requested/reason/priority for the
+// Connect transfer (OPS-2), plus triage_tree/triage_step handoff context.
+func TestHandleLexRequest_TriageRMATerminalEscalates(t *testing.T) {
+	store := setupMocks(t)
+	ctx := context.Background()
+	sid := "sess-triage-rma"
+
+	transcripts := []string{
+		"my headset is not detected", // classify not_detected → preflight.s1
+		"no", "no", "no", "no", "no", // preflight s1→s6
+		"no", // preflight.s6 fails → routes into tree3.s1
+		"no", // tree3.s1 → s2
+		"no", // tree3.s2 → s3
+		"no", // tree3.s3 "works on another machine?" NO → RMA terminal
+	}
+
+	var resp handlers.LexV2Response
+	var err error
+	for i, tr := range transcripts {
+		resp, err = handleLexRequest(ctx, makeLexEvent(sid, tr))
+		if err != nil {
+			t.Fatalf("turn %d: unexpected error: %v", i+1, err)
+		}
+	}
+
+	sa := resp.SessionState.SessionAttributes
+	if sa["escalation_requested"] != "true" {
+		t.Errorf("escalation_requested=%q, want true", sa["escalation_requested"])
+	}
+	if sa["escalation_reason"] != "hardware_fault" {
+		t.Errorf("escalation_reason=%q, want hardware_fault", sa["escalation_reason"])
+	}
+	if sa["escalation_priority"] != "high" {
+		t.Errorf("escalation_priority=%q, want high", sa["escalation_priority"])
+	}
+	if sa["triage_tree"] != "tree3" {
+		t.Errorf("triage_tree=%q, want tree3", sa["triage_tree"])
+	}
+	if sa["triage_step"] != "tree3.s3" {
+		t.Errorf("triage_step=%q, want tree3.s3", sa["triage_step"])
+	}
+	if sa["attempted_steps"] == "" {
+		t.Error("attempted_steps should be carried in the escalation attributes")
+	}
+	if resp.SessionState.DialogAction.Type != "Close" {
+		t.Errorf("dialog action %q, want Close", resp.SessionState.DialogAction.Type)
+	}
+	stored, _ := store.Load(ctx, sid)
+	if stored.Attributes["escalated"] != "true" {
+		t.Errorf("persisted escalated=%q, want true", stored.Attributes["escalated"])
+	}
+	if stored.Attributes["escalation_reason"] != "hardware_fault" {
+		t.Errorf("persisted escalation_reason=%q, want hardware_fault", stored.Attributes["escalation_reason"])
+	}
+}
+
+// TestHandleLexRequest_TriageOffScriptRepromptsOnceThenNo verifies the unclear
+// loop: an off-script reply re-presents the same step once; a second
+// off-script reply is treated as didnt_work and the flow advances.
+func TestHandleLexRequest_TriageOffScriptRepromptsOnceThenNo(t *testing.T) {
+	store := setupMocks(t)
+	ctx := context.Background()
+	sid := "sess-triage-unclear"
+
+	// Turn 1: start the flow.
+	if _, err := handleLexRequest(ctx, makeLexEvent(sid, "i can't hear anything in my headset")); err != nil {
+		t.Fatalf("turn 1: %v", err)
+	}
+	stored, _ := store.Load(ctx, sid)
+	if got := session.GetCurrentStep(stored); got != "preflight.s1" {
+		t.Fatalf("turn 1: current_step=%q, want preflight.s1", got)
+	}
+
+	// Turn 2: off-script → re-prompt, same step, streak=1.
+	resp, err := handleLexRequest(ctx, makeLexEvent(sid, "banana sandwich"))
+	if err != nil {
+		t.Fatalf("turn 2: %v", err)
+	}
+	if !strings.Contains(resp.Messages[0].Content, "yes or no") {
+		t.Errorf("turn 2: expected a re-prompt, got %q", resp.Messages[0].Content)
+	}
+	stored, _ = store.Load(ctx, sid)
+	if got := session.GetCurrentStep(stored); got != "preflight.s1" {
+		t.Errorf("turn 2: current_step=%q, want preflight.s1 (re-prompt)", got)
+	}
+	if got := session.GetUnclearStreak(stored); got != 1 {
+		t.Errorf("turn 2: unclear_streak=%d, want 1", got)
+	}
+
+	// Turn 3: off-script again → treated as didnt_work → advances to s2.
+	if _, err := handleLexRequest(ctx, makeLexEvent(sid, "purple monkey dishwasher")); err != nil {
+		t.Fatalf("turn 3: %v", err)
+	}
+	stored, _ = store.Load(ctx, sid)
+	if got := session.GetCurrentStep(stored); got != "preflight.s2" {
+		t.Errorf("turn 3: current_step=%q, want preflight.s2 (advance after 2nd unclear)", got)
+	}
+	if got := session.GetUnclearStreak(stored); got != 0 {
+		t.Errorf("turn 3: unclear_streak=%d, want 0", got)
+	}
+	attempted := session.GetAttemptedSteps(stored)
+	if len(attempted) != 1 || attempted[0] != "preflight.s1" {
+		t.Errorf("turn 3: attempted_steps=%v, want [preflight.s1]", attempted)
+	}
+}
+
+// TestHandleLexRequest_TriageFreeFormQuestionUsesBedrock verifies a side
+// question routes to the Bedrock agent and the engine re-presents the same
+// step without moving counters (FreeFormHandled).
+func TestHandleLexRequest_TriageFreeFormQuestionUsesBedrock(t *testing.T) {
+	store := setupMocks(t)
+	ctx := context.Background()
+	sid := "sess-triage-freeform"
+
+	if _, err := handleLexRequest(ctx, makeLexEvent(sid, "there's no sound in my headset")); err != nil {
+		t.Fatalf("turn 1: %v", err)
+	}
+
+	resp, err := handleLexRequest(ctx, makeLexEvent(sid, "what's a usb hub?"))
+	if err != nil {
+		t.Fatalf("turn 2: %v", err)
+	}
 	if !strings.Contains(resp.Messages[0].Content, "Stub bedrock response") {
-		t.Errorf("unexpected response message: %q", resp.Messages[0].Content)
+		t.Errorf("expected Bedrock answer in message, got %q", resp.Messages[0].Content)
+	}
+
+	stored, _ := store.Load(ctx, sid)
+	if got := session.GetCurrentStep(stored); got != "preflight.s1" {
+		t.Errorf("current_step=%q, want preflight.s1 (free-form must not advance)", got)
+	}
+	if got := session.GetUnclearStreak(stored); got != 0 {
+		t.Errorf("unclear_streak=%d, want 0 (free-form moves no counters)", got)
 	}
 }
