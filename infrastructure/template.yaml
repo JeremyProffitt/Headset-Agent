@@ -1135,6 +1135,14 @@ Resources:
   ConnectInstance:
     Type: AWS::Connect::Instance
     Condition: CreateConnectInstance
+    # Retain on update/delete: the deploy pipeline discovers this instance on
+    # subsequent runs and passes it back as ExistingConnectInstanceId, which
+    # flips CreateConnectInstance to false. Without Retain, CloudFormation would
+    # DELETE the instance it created when that condition goes true->false,
+    # destroying telephony every other deploy. Retain keeps the physical
+    # instance alive as an unmanaged "existing" instance.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       InstanceAlias: !Sub "headset-${AWS::AccountId}"
       IdentityManagementType: CONNECT_MANAGED
