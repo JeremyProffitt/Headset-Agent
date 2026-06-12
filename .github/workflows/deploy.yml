@@ -473,10 +473,11 @@ jobs:
         run: |
           ENV="${{ needs.setup.outputs.environment }}"
           STACK_NAME="agent-headset-${ENV}"
-          echo "=== Recent stack events (newest first, full StatusReason as JSON) ==="
-          # No 2>/dev/null and JSON output so the exact reason is never truncated/swallowed.
-          aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --max-items 40 \
-            --query "StackEvents[].{R:LogicalResourceId,S:ResourceStatus,Reason:ResourceStatusReason}" \
+          echo "=== FAILED resource events (server-side filtered, full reason as JSON) ==="
+          # Filter for *FAILED* server-side so the root cause is not pushed out of the
+          # window by rollback/delete events. JSON output preserves the full reason.
+          aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+            --query "StackEvents[?contains(ResourceStatus, 'FAILED')].{R:LogicalResourceId,S:ResourceStatus,Reason:ResourceStatusReason}" \
             --output json || echo "describe-stack-events call failed"
   sync-knowledge-base:
     name: Sync Knowledge Base

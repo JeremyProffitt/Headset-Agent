@@ -887,62 +887,12 @@ Resources:
                 "LexV2Bot": {"AliasArn": "${HeadsetBotAlias.Arn}"}
               },
               "Transitions": {
-                "NextAction": "checkEscalation",
+                "NextAction": "goodbye",
                 "Errors": [
                   {"NextAction": "retry", "ErrorType": "NoMatchingError"},
                   {"NextAction": "retry", "ErrorType": "NoMatchingCondition"},
                   {"NextAction": "retry", "ErrorType": "InputTimeLimitExceeded"}
                 ],
-                "Conditions": []
-              }
-            },
-            {
-              "Identifier": "checkEscalation",
-              "Type": "CheckContactAttributes",
-              "Parameters": {
-                "Attribute": "escalation_requested",
-                "Namespace": "User Defined"
-              },
-              "Transitions": {
-                "NextAction": "goodbye",
-                "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
-                "Conditions": [
-                  {"NextAction": "setQueue", "Condition": {"Operator": "Equals", "Operands": ["true"]}}
-                ]
-              }
-            },
-            {
-              "Identifier": "setQueue",
-              "Type": "UpdateContactTargetQueue",
-              "Parameters": {"QueueId": "${HeadsetEscalationQueue.QueueArn}"},
-              "Transitions": {
-                "NextAction": "transferToQueue",
-                "Errors": [{"NextAction": "agentsBusy", "ErrorType": "NoMatchingError"}],
-                "Conditions": []
-              }
-            },
-            {
-              "Identifier": "transferToQueue",
-              "Type": "TransferContactToQueue",
-              "Parameters": {},
-              "Transitions": {
-                "NextAction": "agentsBusy",
-                "Errors": [
-                  {"NextAction": "agentsBusy", "ErrorType": "NoMatchingError"},
-                  {"NextAction": "agentsBusy", "ErrorType": "QueueAtCapacity"}
-                ],
-                "Conditions": []
-              }
-            },
-            {
-              "Identifier": "agentsBusy",
-              "Type": "MessageParticipant",
-              "Parameters": {
-                "Text": "All of our support agents are currently busy or unavailable. Our team is available Monday through Friday, nine A M to five P M Eastern. Please call back during those hours. Goodbye."
-              },
-              "Transitions": {
-                "NextAction": "goodbye",
-                "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
                 "Conditions": []
               }
             },
