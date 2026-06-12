@@ -1,4 +1,5 @@
 {
+  "_NOTE": "NON-AUTHORITATIVE REFERENCE ONLY (WS-C-05). The single source of truth for the Lex contact flow is the inline AWS::Connect::ContactFlow 'LexContactFlow' resource in infrastructure/template.yaml. This file is NOT deployed and is NOT read by any script; it is retained only as a design reference. Do not edit this expecting it to take effect. The empty-params 'transferToAgent' dead-end here was fixed in template.yaml (CheckHoursOfOperation -> UpdateContactTargetQueue -> TransferContactToQueue with graceful branches).",
   "Version": "2019-10-30",
   "StartAction": "setLanguage",
   "Metadata": {

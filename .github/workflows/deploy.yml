@@ -386,6 +386,44 @@ jobs:
             PARAMS="$PARAMS ExistingConnectInstanceId=$EXISTING_CONNECT"
           fi
 
+          # WS-C-04: optional Connect agent user. Only create it when the
+          # CONNECT_AGENT_PASSWORD secret is present AND we can resolve the
+          # CONNECT_MANAGED "Agent" security profile id. If either is missing we
+          # pass empty params so the CreateAgentUser condition stays false and the
+          # deploy does NOT fail. The password is never echoed.
+          AGENT_PASSWORD="${{ secrets.CONNECT_AGENT_PASSWORD }}"
+          AGENT_SEC_PROFILE_ID=""
+          if [ -n "$AGENT_PASSWORD" ]; then
+            # Resolve the Connect instance id to query for security profiles.
+            AGENT_INSTANCE_ID="$EXISTING_CONNECT"
+            if [ -z "$AGENT_INSTANCE_ID" ]; then
+              AGENT_INSTANCE_ID=$(aws ssm get-parameter \
+                --name "/headset-agent/${ENV}/connect/instance-id" \
+                --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+            fi
+
+            if [ -n "$AGENT_INSTANCE_ID" ] && [ "$AGENT_INSTANCE_ID" != "None" ]; then
+              AGENT_SEC_PROFILE_ID=$(aws connect list-security-profiles \
+                --instance-id "$AGENT_INSTANCE_ID" \
+                --query "SecurityProfileSummaryList[?Name=='Agent'].Id | [0]" \
+                --output text 2>/dev/null || echo "")
+              [ "$AGENT_SEC_PROFILE_ID" == "None" ] && AGENT_SEC_PROFILE_ID=""
+            fi
+
+            if [ -n "$AGENT_SEC_PROFILE_ID" ]; then
+              echo "CONNECT_AGENT_PASSWORD present and 'Agent' security profile resolved; agent user will be created."
+              PARAMS="$PARAMS AgentSecurityProfileId=$AGENT_SEC_PROFILE_ID"
+              # The password is appended to PARAMS but PARAMS is never echoed, and
+              # x-tracing is off, so the secret never reaches the logs. NoEcho on
+              # the CFN parameter also keeps it out of stack events/describe output.
+              PARAMS="$PARAMS ConnectAgentPassword=$AGENT_PASSWORD"
+            else
+              echo "CONNECT_AGENT_PASSWORD present but 'Agent' security profile not resolved; skipping agent user creation."
+            fi
+          else
+            echo "CONNECT_AGENT_PASSWORD secret not set; skipping agent user creation."
+          fi
+
           sam deploy \
             --template-file .aws-sam/build/template.yaml \
             --stack-name "$STACK_NAME" \

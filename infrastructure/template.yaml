@@ -96,11 +96,31 @@ Parameters:
     Default: ""
     Description: Existing Amazon Connect instance ID. Leave empty to create a new instance.
 
+  # WS-C-04: Optional Connect agent user. Both params must be non-empty for the
+  # AWS::Connect::User to be created. When the GH Actions secret is absent the
+  # SAM Deploy step passes empty strings, the CreateAgentUser condition is false,
+  # and no user is created (the queue + voicemail/callback path still works).
+  ConnectAgentPassword:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Password for the headset.agent Connect user (from GH Actions secret CONNECT_AGENT_PASSWORD). Empty disables user creation.
+
+  AgentSecurityProfileId:
+    Type: String
+    Default: ""
+    Description: ID of the CONNECT_MANAGED "Agent" security profile (looked up in deploy.yml). Empty disables user creation.
+
 Conditions:
   IsProd: !Equals [!Ref Environment, prod]
   DeployLex: !Equals [!Ref DeployLexPath, 'true']
   DeployNovaSonic: !Equals [!Ref DeployNovaSonicPath, 'true']
   CreateConnectInstance: !Equals [!Ref ExistingConnectInstanceId, ""]
+  # WS-C-04: only create the agent user when BOTH the password and the security
+  # profile id are supplied. Guards against a half-configured user resource.
+  CreateAgentUser: !And
+    - !Not [!Equals [!Ref ConnectAgentPassword, ""]]
+    - !Not [!Equals [!Ref AgentSecurityProfileId, ""]]
 
 Resources:
   # =============================================================
@@ -681,13 +701,156 @@ Resources:
       IntegrationArn: !GetAtt NovaSonicFunction.Arn
 
   # =============================================================
+  # CONNECT HOURS / QUEUE / ROUTING / USER (WS-C-01..04)
+  # =============================================================
+  # WS-C-01: Business hours Mon-Fri 09:00-17:00 America/New_York.
+  HeadsetHoursOfOperation:
+    Type: AWS::Connect::HoursOfOperation
+    Properties:
+      InstanceArn: !If
+        - CreateConnectInstance
+        - !GetAtt ConnectInstance.Arn
+        - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ExistingConnectInstanceId}"
+      Name: !Sub "HeadsetBusinessHours-${Environment}"
+      Description: Mon-Fri 09:00-17:00 Eastern business hours for headset escalation
+      TimeZone: America/New_York
+      Config:
+        - Day: MONDAY
+          StartTime:
+            Hours: 9
+            Minutes: 0
+          EndTime:
+            Hours: 17
+            Minutes: 0
+        - Day: TUESDAY
+          StartTime:
+            Hours: 9
+            Minutes: 0
+          EndTime:
+            Hours: 17
+            Minutes: 0
+        - Day: WEDNESDAY
+          StartTime:
+            Hours: 9
+            Minutes: 0
+          EndTime:
+            Hours: 17
+            Minutes: 0
+        - Day: THURSDAY
+          StartTime:
+            Hours: 9
+            Minutes: 0
+          EndTime:
+            Hours: 17
+            Minutes: 0
+        - Day: FRIDAY
+          StartTime:
+            Hours: 9
+            Minutes: 0
+          EndTime:
+            Hours: 17
+            Minutes: 0
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  # WS-C-02: Escalation queue bound to the business hours above.
+  HeadsetEscalationQueue:
+    Type: AWS::Connect::Queue
+    Properties:
+      InstanceArn: !If
+        - CreateConnectInstance
+        - !GetAtt ConnectInstance.Arn
+        - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ExistingConnectInstanceId}"
+      Name: !Sub "HeadsetEscalation-${Environment}"
+      Description: Queue for headset support calls escalated from the bot
+      HoursOfOperationArn: !GetAtt HeadsetHoursOfOperation.HoursOfOperationArn
+      MaxContacts: 50
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  # WS-C-03: Routing profile that serves the escalation queue over VOICE.
+  HeadsetRoutingProfile:
+    Type: AWS::Connect::RoutingProfile
+    Properties:
+      InstanceArn: !If
+        - CreateConnectInstance
+        - !GetAtt ConnectInstance.Arn
+        - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ExistingConnectInstanceId}"
+      Name: !Sub "HeadsetRouting-${Environment}"
+      Description: Routing profile for headset escalation agents (voice only)
+      DefaultOutboundQueueArn: !GetAtt HeadsetEscalationQueue.QueueArn
+      MediaConcurrencies:
+        - Channel: VOICE
+          Concurrency: 1
+      QueueConfigs:
+        - QueueReference:
+            QueueArn: !GetAtt HeadsetEscalationQueue.QueueArn
+            Channel: VOICE
+          Priority: 1
+          Delay: 0
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  # WS-C-04: Optional test agent user (Condition: CreateAgentUser). Password is a
+  # NoEcho parameter sourced from the GH Actions secret CONNECT_AGENT_PASSWORD;
+  # it never appears in the template or logs. No Secrets Manager is used.
+  HeadsetAgentUser:
+    Type: AWS::Connect::User
+    Condition: CreateAgentUser
+    Properties:
+      InstanceArn: !If
+        - CreateConnectInstance
+        - !GetAtt ConnectInstance.Arn
+        - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ExistingConnectInstanceId}"
+      Username: headset.agent
+      Password: !Ref ConnectAgentPassword
+      RoutingProfileArn: !GetAtt HeadsetRoutingProfile.RoutingProfileArn
+      SecurityProfileIds:
+        - !Ref AgentSecurityProfileId
+      IdentityInfo:
+        FirstName: Headset
+        LastName: Agent
+      PhoneConfig:
+        PhoneType: SOFT_PHONE
+        AutoAccept: false
+        AfterContactWorkTimeLimit: 60
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: HeadsetSupportAgent
+
+  # =============================================================
   # CONNECT CONTACT FLOWS
+  # =============================================================
+  # =============================================================
+  # SINGLE SOURCE OF TRUTH for the Lex contact flow (WS-C-05).
+  # This inline CFN ContactFlow is the ONLY authoritative definition of the
+  # Lex voice flow. The good parts of the former infrastructure/contact-flow-lex.json
+  # (persona DTMF menu + escalation check) were ported here and the queue/hours
+  # ARNs are injected with Fn::Sub. setup-connect.py NO LONGER creates or updates
+  # flows; it only claims phone numbers and associates them to this flow.
+  # contact-flow-lex.json is retained only as a non-authoritative reference.
+  # WS-C-06: real escalation path (CheckHoursOfOperation -> UpdateContactTargetQueue
+  # -> TransferContactToQueue with graceful error/after-hours branches).
+  # WS-D-01 (SEC-1): the first audible block is a recording/AI consent disclosure.
   # =============================================================
   LexContactFlow:
     Type: AWS::Connect::ContactFlow
     Condition: DeployLex
     DependsOn:
       - ConnectLexIntegration
+      - HeadsetEscalationQueue
+      - HeadsetHoursOfOperation
     Properties:
       InstanceArn: !If
         - CreateConnectInstance
@@ -699,22 +862,132 @@ Resources:
       Content: !Sub |
         {
           "Version": "2019-10-30",
-          "StartAction": "a1b2c3d4-1234-5678-9abc-def012345678",
+          "StartAction": "consent",
           "Actions": [
             {
-              "Identifier": "a1b2c3d4-1234-5678-9abc-def012345678",
+              "Identifier": "consent",
+              "Type": "MessageParticipant",
+              "Parameters": {
+                "Text": "This call is recorded and transcribed for quality and training, and is handled by an automated AI assistant. By staying on the line you consent to this. If you do not consent, please hang up now."
+              },
+              "Transitions": {
+                "NextAction": "setLanguage",
+                "Errors": [{"NextAction": "setLanguage", "ErrorType": "NoMatchingError"}],
+                "Conditions": []
+              }
+            },
+            {
+              "Identifier": "setLanguage",
+              "Type": "UpdateContactAttributes",
+              "Parameters": {
+                "Attributes": {
+                  "LanguageCode": "en-US",
+                  "Path": "Lex"
+                },
+                "TargetContact": "Current"
+              },
+              "Transitions": {
+                "NextAction": "setVoice",
+                "Errors": [{"NextAction": "setVoice", "ErrorType": "NoMatchingError"}],
+                "Conditions": []
+              }
+            },
+            {
+              "Identifier": "setVoice",
+              "Type": "UpdateContactTextToSpeechVoice",
+              "Parameters": {
+                "TextToSpeechVoice": "Joanna",
+                "TextToSpeechEngine": "Neural"
+              },
+              "Transitions": {
+                "NextAction": "welcomePrompt",
+                "Errors": [{"NextAction": "welcomePrompt", "ErrorType": "NoMatchingError"}],
+                "Conditions": []
+              }
+            },
+            {
+              "Identifier": "welcomePrompt",
               "Type": "MessageParticipant",
               "Parameters": {
                 "Text": "Welcome to Headset Support. I'll connect you with our troubleshooting assistant."
               },
               "Transitions": {
-                "NextAction": "b2c3d4e5-2345-6789-abcd-ef0123456789",
-                "Errors": [],
+                "NextAction": "personaMenu",
+                "Errors": [{"NextAction": "personaMenu", "ErrorType": "NoMatchingError"}],
                 "Conditions": []
               }
             },
             {
-              "Identifier": "b2c3d4e5-2345-6789-abcd-ef0123456789",
+              "Identifier": "personaMenu",
+              "Type": "GetParticipantInput",
+              "Parameters": {
+                "Text": "For a cheerful Irish assistant, press 1. For a calm, methodical assistant, press 2. For a fast-talking friendly assistant, press 3.",
+                "InputTimeLimitSeconds": "10",
+                "DTMFConfiguration": {
+                  "InputTerminationSequence": "#",
+                  "DisableCancelKey": false
+                }
+              },
+              "Transitions": {
+                "NextAction": "setPersonaTangerine",
+                "Errors": [{"NextAction": "setPersonaTangerine", "ErrorType": "NoMatchingError"}],
+                "Conditions": [
+                  {
+                    "NextAction": "setPersonaTangerine",
+                    "Condition": {"Operator": "Equals", "Operands": ["1"]}
+                  },
+                  {
+                    "NextAction": "setPersonaJoseph",
+                    "Condition": {"Operator": "Equals", "Operands": ["2"]}
+                  },
+                  {
+                    "NextAction": "setPersonaJennifer",
+                    "Condition": {"Operator": "Equals", "Operands": ["3"]}
+                  }
+                ]
+              }
+            },
+            {
+              "Identifier": "setPersonaTangerine",
+              "Type": "UpdateContactAttributes",
+              "Parameters": {
+                "Attributes": {"persona_id": "tangerine"},
+                "TargetContact": "Current"
+              },
+              "Transitions": {
+                "NextAction": "lexBot",
+                "Errors": [{"NextAction": "lexBot", "ErrorType": "NoMatchingError"}],
+                "Conditions": []
+              }
+            },
+            {
+              "Identifier": "setPersonaJoseph",
+              "Type": "UpdateContactAttributes",
+              "Parameters": {
+                "Attributes": {"persona_id": "joseph"},
+                "TargetContact": "Current"
+              },
+              "Transitions": {
+                "NextAction": "lexBot",
+                "Errors": [{"NextAction": "lexBot", "ErrorType": "NoMatchingError"}],
+                "Conditions": []
+              }
+            },
+            {
+              "Identifier": "setPersonaJennifer",
+              "Type": "UpdateContactAttributes",
+              "Parameters": {
+                "Attributes": {"persona_id": "jennifer"},
+                "TargetContact": "Current"
+              },
+              "Transitions": {
+                "NextAction": "lexBot",
+                "Errors": [{"NextAction": "lexBot", "ErrorType": "NoMatchingError"}],
+                "Conditions": []
+              }
+            },
+            {
+              "Identifier": "lexBot",
               "Type": "ConnectParticipantWithLexBot",
               "Parameters": {
                 "Text": "How can I help you with your headset today?",
@@ -723,50 +996,113 @@ Resources:
                 }
               },
               "Transitions": {
-                "NextAction": "c3d4e5f6-3456-789a-bcde-f01234567890",
+                "NextAction": "checkEscalation",
                 "Errors": [
-                  {
-                    "NextAction": "d4e5f6a7-4567-89ab-cdef-012345678901",
-                    "ErrorType": "NoMatchingError"
-                  },
-                  {
-                    "NextAction": "d4e5f6a7-4567-89ab-cdef-012345678901",
-                    "ErrorType": "NoMatchingCondition"
-                  },
-                  {
-                    "NextAction": "d4e5f6a7-4567-89ab-cdef-012345678901",
-                    "ErrorType": "InputTimeLimitExceeded"
-                  }
+                  {"NextAction": "retry", "ErrorType": "NoMatchingError"},
+                  {"NextAction": "retry", "ErrorType": "NoMatchingCondition"},
+                  {"NextAction": "retry", "ErrorType": "InputTimeLimitExceeded"}
                 ],
                 "Conditions": []
               }
             },
             {
-              "Identifier": "c3d4e5f6-3456-789a-bcde-f01234567890",
-              "Type": "MessageParticipant",
+              "Identifier": "checkEscalation",
+              "Type": "CheckContactAttributes",
               "Parameters": {
-                "Text": "Thank you for contacting Headset Support. Goodbye!"
+                "Attribute": "$.Attributes.escalation_requested",
+                "Namespace": "External"
               },
               "Transitions": {
-                "NextAction": "e5f6a7b8-5678-9abc-def0-123456789012",
-                "Errors": [],
+                "NextAction": "goodbye",
+                "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
+                "Conditions": [
+                  {
+                    "NextAction": "checkHours",
+                    "Condition": {"Operator": "Equals", "Operands": ["true"]}
+                  }
+                ]
+              }
+            },
+            {
+              "Identifier": "checkHours",
+              "Type": "CheckHoursOfOperation",
+              "Parameters": {
+                "HoursOfOperationId": "${HeadsetHoursOfOperation.HoursOfOperationArn}"
+              },
+              "Transitions": {
+                "NextAction": "afterHours",
+                "Errors": [{"NextAction": "afterHours", "ErrorType": "NoMatchingError"}],
+                "Conditions": [
+                  {
+                    "NextAction": "setQueue",
+                    "Condition": {"Operator": "Equals", "Operands": ["true"]}
+                  }
+                ]
+              }
+            },
+            {
+              "Identifier": "setQueue",
+              "Type": "UpdateContactTargetQueue",
+              "Parameters": {
+                "QueueId": "${HeadsetEscalationQueue.QueueArn}"
+              },
+              "Transitions": {
+                "NextAction": "transferToQueue",
+                "Errors": [{"NextAction": "agentsBusy", "ErrorType": "NoMatchingError"}],
                 "Conditions": []
               }
             },
             {
-              "Identifier": "d4e5f6a7-4567-89ab-cdef-012345678901",
-              "Type": "MessageParticipant",
-              "Parameters": {
-                "Text": "I'm sorry, we're experiencing technical difficulties. Please try again later."
-              },
+              "Identifier": "transferToQueue",
+              "Type": "TransferContactToQueue",
+              "Parameters": {},
               "Transitions": {
-                "NextAction": "e5f6a7b8-5678-9abc-def0-123456789012",
-                "Errors": [],
+                "NextAction": "agentsBusy",
+                "Errors": [
+                  {"NextAction": "agentsBusy", "ErrorType": "NoMatchingError"},
+                  {"NextAction": "agentsBusy", "ErrorType": "QueueAtCapacity"}
+                ],
                 "Conditions": []
               }
             },
             {
-              "Identifier": "e5f6a7b8-5678-9abc-def0-123456789012",
+              "Identifier": "agentsBusy",
+              "Type": "MessageParticipant",
+              "Parameters": {
+                "Text": "All of our support agents are currently busy. Please leave us a message with your name, number, and issue after the tone, or call back during business hours, Monday through Friday, nine A M to five P M Eastern. We will get back to you. Goodbye."
+              },
+              "Transitions": {
+                "NextAction": "goodbye",
+                "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
+                "Conditions": []
+              }
+            },
+            {
+              "Identifier": "afterHours",
+              "Type": "MessageParticipant",
+              "Parameters": {
+                "Text": "Thank you for calling Headset Support. Our support agents are available Monday through Friday, nine A M to five P M Eastern. Please leave a message with your name, number, and issue after the tone, or call back during business hours, and we will get back to you. Goodbye."
+              },
+              "Transitions": {
+                "NextAction": "goodbye",
+                "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
+                "Conditions": []
+              }
+            },
+            {
+              "Identifier": "retry",
+              "Type": "MessageParticipant",
+              "Parameters": {
+                "Text": "I'm sorry, I had trouble understanding. Thank you for calling Headset Support. Goodbye."
+              },
+              "Transitions": {
+                "NextAction": "goodbye",
+                "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
+                "Conditions": []
+              }
+            },
+            {
+              "Identifier": "goodbye",
               "Type": "DisconnectParticipant",
               "Parameters": {},
               "Transitions": {}
@@ -891,6 +1227,24 @@ Resources:
       Type: String
       Value: !If [CreateConnectInstance, !Ref ConnectInstance, !Ref ExistingConnectInstanceId]
       Description: Amazon Connect instance ID
+
+  # WS-C-01: hours-of-operation ARN for downstream tooling / flows.
+  HoursOfOperationArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/connect/hours-arn"
+      Type: String
+      Value: !GetAtt HeadsetHoursOfOperation.HoursOfOperationArn
+      Description: Amazon Connect hours-of-operation ARN (business hours)
+
+  # WS-C-02: escalation queue ARN for downstream tooling / flows.
+  EscalationQueueArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/headset-agent/${Environment}/connect/escalation-queue-arn"
+      Type: String
+      Value: !GetAtt HeadsetEscalationQueue.QueueArn
+      Description: Amazon Connect escalation queue ARN
 
   PhoneNumberLexParam:
     Type: AWS::SSM::Parameter
@@ -1073,6 +1427,123 @@ Resources:
       AlarmActions:
         - !Ref AlertTopic
 
+  # =============================================================
+  # CONFIG-DRIFT CANARY (WS-F-04)
+  # Runs hourly via EventBridge, reads three SSM params, and emits
+  # CloudWatch custom metrics so alarms fire when the deployment is
+  # still in its initial PLACEHOLDER/PENDING state.
+  # =============================================================
+  CanaryFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      FunctionName: !Sub "headset-config-canary-${Environment}"
+      Handler: bootstrap
+      CodeUri: ../cmd/canary-lambda/
+      Description: Config-drift canary — emits CloudWatch metrics for PLACEHOLDER/PENDING SSM params
+      # Keep at 1 so a mis-configured EventBridge rule cannot spin up
+      # multiple concurrent checks and multiply metric datapoints.
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SUPERVISOR_AGENT_ID_PARAM: !Sub "/headset-agent/${Environment}/supervisor-agent-id"
+          PHONE_LEX_PARAM: !Sub "/headset-agent/${Environment}/connect/phone-number-lex"
+          PHONE_NOVA_PARAM: !Sub "/headset-agent/${Environment}/connect/phone-number-nova-sonic"
+      Events:
+        # SAM creates the EventBridge rule + the Lambda::Permission automatically.
+        HourlyCheck:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Trigger the config-drift canary every hour
+            Enabled: true
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: ReadCanarySSMParams
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/headset-agent/${Environment}/*"
+            # cloudwatch:PutMetricData does not support resource-level scoping;
+            # the Condition restricts to the HeadsetAgent/Canary namespace only.
+            - Sid: PutCanaryMetrics
+              Effect: Allow
+              Action:
+                - cloudwatch:PutMetricData
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: "HeadsetAgent/Canary"
+      Tags:
+        Environment: !Ref Environment
+        Project: HeadsetSupportAgent
+        Component: Canary
+
+  CanaryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/headset-config-canary-${Environment}"
+      # 90 days in prod keeps enough history for audit; 14 days elsewhere
+      # avoids unnecessary storage cost.
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # Alarm: supervisor-agent-id has never been populated.
+  # TreatMissingData: notBreaching — before the canary has run even once there
+  # are no datapoints, and treating that as ALARM would create false pages
+  # immediately after a fresh deploy.  Once the canary fires the first
+  # real datapoint, the alarm transitions to ALARM within ~2 h if the param
+  # is still a PLACEHOLDER (2 eval periods × 3600 s).
+  CanaryAgentPlaceholderAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "headset-canary-agent-placeholder-${Environment}"
+      AlarmDescription: >
+        Supervisor agent ID is still PLACEHOLDER.  The Bedrock agent has not been
+        created yet; callers receive the degraded "setting up" response.
+      Namespace: HeadsetAgent/Canary
+      MetricName: AgentIdIsPlaceholder
+      # No Dimensions — matches the single no-dimension datapoint emitted by the canary.
+      Statistic: Maximum
+      Period: 3600
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  # Alarm: at least one Connect phone number is still PENDING.
+  # The canary emits two datapoints per invocation (Path=lex, Path=nova).
+  # This alarm queries without a dimension filter so it catches EITHER path
+  # being pending (Maximum across both dimensions >= 1).
+  CanaryPhonePendingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "headset-canary-phone-pending-${Environment}"
+      AlarmDescription: >
+        At least one Connect phone number (Lex or Nova Sonic path) is still
+        PENDING.  Callers cannot reach the IVR until a real number is claimed
+        and written to the SSM parameter.
+      Namespace: HeadsetAgent/Canary
+      MetricName: PhoneNumberPending
+      # No Dimensions — aggregates across both Path=lex and Path=nova datapoints.
+      Statistic: Maximum
+      Period: 3600
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
 Outputs:
   # Shared Outputs
   KnowledgeBaseBucketName:
@@ -1189,6 +1660,29 @@ Outputs:
       - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ExistingConnectInstanceId}"
     Export:
       Name: !Sub "${AWS::StackName}-ConnectInstanceArn"
+
+  HoursOfOperationArn:
+    Description: Amazon Connect hours-of-operation ARN (WS-C-01)
+    Value: !GetAtt HeadsetHoursOfOperation.HoursOfOperationArn
+    Export:
+      Name: !Sub "${AWS::StackName}-HoursOfOperationArn"
+
+  EscalationQueueArn:
+    Description: Amazon Connect escalation queue ARN (WS-C-02)
+    Value: !GetAtt HeadsetEscalationQueue.QueueArn
+    Export:
+      Name: !Sub "${AWS::StackName}-EscalationQueueArn"
+
+  RoutingProfileArn:
+    Description: Amazon Connect routing profile ARN (WS-C-03)
+    Value: !GetAtt HeadsetRoutingProfile.RoutingProfileArn
+    Export:
+      Name: !Sub "${AWS::StackName}-RoutingProfileArn"
+
+  AgentUserArn:
+    Condition: CreateAgentUser
+    Description: Amazon Connect agent user ARN (WS-C-04, only when CreateAgentUser)
+    Value: !GetAtt HeadsetAgentUser.UserArn
 
   LexContactFlowArn:
     Condition: DeployLex
