@@ -430,6 +430,198 @@ def verify_phone_number_exists(client, instance_id, phone_number):
         return False
 
 
+def list_all_instance_phone_numbers(client, instance_id):
+    """
+    Return a list of dicts for every phone number claimed to this instance.
+    Each dict has: PhoneNumberId, PhoneNumber, PhoneNumberArn, Status,
+    and ContactFlowId (may be None if not associated with any flow).
+    Only returns numbers whose status is CLAIMED.
+    """
+    try:
+        if instance_id.startswith('arn:'):
+            target_arn = instance_id
+        else:
+            target_arn = f"arn:aws:connect:us-east-1:{get_account_id()}:instance/{instance_id}"
+
+        results = []
+        paginator_token = None
+        while True:
+            kwargs = {'TargetArn': target_arn, 'MaxResults': 100}
+            if paginator_token:
+                kwargs['NextToken'] = paginator_token
+            response = client.list_phone_numbers_v2(**kwargs)
+            for item in response.get('ListPhoneNumbersSummaryList', []):
+                phone_id = item.get('PhoneNumberId')
+                if not phone_id:
+                    continue
+                # Only care about CLAIMED numbers
+                status = get_phone_number_status(client, phone_id)
+                if status != 'CLAIMED':
+                    continue
+                # Determine associated contact flow (if any)
+                contact_flow_id = get_phone_number_contact_flow(client, phone_id)
+                results.append({
+                    'PhoneNumberId': phone_id,
+                    'PhoneNumber': item.get('PhoneNumber'),
+                    'PhoneNumberArn': item.get('PhoneNumberArn'),
+                    'Status': 'CLAIMED',
+                    'ContactFlowId': contact_flow_id,
+                })
+            paginator_token = response.get('NextToken')
+            if not paginator_token:
+                break
+        return results
+    except ClientError as e:
+        print(f"Error listing instance phone numbers: {e}")
+        return []
+
+
+def get_phone_number_contact_flow(client, phone_number_id):
+    """
+    Return the ContactFlowId that a phone number is associated with,
+    or None if it is not associated with any flow.
+    Returns the sentinel string 'UNKNOWN' if the association status
+    cannot be determined (caller should treat this as in-use / do not release).
+    """
+    try:
+        response = client.describe_phone_number(PhoneNumberId=phone_number_id)
+        summary = response.get('ClaimedPhoneNumberSummary', {})
+        # The ContactFlowId field is present when the number is associated
+        flow_id = summary.get('ContactFlowId')
+        return flow_id  # None means not associated
+    except ClientError as e:
+        print(f"  Warning: could not describe phone number {phone_number_id}: {e}")
+        return 'UNKNOWN'
+
+
+def resolve_phone_for_path(
+    client, ssm_client, environment,
+    path_name, flow_id, ssm_param,
+    instance_id, all_claimed_numbers, already_assigned_ids
+):
+    """
+    Idempotent resolution of a phone number for one path (Lex or Nova Sonic).
+
+    Strategy (in order):
+      1. Reuse SSM: if the SSM param holds a number that is still CLAIMED in
+         this instance, keep it and ensure it is associated with flow_id. Return
+         the PhoneNumberId without claiming anything new.
+      2. Reuse existing claimed: pick any CLAIMED number that is not yet assigned
+         to one of our flows (i.e., ContactFlowId is None / unset), associate it
+         with flow_id, write the SSM param. Return the PhoneNumberId.
+      3. Claim new: only if no reusable number exists.
+
+    Returns the PhoneNumberId that was assigned (str), or None on failure.
+    Modifies already_assigned_ids in-place by adding the assigned ID.
+    """
+    # --- Step 1: Reuse SSM ---
+    existing_ssm_value = get_ssm_parameter(ssm_client, ssm_param)
+    if existing_ssm_value and existing_ssm_value not in ('PLACEHOLDER', 'PENDING'):
+        # Find the corresponding claimed record
+        for rec in all_claimed_numbers:
+            if rec['PhoneNumber'] == existing_ssm_value:
+                print(f"  [{path_name}] SSM param matches claimed number {existing_ssm_value} - reusing")
+                # Ensure it is associated with the correct flow
+                if flow_id and rec.get('ContactFlowId') != flow_id:
+                    print(f"  [{path_name}] Re-associating phone to flow {flow_id}")
+                    associate_phone_with_flow(client, instance_id, rec['PhoneNumberId'], flow_id)
+                already_assigned_ids.add(rec['PhoneNumberId'])
+                return rec['PhoneNumberId']
+        # SSM value not found among claimed numbers - fall through to reuse/claim
+        print(f"  [{path_name}] SSM value {existing_ssm_value} not found among claimed numbers - will reuse or claim")
+
+    # --- Step 2: Reuse an existing claimed number not yet assigned to any flow ---
+    for rec in all_claimed_numbers:
+        if rec['PhoneNumberId'] in already_assigned_ids:
+            continue  # already spoken for
+        flow = rec.get('ContactFlowId')
+        if flow == 'UNKNOWN':
+            continue  # can't determine status - skip safely
+        if flow is None:
+            # Unassociated - take it
+            print(f"  [{path_name}] Reusing unassigned claimed number {rec['PhoneNumber']} (ID: {rec['PhoneNumberId']})")
+            if flow_id:
+                associate_phone_with_flow(client, instance_id, rec['PhoneNumberId'], flow_id)
+            save_to_ssm(ssm_client, ssm_param, rec['PhoneNumber'],
+                        f"Phone number for {path_name} path")
+            already_assigned_ids.add(rec['PhoneNumberId'])
+            return rec['PhoneNumberId']
+
+    # --- Step 3: Claim new ---
+    print(f"  [{path_name}] No reusable number found - claiming a new one")
+    if not flow_id:
+        print(f"  [{path_name}] Contact flow not found - skipping claim")
+        return None
+
+    new_phone = claim_phone_number(
+        client, instance_id,
+        phone_type='TOLL_FREE',
+        description=f"Headset Support - {path_name} Path ({environment})"
+    )
+    if new_phone and new_phone.get('Status') == 'CLAIMED':
+        save_to_ssm(ssm_client, ssm_param, new_phone['PhoneNumber'],
+                    f"Phone number for {path_name} path")
+        phone_id = new_phone.get('PhoneNumberId')
+        if phone_id:
+            associate_phone_with_flow(client, instance_id, phone_id, flow_id)
+            # Add to the in-memory list so orphan cleanup sees it
+            all_claimed_numbers.append({
+                'PhoneNumberId': phone_id,
+                'PhoneNumber': new_phone['PhoneNumber'],
+                'PhoneNumberArn': new_phone.get('PhoneNumberArn'),
+                'Status': 'CLAIMED',
+                'ContactFlowId': flow_id,
+            })
+            already_assigned_ids.add(phone_id)
+        print(f"  [{path_name}] Phone number ready: {new_phone['PhoneNumber']}")
+        return phone_id
+    else:
+        print(f"  [{path_name}] Failed to claim phone number")
+        return None
+
+
+def release_orphaned_phone_numbers(client, all_claimed_numbers, assigned_ids):
+    """
+    Release phone numbers that are:
+      (a) claimed to this instance,
+      (b) NOT one of the assigned numbers (Lex / Nova), AND
+      (c) NOT associated with any contact flow (ContactFlowId is None).
+
+    Numbers whose ContactFlowId is 'UNKNOWN' are skipped (fail-safe: cannot
+    determine association, so do not release).
+
+    Per-number try/except: one failure does not abort the rest.
+    """
+    released = 0
+    for rec in all_claimed_numbers:
+        phone_id = rec['PhoneNumberId']
+        phone_num = rec.get('PhoneNumber', phone_id)
+
+        if phone_id in assigned_ids:
+            continue  # in use by one of our paths
+
+        flow = rec.get('ContactFlowId')
+        if flow == 'UNKNOWN':
+            print(f"  SKIP release of {phone_num}: association status unknown (fail-safe)")
+            continue
+        if flow is not None:
+            print(f"  SKIP release of {phone_num}: associated with flow {flow} (in use)")
+            continue
+
+        # Safe to release: claimed, not assigned to us, not associated with any flow
+        print(f"  Releasing orphaned phone number {phone_num} (ID: {phone_id}) - claimed but not associated with any flow")
+        try:
+            if release_phone_number(client, phone_id):
+                released += 1
+        except Exception as e:
+            print(f"  Error releasing {phone_num}: {e} - skipping")
+
+    if released:
+        print(f"  Released {released} orphaned phone number(s)")
+    else:
+        print(f"  No orphaned phone numbers to release")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Setup Amazon Connect for Headset Support Agent')
     parser.add_argument('--environment', '-e', default='prod', choices=['prod'])
@@ -499,7 +691,7 @@ def main():
     print(f"Lex Contact Flow ID: {lex_flow_id or 'Not found'}")
     print(f"Nova Sonic Contact Flow ID: {nova_flow_id or 'Not found'}")
 
-    # Step 3: Claim phone numbers and associate with flows
+    # Step 3: Phone numbers — reuse before claiming, then release orphans
     print("\n--- Step 3: Phone Numbers ---")
     if args.skip_phone_numbers:
         print("Skipping phone number claiming (--skip-phone-numbers)")
@@ -508,91 +700,63 @@ def main():
         print("Checking for failed phone numbers to clean up...")
         find_and_cleanup_failed_phone_numbers(connect_client, instance_id)
 
-        # Check existing phone numbers
-        existing_lex_phone = get_ssm_parameter(
-            ssm_client, f"/headset-agent/{args.environment}/connect/phone-number-lex"
+        # Build a single snapshot of all CLAIMED numbers on this instance.
+        # This is used for both the reuse logic and the orphan-release pass.
+        print("Loading all claimed phone numbers for this instance...")
+        all_claimed = list_all_instance_phone_numbers(connect_client, instance_id)
+        print(f"  Found {len(all_claimed)} CLAIMED phone number(s) on this instance")
+
+        # Track which phone number IDs we intentionally assign so the orphan
+        # pass knows what to leave alone.
+        assigned_ids = set()
+
+        # --- Lex path (always needed when lex_flow_id is present) ---
+        print("\nResolving phone number for Lex path...")
+        lex_phone_id = resolve_phone_for_path(
+            client=connect_client,
+            ssm_client=ssm_client,
+            environment=args.environment,
+            path_name="Lex",
+            flow_id=lex_flow_id,
+            ssm_param=f"/headset-agent/{args.environment}/connect/phone-number-lex",
+            instance_id=instance_id,
+            all_claimed_numbers=all_claimed,
+            already_assigned_ids=assigned_ids,
         )
-        existing_nova_phone = get_ssm_parameter(
-            ssm_client, f"/headset-agent/{args.environment}/connect/phone-number-nova-sonic"
-        )
+        if lex_phone_id:
+            print(f"  Lex path phone number assigned (ID: {lex_phone_id})")
+        else:
+            print("  Lex path phone number could not be assigned")
 
-        # Claim phone for Lex path
-        needs_lex_phone = not existing_lex_phone or existing_lex_phone in ['PLACEHOLDER', 'PENDING']
-
-        if not needs_lex_phone:
-            # Verify the phone number actually exists in Connect and is claimed
-            if verify_phone_number_exists(connect_client, instance_id, existing_lex_phone):
-                print(f"Lex path phone number already claimed and verified: {existing_lex_phone}")
+        # --- Nova Sonic path (needed only when its contact flow exists) ---
+        # The flow presence is the authoritative signal: if CloudFormation
+        # deployed the Nova Sonic flow, nova_flow_id will be non-None.
+        if nova_flow_id:
+            print("\nResolving phone number for Nova Sonic path...")
+            nova_phone_id = resolve_phone_for_path(
+                client=connect_client,
+                ssm_client=ssm_client,
+                environment=args.environment,
+                path_name="Nova Sonic",
+                flow_id=nova_flow_id,
+                ssm_param=f"/headset-agent/{args.environment}/connect/phone-number-nova-sonic",
+                instance_id=instance_id,
+                all_claimed_numbers=all_claimed,
+                already_assigned_ids=assigned_ids,
+            )
+            if nova_phone_id:
+                print(f"  Nova Sonic path phone number assigned (ID: {nova_phone_id})")
             else:
-                print(f"Lex path phone number {existing_lex_phone} no longer exists in Connect, reclaiming...")
-                needs_lex_phone = True
+                print("  Nova Sonic path phone number could not be assigned")
+        else:
+            print("\nNova Sonic contact flow not found - skipping Nova Sonic phone number")
 
-        if needs_lex_phone:
-            if lex_flow_id:
-                print("Claiming phone number for Lex path...")
-                lex_phone = claim_phone_number(
-                    connect_client, instance_id,
-                    phone_type='TOLL_FREE',
-                    description=f"Headset Support - Lex Path ({args.environment})"
-                )
-                if lex_phone and lex_phone.get('Status') == 'CLAIMED':
-                    save_to_ssm(
-                        ssm_client,
-                        f"/headset-agent/{args.environment}/connect/phone-number-lex",
-                        lex_phone['PhoneNumber'],
-                        "Phone number for Lex path (Path A)"
-                    )
-                    # Associate with contact flow
-                    if lex_phone.get('PhoneNumberId'):
-                        associate_phone_with_flow(
-                            connect_client, instance_id,
-                            lex_phone['PhoneNumberId'], lex_flow_id
-                        )
-                    print(f"✓ Lex phone number ready: {lex_phone['PhoneNumber']}")
-                else:
-                    print("✗ Failed to claim Lex phone number - provisioning did not complete")
-                    print("  This may be a quota issue - check AWS Service Quotas for Amazon Connect")
-            else:
-                print("Lex contact flow not found - skipping phone number")
-
-        # Claim phone for Nova Sonic path
-        needs_nova_phone = not existing_nova_phone or existing_nova_phone in ['PLACEHOLDER', 'PENDING']
-
-        if not needs_nova_phone:
-            # Verify the phone number actually exists in Connect
-            if verify_phone_number_exists(connect_client, instance_id, existing_nova_phone):
-                print(f"Nova Sonic path phone number already claimed and verified: {existing_nova_phone}")
-            else:
-                print(f"Nova Sonic path phone number {existing_nova_phone} no longer exists in Connect, reclaiming...")
-                needs_nova_phone = True
-
-        if needs_nova_phone:
-            if nova_flow_id:
-                print("Claiming phone number for Nova Sonic path...")
-                nova_phone = claim_phone_number(
-                    connect_client, instance_id,
-                    phone_type='TOLL_FREE',
-                    description=f"Headset Support - Nova Sonic Path ({args.environment})"
-                )
-                if nova_phone and nova_phone.get('Status') == 'CLAIMED':
-                    save_to_ssm(
-                        ssm_client,
-                        f"/headset-agent/{args.environment}/connect/phone-number-nova-sonic",
-                        nova_phone['PhoneNumber'],
-                        "Phone number for Nova Sonic path (Path B)"
-                    )
-                    # Associate with contact flow
-                    if nova_phone.get('PhoneNumberId'):
-                        associate_phone_with_flow(
-                            connect_client, instance_id,
-                            nova_phone['PhoneNumberId'], nova_flow_id
-                        )
-                    print(f"✓ Nova Sonic phone number ready: {nova_phone['PhoneNumber']}")
-                else:
-                    print("✗ Failed to claim Nova Sonic phone number - provisioning did not complete")
-                    print("  This may be a quota issue - check AWS Service Quotas for Amazon Connect")
-            else:
-                print("Nova Sonic contact flow not found - skipping phone number")
+        # --- Release orphaned numbers ---
+        # Release any number that is claimed to this instance, is NOT one of
+        # our two assigned numbers, and is NOT associated with any contact flow.
+        # Numbers with unknown association status are skipped (fail-safe).
+        print("\nChecking for orphaned phone numbers to release...")
+        release_orphaned_phone_numbers(connect_client, all_claimed, assigned_ids)
 
     # Summary
     print("\n=== Connect Setup Summary ===")
