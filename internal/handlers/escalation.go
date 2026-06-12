@@ -41,7 +41,17 @@ var FrustrationIndicators = []string{
 	"garbage",
 }
 
-// DetectEscalation analyzes user input for escalation triggers
+// DetectEscalation analyzes user input for escalation triggers.
+//
+// frustrationCount is the accumulated count from previous turns (read from the
+// session store by the handler). failedSteps is the number of troubleshooting
+// steps that have been attempted without resolution.
+//
+// The returned EscalationDecision.FrustrationDelta carries the count of
+// frustration indicators matched in THIS turn's transcript. The handler is
+// responsible for adding FrustrationDelta to the session's frustration_count
+// and persisting it, so the >=3 threshold accumulates correctly across turns
+// (B-06).
 func DetectEscalation(transcript string, frustrationCount int, failedSteps int) *models.EscalationDecision {
 	lowerTranscript := strings.ToLower(transcript)
 
@@ -49,14 +59,15 @@ func DetectEscalation(transcript string, frustrationCount int, failedSteps int) 
 	for _, keyword := range EscapeKeywords {
 		if strings.Contains(lowerTranscript, keyword) {
 			return &models.EscalationDecision{
-				ShouldEscalate: true,
-				Reason:         "user_requested",
-				Priority:       "high",
+				ShouldEscalate:   true,
+				Reason:           "user_requested",
+				Priority:         "high",
+				FrustrationDelta: 0,
 			}
 		}
 	}
 
-	// Check for frustration indicators
+	// Count frustration indicators in this turn's transcript.
 	currentFrustration := 0
 	for _, indicator := range FrustrationIndicators {
 		if strings.Contains(lowerTranscript, indicator) {
@@ -64,29 +75,32 @@ func DetectEscalation(transcript string, frustrationCount int, failedSteps int) 
 		}
 	}
 
-	// Escalate if frustration threshold exceeded
+	// Escalate if frustration threshold exceeded (accumulated + this turn).
 	totalFrustration := frustrationCount + currentFrustration
 	if totalFrustration >= 3 {
 		return &models.EscalationDecision{
-			ShouldEscalate: true,
-			Reason:         "user_frustrated",
-			Priority:       "medium",
+			ShouldEscalate:   true,
+			Reason:           "user_frustrated",
+			Priority:         "medium",
+			FrustrationDelta: currentFrustration,
 		}
 	}
 
-	// Escalate if too many failed troubleshooting steps
+	// Escalate if too many failed troubleshooting steps.
 	if failedSteps >= 5 {
 		return &models.EscalationDecision{
-			ShouldEscalate: true,
-			Reason:         "troubleshooting_exhausted",
-			Priority:       "medium",
+			ShouldEscalate:   true,
+			Reason:           "troubleshooting_exhausted",
+			Priority:         "medium",
+			FrustrationDelta: currentFrustration,
 		}
 	}
 
 	return &models.EscalationDecision{
-		ShouldEscalate: false,
-		Reason:         "",
-		Priority:       "",
+		ShouldEscalate:   false,
+		Reason:           "",
+		Priority:         "",
+		FrustrationDelta: currentFrustration,
 	}
 }
 

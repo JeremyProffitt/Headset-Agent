@@ -467,6 +467,15 @@ jobs:
 
           echo "Stack deployment complete: $STACK_NAME"
 
+      - name: Diagnose failed stack events
+        if: failure()
+        run: |
+          ENV="${{ needs.setup.outputs.environment }}"
+          STACK_NAME="agent-headset-${ENV}"
+          echo "=== Most recent FAILED resource events (exact StatusReason) ==="
+          aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+            --query "reverse(StackEvents[?contains(ResourceStatus, 'FAILED')].{T:Timestamp,R:LogicalResourceId,Type:ResourceType,Status:ResourceStatus,Reason:ResourceStatusReason})" \
+            --output table 2>/dev/null | head -80 || echo "could not read stack events"
   sync-knowledge-base:
     name: Sync Knowledge Base
     runs-on: ubuntu-latest

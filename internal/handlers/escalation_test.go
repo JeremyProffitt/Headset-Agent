@@ -45,20 +45,25 @@ func TestDetectEscalation_SingleFrustrationPhraseDoesNotEscalate(t *testing.T) {
 	}
 }
 
-// TestDetectEscalation_CounterBugNeverIncrements documents the known counter bug.
+// TestDetectEscalation_CounterBugNeverIncrements was originally written to
+// document the WS-G-01 counter bug where frustration_count was never persisted.
 //
-// BUG captured per WS-G-01; fixed by B-06 which will persist the counter.
-// Update this test when B-06 lands.
+// B-06 has LANDED. The fix is in the handler (cmd/lex-lambda/main.go):
+// after calling DetectEscalation the handler reads frustration_count from the
+// session store, passes it in, then persists (frustration_count +
+// FrustrationDelta) back before saving. The 3-turn accumulation scenario is
+// now covered by handler-level tests in cmd/lex-lambda/main_test.go
+// (TestHandleLexRequest_FrustrationAccumulatesAcross3Turns).
 //
-// The Lex handler reads frustration_count from session attributes but NEVER
-// persists/increments it back after each turn. As a result, three separate
-// conversation turns each containing ONE frustration phrase will each call
-// DetectEscalation with frustrationCount=0 and currentFrustration=1.
-// totalFrustration == 1, which is < 3, so escalation on frustration alone
-// NEVER triggers. This test asserts the CURRENT (buggy) behaviour.
+// This test retains its original assertion: DetectEscalation itself does NOT
+// escalate when each call receives frustrationCount=0 (a single phrase gives
+// delta=1 < threshold of 3). That is CORRECT — accumulation is the handler's
+// responsibility, not DetectEscalation's.
 func TestDetectEscalation_CounterBugNeverIncrements(t *testing.T) {
 	// Simulate 3 separate turns, each with one frustration phrase.
-	// Because the counter is never persisted, each call receives frustrationCount=0.
+	// If the caller always passes frustrationCount=0 (as the buggy handler did),
+	// DetectEscalation correctly returns ShouldEscalate=false each time —
+	// escalation requires the accumulated counter, which the handler now persists.
 	frustrationPhrases := []string{
 		"this is ridiculous",
 		"doesn't work",
@@ -66,24 +71,88 @@ func TestDetectEscalation_CounterBugNeverIncrements(t *testing.T) {
 	}
 
 	for i, phrase := range frustrationPhrases {
-		// Each call mimics what the Lex handler actually does:
-		// it passes the stale (never-incremented) frustrationCount=0.
-		decision := DetectEscalation(phrase, 0 /*never incremented*/, 0)
+		decision := DetectEscalation(phrase, 0 /* accumulated count, not persisted */, 0)
 
-		// BUG: totalFrustration is always 1 (0 + 1), never reaches 3.
+		// With frustrationCount=0 and one phrase (delta=1), total=1 < 3 → no escalation.
 		if decision.ShouldEscalate {
 			t.Errorf(
-				"turn %d: expected NO escalation because counter is never persisted (bug), "+
-					"but got ShouldEscalate=true reason=%q",
+				"turn %d: DetectEscalation alone should NOT escalate (counter accumulation "+
+					"is the handler's job), but got ShouldEscalate=true reason=%q",
 				i+1, decision.Reason,
 			)
 		}
 		if decision.Reason == "user_frustrated" {
 			t.Errorf(
-				"turn %d: should not have reason=user_frustrated due to counter bug, got %q",
+				"turn %d: should not have reason=user_frustrated without accumulated count, got %q",
 				i+1, decision.Reason,
 			)
 		}
+
+		// B-06: FrustrationDelta must be 1 (exactly one phrase matched).
+		if decision.FrustrationDelta != 1 {
+			t.Errorf(
+				"turn %d: expected FrustrationDelta=1, got %d",
+				i+1, decision.FrustrationDelta,
+			)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// B-06: FrustrationDelta field tests
+// ---------------------------------------------------------------------------
+
+// TestDetectEscalation_FrustrationDeltaZeroForNoPhrase confirms delta=0 when
+// the transcript contains no frustration phrases.
+func TestDetectEscalation_FrustrationDeltaZeroForNoPhrase(t *testing.T) {
+	decision := DetectEscalation("my headset seems a bit quiet", 0, 0)
+	if decision.FrustrationDelta != 0 {
+		t.Errorf("expected FrustrationDelta=0 for benign input, got %d", decision.FrustrationDelta)
+	}
+}
+
+// TestDetectEscalation_FrustrationDeltaOneForOnePhrase confirms delta=1 for a
+// single matched indicator.
+func TestDetectEscalation_FrustrationDeltaOneForOnePhrase(t *testing.T) {
+	decision := DetectEscalation("this is ridiculous", 0, 0)
+	if decision.FrustrationDelta != 1 {
+		t.Errorf("expected FrustrationDelta=1, got %d", decision.FrustrationDelta)
+	}
+}
+
+// TestDetectEscalation_FrustrationDeltaTwoForTwoPhrases confirms delta=2 when
+// two distinct frustration indicators appear in the transcript.
+func TestDetectEscalation_FrustrationDeltaTwoForTwoPhrases(t *testing.T) {
+	decision := DetectEscalation("this is ridiculous and doesn't work", 0, 0)
+	if decision.FrustrationDelta != 2 {
+		t.Errorf("expected FrustrationDelta=2, got %d", decision.FrustrationDelta)
+	}
+}
+
+// TestDetectEscalation_FrustrationDeltaPopulatedWhenEscalating confirms that
+// FrustrationDelta is set even when the escalation fires (total >= 3).
+func TestDetectEscalation_FrustrationDeltaPopulatedWhenEscalating(t *testing.T) {
+	// frustrationCount=2, transcript has one phrase → delta=1, total=3 → escalate.
+	decision := DetectEscalation("this is ridiculous", 2, 0)
+	if !decision.ShouldEscalate {
+		t.Fatal("expected escalation, got none")
+	}
+	if decision.FrustrationDelta != 1 {
+		t.Errorf("expected FrustrationDelta=1 when escalating via accumulated count, got %d",
+			decision.FrustrationDelta)
+	}
+}
+
+// TestDetectEscalation_FrustrationDeltaZeroOnEscapeKeyword confirms delta=0
+// when escalation is triggered by an escape keyword (not frustration phrases).
+func TestDetectEscalation_FrustrationDeltaZeroOnEscapeKeyword(t *testing.T) {
+	decision := DetectEscalation("I want to talk to a human", 0, 0)
+	if !decision.ShouldEscalate {
+		t.Fatal("expected user_requested escalation")
+	}
+	if decision.FrustrationDelta != 0 {
+		t.Errorf("expected FrustrationDelta=0 for escape-keyword escalation, got %d",
+			decision.FrustrationDelta)
 	}
 }
 

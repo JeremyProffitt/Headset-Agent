@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"sync"
@@ -14,13 +15,35 @@ import (
 	"github.com/headset-support-agent/internal/agents"
 	"github.com/headset-support-agent/internal/handlers"
 	"github.com/headset-support-agent/internal/logging"
+	"github.com/headset-support-agent/internal/models"
 	"github.com/headset-support-agent/internal/persona"
+	"github.com/headset-support-agent/internal/session"
 )
 
+// sessionStorer is the interface the handler uses for session persistence.
+// The real *session.Store satisfies it; tests inject a mock implementation.
+type sessionStorer interface {
+	Load(ctx context.Context, sessionID string) (*models.Session, error)
+	Save(ctx context.Context, sess *models.Session) error
+}
+
+// agentInvoker is the interface the handler uses to call the Bedrock agent.
+// The real *agents.BedrockClient satisfies it; tests inject a stub.
+type agentInvoker interface {
+	InvokeAgent(ctx context.Context, input agents.InvokeAgentInput) (*models.AgentResponse, error)
+}
+
+// personaLoaderI is the interface the handler uses to load a persona.
+// The real *persona.Loader satisfies it; tests inject a stub.
+type personaLoaderI interface {
+	Load(ctx context.Context, personaID string) (*models.Persona, error)
+}
+
 var (
-	agentClient   *agents.BedrockClient
-	personaLoader *persona.Loader
+	agentClient   agentInvoker   // set in init(); overridable in tests
+	personaLoader personaLoaderI // set in init(); overridable in tests
 	ssmClient     *ssm.Client
+	sessStore     sessionStorer // set in init(); overridable in tests
 	agentConfig   struct {
 		sync.RWMutex
 		agentID    string
@@ -122,6 +145,13 @@ func init() {
 		tableName = "PersonaConfigurations"
 	}
 	personaLoader = persona.NewLoader(cfg, tableName)
+
+	// B-02: construct session store from SESSION_TABLE_NAME env.
+	sessionTableName := os.Getenv("SESSION_TABLE_NAME")
+	if sessionTableName == "" {
+		sessionTableName = "HeadsetSupportSessions"
+	}
+	sessStore = session.NewStore(cfg, sessionTableName)
 }
 
 // loadAgentConfig reads agent configuration from SSM Parameter Store
@@ -189,6 +219,99 @@ func loadAgentConfig(ctx context.Context) (agentID, agentAlias string) {
 	return agentConfig.agentID, agentConfig.agentAlias
 }
 
+// loadAndMergeSession loads the stored session and produces a merged session
+// object that reflects both the durable store state and the Lex/API per-turn
+// attributes.
+//
+// Merge is a two-pass operation:
+//
+//	Pass 1 — stored fills gaps in turnAttrs:
+//	  Stored attributes are copied into turnAttrs for any key not already
+//	  present, so Lex-provided keys (persona_id, etc.) are not overridden by
+//	  the store.
+//
+//	Pass 2 — turnAttrs (now including stored gaps) are applied to sess.Attributes:
+//	  Every key in turnAttrs is written into sess.Attributes, with turnAttrs
+//	  winning on any collision.  This means:
+//	    - Lex-provided keys override any stale stored value.
+//	    - Counter keys (frustration_count, failed_steps) end up in
+//	      sess.Attributes with the stored value, because they weren't present
+//	      in the incoming Lex attrs and were gap-filled in Pass 1.
+//
+// After this function returns, sess.Attributes is the single source of truth
+// for the rest of the turn.  The handler reads counters from sess via the
+// named accessors (session.GetFrustrationCount etc.) and writes updates back
+// via the same accessors.  saveSession persists sess.Attributes; it only fills
+// in additional keys from turnAttrs that were not already set (i.e. escalation
+// attrs set by BuildEscalationResponse after the load).
+//
+// On Load failure the function logs at WARN and returns a fresh empty session
+// so the turn continues (graceful degrade).
+func loadAndMergeSession(ctx context.Context, sessionID string, turnAttrs map[string]string) *models.Session {
+	sess, err := sessStore.Load(ctx, sessionID)
+	if err != nil {
+		slog.Warn("session load failed — continuing with empty session",
+			slog.String("session_id", sessionID),
+			slog.String("error", err.Error()),
+		)
+		sess = &models.Session{
+			SessionID:  sessionID,
+			Attributes: make(map[string]string),
+		}
+	}
+
+	// Pass 1: stored keys fill gaps in turnAttrs (Lex-provided keys win).
+	for k, v := range sess.Attributes {
+		if _, alreadyPresent := turnAttrs[k]; !alreadyPresent {
+			turnAttrs[k] = v
+		}
+	}
+
+	// Pass 2: apply the merged turnAttrs back into sess.Attributes so that
+	// the session object is the canonical state for this turn. Lex-provided
+	// values win on collision (e.g. persona_id from the front-end overrides
+	// a stale stored value).
+	for k, v := range turnAttrs {
+		sess.Attributes[k] = v
+	}
+
+	return sess
+}
+
+// saveSession writes the session back to the store after the turn is complete.
+// Save errors (including ErrConcurrentUpdate) are logged at WARN only — the
+// turn response is returned regardless so we never fail the caller.
+//
+// Merge on save: sess.Attributes holds values the handler explicitly wrote
+// (via session.Set* accessors), such as the updated frustration_count. Those
+// WIN over turnAttrs on any collision. turnAttrs only fills keys that the
+// handler did not explicitly write to sess.Attributes. This is the inverse of
+// the load-merge, where Lex/incoming attrs won; here the handler's persisted
+// state wins so that counter updates are never clobbered by stale Lex attrs.
+func saveSession(ctx context.Context, sess *models.Session, turnAttrs map[string]string) {
+	// Copy turnAttrs into sess.Attributes, but only for keys not already present.
+	// Keys the handler set explicitly (e.g. frustration_count via SetFrustrationCount)
+	// already live in sess.Attributes and must not be overwritten.
+	for k, v := range turnAttrs {
+		if _, exists := sess.Attributes[k]; !exists {
+			sess.Attributes[k] = v
+		}
+	}
+
+	if err := sessStore.Save(ctx, sess); err != nil {
+		if errors.Is(err, session.ErrConcurrentUpdate) {
+			slog.Warn("session save skipped — concurrent update",
+				slog.String("session_id", sess.SessionID),
+			)
+		} else {
+			slog.Warn("session save failed",
+				slog.String("session_id", sess.SessionID),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+}
+
 // handleAPIRequest handles HTTP API Gateway requests
 func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
 	slog.Info("received API request",
@@ -206,6 +329,15 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 			Body:       `{"error": "Invalid request body"}`,
 		}, nil
 	}
+
+	// Initialize session attributes if nil.
+	if chatReq.SessionState.SessionAttributes == nil {
+		chatReq.SessionState.SessionAttributes = make(map[string]string)
+	}
+
+	// B-02: load stored session and merge persisted attributes (stored keys fill
+	// gaps; incoming request attrs win on collision).
+	sess := loadAndMergeSession(ctx, chatReq.SessionID, chatReq.SessionState.SessionAttributes)
 
 	// Get persona from request headers or body
 	personaID := request.Headers["x-persona-id"]
@@ -243,6 +375,8 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 			},
 		}
 		respBody, _ := json.Marshal(chatResp)
+		// Save session even on refusal path (no counter updates needed here).
+		saveSession(ctx, sess, chatReq.SessionState.SessionAttributes)
 		return events.APIGatewayV2HTTPResponse{
 			StatusCode: 200,
 			Headers: map[string]string{
@@ -284,6 +418,9 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 			responseMessage = response.OutputText
 		}
 	}
+
+	// Save session before returning.
+	saveSession(ctx, sess, chatReq.SessionState.SessionAttributes)
 
 	// Build response
 	chatResp := ChatResponse{
@@ -334,6 +471,13 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 		event.SessionState.SessionAttributes = make(map[string]string)
 	}
 
+	// B-02: load stored session and merge persisted attributes.
+	// Stored keys fill gaps; Lex sessionAttributes win on collision.
+	// Counter keys (frustration_count, failed_steps) are read from the session
+	// object directly (via named accessors) so the Lex-wins rule for those keys
+	// in sessionAttributes is irrelevant to accumulation correctness.
+	sess := loadAndMergeSession(ctx, event.SessionID, event.SessionState.SessionAttributes)
+
 	// Check for test invocation
 	if transcript == "" && event.SessionState.SessionAttributes["test"] == "true" {
 		return handlers.BuildTestResponse(), nil
@@ -355,11 +499,13 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 		if p == nil {
 			p = persona.DefaultPersona()
 		}
-		return handlers.BuildSuccessResponse(
+		resp := handlers.BuildSuccessResponse(
 			p,
 			"Hi there! I'm your headset support assistant. Please describe your issue and I'll help you troubleshoot.",
 			event.SessionState.SessionAttributes,
-		), nil
+		)
+		saveSession(ctx, sess, event.SessionState.SessionAttributes)
+		return resp, nil
 	}
 
 	// Get persona
@@ -387,18 +533,39 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 			slog.String("session_id", event.SessionID),
 			slog.Bool("payment_blocked", true),
 		)
-		return handlers.BuildPaymentRefusalResponse(p, event.SessionState.SessionAttributes), nil
+		resp := handlers.BuildPaymentRefusalResponse(p, event.SessionState.SessionAttributes)
+		saveSession(ctx, sess, event.SessionState.SessionAttributes)
+		return resp, nil
 	}
+
+	// B-06: read accumulated counters from the session store (not from Lex
+	// sessionAttributes) so they reflect the persisted running totals.
+	frustrationCount := session.GetFrustrationCount(sess)
+	failedSteps := session.GetFailedSteps(sess)
 
 	// Check for escalation triggers
 	escalationDecision := handlers.DetectEscalation(
 		transcript,
-		getIntAttr(event.SessionState.SessionAttributes, "frustration_count"),
-		getIntAttr(event.SessionState.SessionAttributes, "failed_steps"),
+		frustrationCount,
+		failedSteps,
 	)
 
+	// B-06: persist the frustration delta so it accumulates across turns.
+	// Do this regardless of whether escalation fired (if it fired the session
+	// will be saved with escalation attrs; if not the incremented counter
+	// ensures the next turn starts from the correct accumulated value).
+	if escalationDecision.FrustrationDelta > 0 {
+		session.SetFrustrationCount(sess, frustrationCount+escalationDecision.FrustrationDelta)
+	}
+
 	if escalationDecision.ShouldEscalate {
-		return handlers.BuildEscalationResponse(p, escalationDecision, event.SessionState.SessionAttributes), nil
+		resp := handlers.BuildEscalationResponse(p, escalationDecision, event.SessionState.SessionAttributes)
+		// BuildEscalationResponse mutates sessionAttrs in-place (sets
+		// escalation_requested / reason / priority). Those mutations are
+		// reflected in event.SessionState.SessionAttributes and will be
+		// written into the session by saveSession below.
+		saveSession(ctx, sess, event.SessionState.SessionAttributes)
+		return resp, nil
 	}
 
 	// Load supervisor agent configuration from SSM
@@ -410,11 +577,13 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 			slog.String("agent_id", agentID),
 			slog.String("alias_id", agentAlias),
 		)
-		return handlers.BuildSuccessResponse(
+		resp := handlers.BuildSuccessResponse(
 			p,
 			"Hello! I'm setting up right now. The system is being configured. Please try again in a few minutes.",
 			event.SessionState.SessionAttributes,
-		), nil
+		)
+		saveSession(ctx, sess, event.SessionState.SessionAttributes)
+		return resp, nil
 	}
 
 	// Invoke Bedrock supervisor agent — log transcript at DEBUG only (PII risk)
@@ -437,15 +606,21 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 			slog.String("session_id", event.SessionID),
 			slog.String("error", err.Error()),
 		)
-		return handlers.BuildErrorResponse(p, "I'm having a bit of trouble connecting. Let me try that again."), nil
+		resp := handlers.BuildErrorResponse(p, "I'm having a bit of trouble connecting. Let me try that again.")
+		saveSession(ctx, sess, event.SessionState.SessionAttributes)
+		return resp, nil
 	}
 
 	if response == nil || response.OutputText == "" {
 		slog.Warn("empty response from bedrock agent", slog.String("session_id", event.SessionID))
-		return handlers.BuildErrorResponse(p, "I'm sorry, I didn't catch that. Could you please rephrase your question?"), nil
+		resp := handlers.BuildErrorResponse(p, "I'm sorry, I didn't catch that. Could you please rephrase your question?")
+		saveSession(ctx, sess, event.SessionState.SessionAttributes)
+		return resp, nil
 	}
 
-	return handlers.BuildSuccessResponse(p, response.OutputText, event.SessionState.SessionAttributes), nil
+	resp := handlers.BuildSuccessResponse(p, response.OutputText, event.SessionState.SessionAttributes)
+	saveSession(ctx, sess, event.SessionState.SessionAttributes)
+	return resp, nil
 }
 
 func handleRequest(ctx context.Context, event json.RawMessage) (interface{}, error) {
@@ -462,15 +637,6 @@ func handleRequest(ctx context.Context, event json.RawMessage) (interface{}, err
 		return nil, err
 	}
 	return handleLexRequest(ctx, lexEvent)
-}
-
-func getIntAttr(attrs map[string]string, key string) int {
-	if val, ok := attrs[key]; ok {
-		var n int
-		json.Unmarshal([]byte(val), &n)
-		return n
-	}
-	return 0
 }
 
 func main() {

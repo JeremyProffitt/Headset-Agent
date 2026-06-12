@@ -51,6 +51,10 @@ type EscalationDecision struct {
 	ShouldEscalate bool   `json:"should_escalate"`
 	Reason         string `json:"reason"`
 	Priority       string `json:"priority"`
+	// FrustrationDelta is the count of frustration indicators matched THIS turn.
+	// The handler accumulates this into the session's frustration_count so that
+	// the >=3 threshold can fire across successive turns (B-06).
+	FrustrationDelta int `json:"frustration_delta"`
 }
 
 // AgentResponse represents a response from Bedrock agent
