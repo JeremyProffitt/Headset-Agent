@@ -873,21 +873,14 @@ Resources:
               "Parameters": {
                 "Text": "This call is recorded and transcribed for quality and training, and is handled by an automated A I assistant. By staying on the line you consent to this. If you do not consent, please hang up now."
               },
-              "Transitions": {
-                "NextAction": "lexBot",
-                "Errors": [{"NextAction": "lexBot", "ErrorType": "NoMatchingError"}],
-                "Conditions": []
-              }
+              "Transitions": {"NextAction": "lexBot", "Errors": [{"NextAction": "lexBot", "ErrorType": "NoMatchingError"}], "Conditions": []}
             },
             {
               "Identifier": "lexBot",
               "Type": "ConnectParticipantWithLexBot",
-              "Parameters": {
-                "Text": "How can I help you with your headset today?",
-                "LexV2Bot": {"AliasArn": "${HeadsetBotAlias.Arn}"}
-              },
+              "Parameters": {"Text": "How can I help you with your headset today?", "LexV2Bot": {"AliasArn": "${HeadsetBotAlias.Arn}"}},
               "Transitions": {
-                "NextAction": "goodbye",
+                "NextAction": "checkEscalation",
                 "Errors": [
                   {"NextAction": "retry", "ErrorType": "NoMatchingError"},
                   {"NextAction": "retry", "ErrorType": "NoMatchingCondition"},
@@ -897,23 +890,47 @@ Resources:
               }
             },
             {
-              "Identifier": "retry",
-              "Type": "MessageParticipant",
-              "Parameters": {
-                "Text": "I'm sorry, I had trouble understanding. Thank you for calling Headset Support. Goodbye."
-              },
+              "Identifier": "checkEscalation",
+              "Type": "Compare",
+              "Parameters": {"ComparisonValue": "$.Lex.SessionAttributes.escalation_requested"},
               "Transitions": {
                 "NextAction": "goodbye",
-                "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
+                "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingCondition"}],
+                "Conditions": [{"NextAction": "setQueue", "Condition": {"Operator": "Equals", "Operands": ["true"]}}]
+              }
+            },
+            {
+              "Identifier": "setQueue",
+              "Type": "UpdateContactTargetQueue",
+              "Parameters": {"QueueId": "${HeadsetEscalationQueue.QueueArn}"},
+              "Transitions": {"NextAction": "transferToQueue", "Errors": [{"NextAction": "agentsBusy", "ErrorType": "NoMatchingError"}], "Conditions": []}
+            },
+            {
+              "Identifier": "transferToQueue",
+              "Type": "TransferContactToQueue",
+              "Parameters": {},
+              "Transitions": {
+                "NextAction": "agentsBusy",
+                "Errors": [
+                  {"NextAction": "agentsBusy", "ErrorType": "NoMatchingError"},
+                  {"NextAction": "agentsBusy", "ErrorType": "QueueAtCapacity"}
+                ],
                 "Conditions": []
               }
             },
             {
-              "Identifier": "goodbye",
-              "Type": "DisconnectParticipant",
-              "Parameters": {},
-              "Transitions": {}
-            }
+              "Identifier": "agentsBusy",
+              "Type": "MessageParticipant",
+              "Parameters": {"Text": "All of our support agents are currently busy or unavailable. Our team is available Monday through Friday, nine A M to five P M Eastern. Please call back during those hours. Goodbye."},
+              "Transitions": {"NextAction": "goodbye", "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}], "Conditions": []}
+            },
+            {
+              "Identifier": "retry",
+              "Type": "MessageParticipant",
+              "Parameters": {"Text": "I'm sorry, I had trouble understanding. Thank you for calling Headset Support. Goodbye."},
+              "Transitions": {"NextAction": "goodbye", "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}], "Conditions": []}
+            },
+            {"Identifier": "goodbye", "Type": "DisconnectParticipant", "Parameters": {}, "Transitions": {}}
           ]
         }
       Tags:
