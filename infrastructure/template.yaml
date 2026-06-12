@@ -182,7 +182,11 @@ Resources:
     Type: AWS::S3Vectors::Index
     Properties:
       VectorBucketArn: !GetAtt KbVectorBucket.VectorBucketArn
-      IndexName: !Sub "${KBBucketName}-idx-${Environment}"
+      # NOTE: MetadataConfiguration is immutable on AWS::S3Vectors::Index, so any
+      # change forces REPLACEMENT. CFN creates the new index before deleting the old,
+      # which collides on a same name (409 AlreadyExists) — so the name is versioned
+      # (-idxb-) to allow a clean create-new -> repoint-KB -> delete-old replacement.
+      IndexName: !Sub "${KBBucketName}-idxb-${Environment}"
       DataType: float32
       Dimension: 1024
       DistanceMetric: cosine
