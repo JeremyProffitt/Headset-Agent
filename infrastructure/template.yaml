@@ -871,117 +871,7 @@ Resources:
               "Identifier": "consent",
               "Type": "MessageParticipant",
               "Parameters": {
-                "Text": "This call is recorded and transcribed for quality and training, and is handled by an automated AI assistant. By staying on the line you consent to this. If you do not consent, please hang up now."
-              },
-              "Transitions": {
-                "NextAction": "setLanguage",
-                "Errors": [{"NextAction": "setLanguage", "ErrorType": "NoMatchingError"}],
-                "Conditions": []
-              }
-            },
-            {
-              "Identifier": "setLanguage",
-              "Type": "UpdateContactAttributes",
-              "Parameters": {
-                "Attributes": {
-                  "LanguageCode": "en-US",
-                  "Path": "Lex"
-                },
-                "TargetContact": "Current"
-              },
-              "Transitions": {
-                "NextAction": "setVoice",
-                "Errors": [{"NextAction": "setVoice", "ErrorType": "NoMatchingError"}],
-                "Conditions": []
-              }
-            },
-            {
-              "Identifier": "setVoice",
-              "Type": "UpdateContactTextToSpeechVoice",
-              "Parameters": {
-                "TextToSpeechVoice": "Joanna",
-                "TextToSpeechEngine": "Neural"
-              },
-              "Transitions": {
-                "NextAction": "welcomePrompt",
-                "Errors": [{"NextAction": "welcomePrompt", "ErrorType": "NoMatchingError"}],
-                "Conditions": []
-              }
-            },
-            {
-              "Identifier": "welcomePrompt",
-              "Type": "MessageParticipant",
-              "Parameters": {
-                "Text": "Welcome to Headset Support. I'll connect you with our troubleshooting assistant."
-              },
-              "Transitions": {
-                "NextAction": "personaMenu",
-                "Errors": [{"NextAction": "personaMenu", "ErrorType": "NoMatchingError"}],
-                "Conditions": []
-              }
-            },
-            {
-              "Identifier": "personaMenu",
-              "Type": "GetParticipantInput",
-              "Parameters": {
-                "Text": "For a cheerful Irish assistant, press 1. For a calm, methodical assistant, press 2. For a fast-talking friendly assistant, press 3.",
-                "InputTimeLimitSeconds": "10",
-                "DTMFConfiguration": {
-                  "InputTerminationSequence": "#",
-                  "DisableCancelKey": false
-                }
-              },
-              "Transitions": {
-                "NextAction": "setPersonaTangerine",
-                "Errors": [{"NextAction": "setPersonaTangerine", "ErrorType": "NoMatchingError"}],
-                "Conditions": [
-                  {
-                    "NextAction": "setPersonaTangerine",
-                    "Condition": {"Operator": "Equals", "Operands": ["1"]}
-                  },
-                  {
-                    "NextAction": "setPersonaJoseph",
-                    "Condition": {"Operator": "Equals", "Operands": ["2"]}
-                  },
-                  {
-                    "NextAction": "setPersonaJennifer",
-                    "Condition": {"Operator": "Equals", "Operands": ["3"]}
-                  }
-                ]
-              }
-            },
-            {
-              "Identifier": "setPersonaTangerine",
-              "Type": "UpdateContactAttributes",
-              "Parameters": {
-                "Attributes": {"persona_id": "tangerine"},
-                "TargetContact": "Current"
-              },
-              "Transitions": {
-                "NextAction": "lexBot",
-                "Errors": [{"NextAction": "lexBot", "ErrorType": "NoMatchingError"}],
-                "Conditions": []
-              }
-            },
-            {
-              "Identifier": "setPersonaJoseph",
-              "Type": "UpdateContactAttributes",
-              "Parameters": {
-                "Attributes": {"persona_id": "joseph"},
-                "TargetContact": "Current"
-              },
-              "Transitions": {
-                "NextAction": "lexBot",
-                "Errors": [{"NextAction": "lexBot", "ErrorType": "NoMatchingError"}],
-                "Conditions": []
-              }
-            },
-            {
-              "Identifier": "setPersonaJennifer",
-              "Type": "UpdateContactAttributes",
-              "Parameters": {
-                "Attributes": {"persona_id": "jennifer"},
-                "TargetContact": "Current"
+                "Text": "This call is recorded and transcribed for quality and training, and is handled by an automated A I assistant. By staying on the line you consent to this. If you do not consent, please hang up now."
               },
               "Transitions": {
                 "NextAction": "lexBot",
@@ -994,9 +884,7 @@ Resources:
               "Type": "ConnectParticipantWithLexBot",
               "Parameters": {
                 "Text": "How can I help you with your headset today?",
-                "LexV2Bot": {
-                  "AliasArn": "${HeadsetBotAlias.Arn}"
-                }
+                "LexV2Bot": {"AliasArn": "${HeadsetBotAlias.Arn}"}
               },
               "Transitions": {
                 "NextAction": "checkEscalation",
@@ -1012,43 +900,21 @@ Resources:
               "Identifier": "checkEscalation",
               "Type": "CheckContactAttributes",
               "Parameters": {
-                "Attribute": "$.Attributes.escalation_requested",
-                "Namespace": "External"
+                "Attribute": "escalation_requested",
+                "Namespace": "User Defined"
               },
               "Transitions": {
                 "NextAction": "goodbye",
                 "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
                 "Conditions": [
-                  {
-                    "NextAction": "checkHours",
-                    "Condition": {"Operator": "Equals", "Operands": ["true"]}
-                  }
-                ]
-              }
-            },
-            {
-              "Identifier": "checkHours",
-              "Type": "CheckHoursOfOperation",
-              "Parameters": {
-                "HoursOfOperationId": "${HeadsetHoursOfOperation.HoursOfOperationArn}"
-              },
-              "Transitions": {
-                "NextAction": "afterHours",
-                "Errors": [{"NextAction": "afterHours", "ErrorType": "NoMatchingError"}],
-                "Conditions": [
-                  {
-                    "NextAction": "setQueue",
-                    "Condition": {"Operator": "Equals", "Operands": ["true"]}
-                  }
+                  {"NextAction": "setQueue", "Condition": {"Operator": "Equals", "Operands": ["true"]}}
                 ]
               }
             },
             {
               "Identifier": "setQueue",
               "Type": "UpdateContactTargetQueue",
-              "Parameters": {
-                "QueueId": "${HeadsetEscalationQueue.QueueArn}"
-              },
+              "Parameters": {"QueueId": "${HeadsetEscalationQueue.QueueArn}"},
               "Transitions": {
                 "NextAction": "transferToQueue",
                 "Errors": [{"NextAction": "agentsBusy", "ErrorType": "NoMatchingError"}],
@@ -1072,19 +938,7 @@ Resources:
               "Identifier": "agentsBusy",
               "Type": "MessageParticipant",
               "Parameters": {
-                "Text": "All of our support agents are currently busy. Please leave us a message with your name, number, and issue after the tone, or call back during business hours, Monday through Friday, nine A M to five P M Eastern. We will get back to you. Goodbye."
-              },
-              "Transitions": {
-                "NextAction": "goodbye",
-                "Errors": [{"NextAction": "goodbye", "ErrorType": "NoMatchingError"}],
-                "Conditions": []
-              }
-            },
-            {
-              "Identifier": "afterHours",
-              "Type": "MessageParticipant",
-              "Parameters": {
-                "Text": "Thank you for calling Headset Support. Our support agents are available Monday through Friday, nine A M to five P M Eastern. Please leave a message with your name, number, and issue after the tone, or call back during business hours, and we will get back to you. Goodbye."
+                "Text": "All of our support agents are currently busy or unavailable. Our team is available Monday through Friday, nine A M to five P M Eastern. Please call back during those hours. Goodbye."
               },
               "Transitions": {
                 "NextAction": "goodbye",

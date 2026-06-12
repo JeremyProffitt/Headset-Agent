@@ -473,10 +473,11 @@ jobs:
         run: |
           ENV="${{ needs.setup.outputs.environment }}"
           STACK_NAME="agent-headset-${ENV}"
-          echo "=== Most recent FAILED resource events (exact StatusReason) ==="
-          aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
-            --query "reverse(StackEvents[?contains(ResourceStatus, 'FAILED')].{T:Timestamp,R:LogicalResourceId,Type:ResourceType,Status:ResourceStatus,Reason:ResourceStatusReason})" \
-            --output table 2>/dev/null | head -80 || echo "could not read stack events"
+          echo "=== Recent stack events (newest first, full StatusReason as JSON) ==="
+          # No 2>/dev/null and JSON output so the exact reason is never truncated/swallowed.
+          aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --max-items 40 \
+            --query "StackEvents[].{R:LogicalResourceId,S:ResourceStatus,Reason:ResourceStatusReason}" \
+            --output json || echo "describe-stack-events call failed"
   sync-knowledge-base:
     name: Sync Knowledge Base
     runs-on: ubuntu-latest

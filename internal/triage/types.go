@@ -144,6 +144,17 @@ type Step struct {
 	OnWorked    Transition // user reports the step fixed the problem
 	OnDidntWork Transition // user reports it did not help / still broken
 	OnUnclear   Transition // ambiguous/off-script answer; usually re-ask once
+
+	// Branches optionally encodes an n-way classification fork (B-04 addition,
+	// sanctioned by docs/triage-design.md §7 for Tree 5 s1/s4, Tree 6 s1, and
+	// Tree 7 s1). Keys are the Branch* consts in trees.go; values are the step
+	// to enter when the user's characterization matches that branch. When set,
+	// the engine first sub-classifies TurnResult.RawUtterance against the
+	// branch vocabulary (classify.go) and, on a match, takes Branches[key].
+	// When the utterance does not match, the OnWorked/OnDidntWork aliases (the
+	// most-common branch) apply; OnUnclear re-asks the characterization. Nil
+	// for ordinary yes/no steps.
+	Branches map[string]*StepRef
 }
 
 // Outcome is what the engine expects back from the agent each turn after a
