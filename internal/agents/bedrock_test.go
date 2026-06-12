@@ -621,6 +621,90 @@ func TestRetrieveAndGenerate_MultipleFiltersAreAndAll(t *testing.T) {
 	}
 }
 
+func TestRetrieveAndGenerate_FilterAnyOfIsInFilter(t *testing.T) {
+	mock := &mockAgentRuntime{ragOutput: ragSuccessOutput("answer", "s3://kb/doc.md")}
+	c := newTestClient(mock)
+
+	// B-07: a single any-of constraint becomes a bare "in" filter so that the
+	// caller's brand AND generic ("any"-tagged) docs both match.
+	_, err := c.RetrieveAndGenerate(context.Background(), RetrieveAndGenerateRequest{
+		KnowledgeBaseID: "KB123",
+		ModelID:         "model-1",
+		Query:           "jabra mic dead",
+		FilterAnyOf:     map[string][]string{"brand": {"any", "jabra"}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f := mock.lastRAGInput.RetrieveAndGenerateConfiguration.KnowledgeBaseConfiguration.
+		RetrievalConfiguration.VectorSearchConfiguration.Filter
+	in, ok := f.(*types.RetrievalFilterMemberIn)
+	if !ok {
+		t.Fatalf("expected single in filter, got %T", f)
+	}
+	if *in.Value.Key != "brand" {
+		t.Errorf("filter key=%q, want brand", *in.Value.Key)
+	}
+}
+
+func TestRetrieveAndGenerate_ExactAndAnyOfCombineToAndAll(t *testing.T) {
+	mock := &mockAgentRuntime{ragOutput: ragSuccessOutput("answer", "s3://kb/doc.md")}
+	c := newTestClient(mock)
+
+	// Exact equals conditions sort first, then the in conditions; everything is
+	// ANDed together.
+	_, err := c.RetrieveAndGenerate(context.Background(), RetrieveAndGenerateRequest{
+		KnowledgeBaseID: "KB123",
+		ModelID:         "model-1",
+		Query:           "no sound",
+		Filters:         map[string]string{"tree_id": "tree-1"},
+		FilterAnyOf: map[string][]string{
+			"connection_type": {"any", "usb"},
+			"brand":           {"any", "poly"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f := mock.lastRAGInput.RetrieveAndGenerateConfiguration.KnowledgeBaseConfiguration.
+		RetrievalConfiguration.VectorSearchConfiguration.Filter
+	andAll, ok := f.(*types.RetrievalFilterMemberAndAll)
+	if !ok {
+		t.Fatalf("expected andAll filter, got %T", f)
+	}
+	if len(andAll.Value) != 3 {
+		t.Fatalf("expected 3 conditions (1 equals + 2 in), got %d", len(andAll.Value))
+	}
+	// Equals (tree_id) sorts before the two in conditions.
+	if _, ok := andAll.Value[0].(*types.RetrievalFilterMemberEquals); !ok {
+		t.Errorf("first condition = %T, want equals (tree_id)", andAll.Value[0])
+	}
+	if _, ok := andAll.Value[1].(*types.RetrievalFilterMemberIn); !ok {
+		t.Errorf("second condition = %T, want in", andAll.Value[1])
+	}
+}
+
+func TestRetrieveAndGenerate_EmptyAnyOfValueIsSkipped(t *testing.T) {
+	mock := &mockAgentRuntime{ragOutput: ragSuccessOutput("answer", "s3://kb/doc.md")}
+	c := newTestClient(mock)
+
+	// An any-of key with an empty value list contributes no condition.
+	_, err := c.RetrieveAndGenerate(context.Background(), RetrieveAndGenerateRequest{
+		KnowledgeBaseID: "KB123",
+		ModelID:         "model-1",
+		Query:           "no sound",
+		FilterAnyOf:     map[string][]string{"brand": {}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f := mock.lastRAGInput.RetrieveAndGenerateConfiguration.KnowledgeBaseConfiguration.
+		RetrievalConfiguration.VectorSearchConfiguration.Filter
+	if f != nil {
+		t.Errorf("expected nil filter for empty any-of, got %T", f)
+	}
+}
+
 func TestGroundedPromptTemplate_NilPersonaHasDefaults(t *testing.T) {
 	tpl := groundedPromptTemplate(nil)
 	for _, want := range []string{"$search_results$", "friendly headset support assistant", "ONLY from the search results"} {

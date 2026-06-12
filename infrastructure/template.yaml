@@ -771,6 +771,141 @@ Resources:
           VoiceSettings:
             VoiceId: Joanna
             Engine: neural
+          # B-07 (CC-5): custom slot types over the frozen A-02 controlled
+          # vocabulary. TopResolution makes Lex NLU resolve any spoken synonym
+          # to the canonical value, so the Lambda reads e.g. "plantronics" as
+          # "poly" and "no sound" as "no_audio_output" — these resolved values
+          # feed the deterministic triage classifier and the KB metadata filters.
+          SlotTypes:
+            - Name: ConnectionType
+              Description: How the headset connects (frozen connection_type vocab)
+              ValueSelectionSetting:
+                ResolutionStrategy: TOP_RESOLUTION
+              SlotTypeValues:
+                - SampleValue:
+                    Value: usb
+                  Synonyms:
+                    - Value: u s b
+                    - Value: usb cable
+                    - Value: wired
+                    - Value: cable
+                    - Value: cabled
+                    - Value: plugged in
+                - SampleValue:
+                    Value: bluetooth
+                  Synonyms:
+                    - Value: blue tooth
+                    - Value: bt
+                    - Value: wireless bluetooth
+                - SampleValue:
+                    Value: dect
+                  Synonyms:
+                    - Value: d e c t
+                    - Value: base station
+                    - Value: deskphone
+                    - Value: cordless
+                - SampleValue:
+                    Value: wireless_dongle
+                  Synonyms:
+                    - Value: dongle
+                    - Value: usb dongle
+                    - Value: adapter
+                    - Value: adaptor
+                    - Value: receiver
+                    - Value: nano receiver
+                    - Value: usb receiver
+                    - Value: wireless adapter
+            - Name: HeadsetBrand
+              Description: Headset manufacturer (frozen brand vocab)
+              ValueSelectionSetting:
+                ResolutionStrategy: TOP_RESOLUTION
+              SlotTypeValues:
+                - SampleValue:
+                    Value: jabra
+                  Synonyms:
+                    - Value: gn
+                - SampleValue:
+                    Value: poly
+                  Synonyms:
+                    - Value: plantronics
+                    - Value: polycom
+                - SampleValue:
+                    Value: logitech
+                  Synonyms:
+                    - Value: logi
+                - SampleValue:
+                    Value: epos
+                  Synonyms:
+                    - Value: sennheiser
+                    - Value: epos sennheiser
+                - SampleValue:
+                    Value: yealink
+            - Name: IssueType
+              Description: Symptom class (maps 1:1 onto the eight triage SymptomClass values)
+              ValueSelectionSetting:
+                ResolutionStrategy: TOP_RESOLUTION
+              SlotTypeValues:
+                - SampleValue:
+                    Value: no_audio_output
+                  Synonyms:
+                    - Value: no sound
+                    - Value: no audio
+                    - Value: cannot hear anything
+                    - Value: no sound at all
+                    - Value: cant hear them
+                - SampleValue:
+                    Value: mic_not_working
+                  Synonyms:
+                    - Value: microphone not working
+                    - Value: mic not working
+                    - Value: they cant hear me
+                    - Value: microphone
+                    - Value: mic
+                - SampleValue:
+                    Value: not_detected
+                  Synonyms:
+                    - Value: not detected
+                    - Value: not showing up
+                    - Value: not recognized
+                    - Value: headset not found
+                - SampleValue:
+                    Value: one_sided_audio
+                  Synonyms:
+                    - Value: one ear
+                    - Value: one side
+                    - Value: only one ear
+                    - Value: mono
+                - SampleValue:
+                    Value: distorted_audio
+                  Synonyms:
+                    - Value: distorted
+                    - Value: choppy
+                    - Value: robotic
+                    - Value: crackling
+                    - Value: echo
+                    - Value: static
+                - SampleValue:
+                    Value: volume_sidetone
+                  Synonyms:
+                    - Value: too quiet
+                    - Value: too loud
+                    - Value: volume
+                    - Value: sidetone
+                    - Value: hear myself
+                - SampleValue:
+                    Value: mute_call_control
+                  Synonyms:
+                    - Value: mute not working
+                    - Value: buttons not working
+                    - Value: call control
+                    - Value: mute
+                - SampleValue:
+                    Value: intermittent_drops
+                  Synonyms:
+                    - Value: cutting out
+                    - Value: dropping
+                    - Value: disconnecting
+                    - Value: drops
           Intents:
             - Name: TroubleshootIntent
               Description: Main troubleshooting intent
@@ -784,6 +919,61 @@ Resources:
                 - Utterance: "Microphone not working"
                 - Utterance: "Bluetooth won't connect"
                 - Utterance: "How do I pair my headset"
+                - Utterance: "My {headset_brand} {connection_type} headset has {issue_type}"
+                - Utterance: "My {connection_type} headset {issue_type}"
+                - Utterance: "I have a {issue_type} problem with my {headset_brand} headset"
+              # B-07: optional slots. They are Optional (not Required) because the
+              # Lambda owns dialog via the ElicitIntent conversational loop and
+              # never Delegates to Lex's slot-elicitation; making them Required
+              # would be inert. Optional still lets Lex NLU resolve them from any
+              # utterance ("My Jabra USB mic is dead" fills all three in one shot).
+              # The Lambda reads them, persists them, feeds them to the triage
+              # classifier (issue_type resolves the symptom deterministically) and
+              # to the KB metadata filters. The single active elicitation is the
+              # in-Lambda symptom clarifier (issue_type, ≤once). MaxRetries:1 caps
+              # any future slot elicitation at one re-ask; on telephony Lex prompts
+              # accept DTMF by default (the DTMF/spelling fallback affordance).
+              Slots:
+                - Name: issue_type
+                  SlotTypeName: IssueType
+                  ValueElicitationSetting:
+                    SlotConstraint: Optional
+                    PromptSpecification:
+                      MaxRetries: 1
+                      AllowInterrupt: true
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: "Briefly, what's the headset doing — for example no sound, the mic not working, or it keeps cutting out?"
+                - Name: connection_type
+                  SlotTypeName: ConnectionType
+                  ValueElicitationSetting:
+                    SlotConstraint: Optional
+                    PromptSpecification:
+                      MaxRetries: 1
+                      AllowInterrupt: true
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: "How is your headset connected — USB, Bluetooth, a wireless dongle, or DECT?"
+                - Name: headset_brand
+                  SlotTypeName: HeadsetBrand
+                  ValueElicitationSetting:
+                    SlotConstraint: Optional
+                    PromptSpecification:
+                      MaxRetries: 1
+                      AllowInterrupt: true
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: "What brand is your headset — for example Jabra, Poly, Logitech, EPOS, or Yealink?"
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: issue_type
+                - Priority: 2
+                  SlotName: connection_type
+                - Priority: 3
+                  SlotName: headset_brand
               FulfillmentCodeHook:
                 Enabled: true
               DialogCodeHook:

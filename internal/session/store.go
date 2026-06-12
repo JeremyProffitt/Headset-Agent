@@ -80,6 +80,18 @@ const (
 	KeyLowASRCount = "low_asr_count"
 	// KeyNoMatchCount counts intent no-match events (VX-6).
 	KeyNoMatchCount = "no_match_count"
+
+	// B-07 Lex-slot values (frozen A-02 controlled vocabulary). Persisted so a
+	// value captured on one turn keeps filtering retrieval on later turns.
+	// KeyConnectionType is one of usb/bluetooth/dect/wireless_dongle ("" = unknown).
+	KeyConnectionType = "connection_type"
+	// KeyBrand is one of jabra/poly/logitech/epos/yealink ("" = unknown). This
+	// matches the KB sidecar metadata key "brand" (the Lex slot is named
+	// "headset_brand"; the handler normalizes to this key).
+	KeyBrand = "brand"
+	// KeyIssueType is the symptom class resolved from the issue_type slot
+	// (maps 1:1 onto triage SymptomClass values; "" = unknown).
+	KeyIssueType = "issue_type"
 )
 
 // ---------------------------------------------------------------------------

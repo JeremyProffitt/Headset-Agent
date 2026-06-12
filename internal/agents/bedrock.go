@@ -134,6 +134,13 @@ type RetrieveAndGenerateRequest struct {
 	// search (e.g. tree_id, brand, connection_type — the keys written by the
 	// KB ingestion sidecars). Multiple entries are ANDed. Nil/empty = none.
 	Filters map[string]string
+	// FilterAnyOf are optional metadata "in" filters: the document's value for
+	// the key must be one of the listed values. B-07 uses this for
+	// connection_type / brand with the caller's value PLUS "any", because most
+	// KB docs are tagged brand:"any" / connection_type:"any" — an exact-equals
+	// filter on a specific brand would exclude all generic docs and starve
+	// retrieval. Each entry is ANDed with the others and with Filters.
+	FilterAnyOf map[string][]string
 }
 
 // KBAnswer is a generated, KB-grounded answer plus best-effort citations.
@@ -168,7 +175,7 @@ func (c *BedrockClient) RetrieveAndGenerate(ctx context.Context, req RetrieveAnd
 	slog.Info("retrieve-and-generate against knowledge base",
 		slog.String("kb_id", req.KnowledgeBaseID),
 		slog.String("model", req.ModelID),
-		slog.Int("filter_count", len(req.Filters)),
+		slog.Int("filter_count", len(req.Filters)+len(req.FilterAnyOf)),
 	)
 	slog.Debug("retrieve-and-generate query",
 		slog.String("query_preview", logging.Truncate(req.Query, 80)),
@@ -189,7 +196,7 @@ func (c *BedrockClient) RetrieveAndGenerate(ctx context.Context, req RetrieveAnd
 				RetrievalConfiguration: &types.KnowledgeBaseRetrievalConfiguration{
 					VectorSearchConfiguration: &types.KnowledgeBaseVectorSearchConfiguration{
 						NumberOfResults: aws.Int32(kbNumberOfResults),
-						Filter:          buildRetrievalFilter(req.Filters),
+						Filter:          buildRetrievalFilter(req.Filters, req.FilterAnyOf),
 					},
 				},
 			},
@@ -251,33 +258,52 @@ func groundedPromptTemplate(p *models.Persona) string {
 		"- Never ask for or accept payment or card details."
 }
 
-// buildRetrievalFilter converts a flat key/value map into a Bedrock metadata
-// retrieval filter: nil for no filters, a single equals condition for one
-// entry, and an andAll of equals conditions for several. Keys are sorted so
-// the constructed filter is deterministic.
-func buildRetrievalFilter(filters map[string]string) types.RetrievalFilter {
-	if len(filters) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(filters))
-	for k := range filters {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+// buildRetrievalFilter converts exact (equals) and any-of (in) metadata
+// constraints into a single Bedrock retrieval filter: nil when there are none,
+// the bare condition when there is exactly one, and an andAll otherwise. Keys
+// are sorted within each group (equals first, then in) so the constructed
+// filter is deterministic.
+func buildRetrievalFilter(exact map[string]string, anyOf map[string][]string) types.RetrievalFilter {
+	conds := make([]types.RetrievalFilter, 0, len(exact)+len(anyOf))
 
-	conds := make([]types.RetrievalFilter, 0, len(keys))
-	for _, k := range keys {
+	exactKeys := make([]string, 0, len(exact))
+	for k := range exact {
+		exactKeys = append(exactKeys, k)
+	}
+	sort.Strings(exactKeys)
+	for _, k := range exactKeys {
 		conds = append(conds, &types.RetrievalFilterMemberEquals{
 			Value: types.FilterAttribute{
 				Key:   aws.String(k),
-				Value: document.NewLazyDocument(filters[k]),
+				Value: document.NewLazyDocument(exact[k]),
 			},
 		})
 	}
-	if len(conds) == 1 {
-		return conds[0]
+
+	inKeys := make([]string, 0, len(anyOf))
+	for k, vs := range anyOf {
+		if len(vs) > 0 {
+			inKeys = append(inKeys, k)
+		}
 	}
-	return &types.RetrievalFilterMemberAndAll{Value: conds}
+	sort.Strings(inKeys)
+	for _, k := range inKeys {
+		conds = append(conds, &types.RetrievalFilterMemberIn{
+			Value: types.FilterAttribute{
+				Key:   aws.String(k),
+				Value: document.NewLazyDocument(anyOf[k]),
+			},
+		})
+	}
+
+	switch len(conds) {
+	case 0:
+		return nil
+	case 1:
+		return conds[0]
+	default:
+		return &types.RetrievalFilterMemberAndAll{Value: conds}
+	}
 }
 
 // citationURIs extracts the distinct S3 source URIs from the citations of a

@@ -61,11 +61,15 @@ const symptomClarifyPrompt = "I want to make sure we go down the right path. Whi
 type FreeFormAnswerer func(ctx context.Context, sessionID, question string, kbDoc triage.KBDocRef) (string, error)
 
 // TriageDeps bundles the dependencies HandleTriageTurn needs. Engine and
-// Classifier are required; FreeForm is optional.
+// Classifier are required; FreeForm is optional. Slots carries the B-07 Lex
+// slot values (already merged with the stored session values by the caller):
+// IssueType resolves the symptom deterministically, ConnectionType gates the
+// one-time connection clarifier.
 type TriageDeps struct {
 	Engine     *triage.Engine
 	Classifier *triage.Classifier
 	FreeForm   FreeFormAnswerer
+	Slots      triage.Slots
 }
 
 // ---------------------------------------------------------------------------
@@ -293,9 +297,12 @@ func HandleTriageTurn(ctx context.Context, deps TriageDeps, sess *models.Session
 
 	// First substantive turn: classify the symptom and enter the flow at the
 	// Universal Pre-Flight Checklist. An unclassifiable opener defers to the
-	// generic agent (no tree guessing — there is no catch-all class).
+	// generic agent (no tree guessing — there is no catch-all class). B-07: the
+	// classifier is now fed the merged Lex slots, so a filled issue_type slot
+	// ("My Jabra USB mic is dead") resolves the symptom deterministically even
+	// when the free-text keywords are ambiguous.
 	if st.CurrentTree == "" {
-		class, err := deps.Classifier.Classify(ctx, transcript, triage.Slots{})
+		class, err := deps.Classifier.Classify(ctx, transcript, deps.Slots)
 		if err != nil {
 			slog.Debug("triage: opening utterance unclassified — deferring to agent",
 				slog.String("session_id", sess.SessionID))
@@ -311,6 +318,7 @@ func HandleTriageTurn(ctx context.Context, deps TriageDeps, sess *models.Session
 		slog.Info("triage: flow started",
 			slog.String("session_id", sess.SessionID),
 			slog.String("symptom", string(class)),
+			slog.String("connection_type", deps.Slots.ConnectionType),
 			slog.String("tree", view.TreeID),
 			slog.String("step", string(view.StepID)))
 		text := "I can definitely help with that. Let's run a few quick checks first — they fix most headset issues in a couple of minutes. " + stepPrompt(view)
@@ -331,7 +339,7 @@ func HandleTriageTurn(ctx context.Context, deps TriageDeps, sess *models.Session
 	// Pre-flight handed off without a classified symptom: this utterance is
 	// the answer to the "which best describes it" clarifier.
 	if session.GetBool(sess, KeyAwaitingSymptom) {
-		class, err := deps.Classifier.Classify(ctx, transcript, triage.Slots{})
+		class, err := deps.Classifier.Classify(ctx, transcript, deps.Slots)
 		if err != nil {
 			st.LastResponse = symptomClarifyPrompt
 			SaveTriageState(sess, st, attrs)
@@ -385,7 +393,7 @@ func HandleTriageTurn(ctx context.Context, deps TriageDeps, sess *models.Session
 	if errors.Is(err, triage.ErrSymptomRequired) {
 		// Counters for this turn were already applied — do NOT re-Advance.
 		// Try classifying this same utterance; otherwise ask the clarifier.
-		class, cerr := deps.Classifier.Classify(ctx, transcript, triage.Slots{})
+		class, cerr := deps.Classifier.Classify(ctx, transcript, deps.Slots)
 		if cerr != nil {
 			setAwaitingSymptom(sess, attrs, true)
 			st.LastResponse = symptomClarifyPrompt

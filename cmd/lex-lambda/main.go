@@ -182,6 +182,126 @@ func kbConfig() (kbID, modelID string) {
 	return kbID, modelID
 }
 
+// ---------------------------------------------------------------------------
+// B-07: Lex slots → triage classification + KB metadata filters
+// ---------------------------------------------------------------------------
+
+// allowedConnectionTypes / allowedBrands are the frozen A-02 controlled
+// vocabulary (PLAN §5.1 #6). Slot values outside these sets are dropped so a
+// stray ASR resolution never reaches the retrieval filter.
+var allowedConnectionTypes = map[string]bool{
+	"usb": true, "bluetooth": true, "dect": true, "wireless_dongle": true,
+}
+var allowedBrands = map[string]bool{
+	"jabra": true, "poly": true, "logitech": true, "epos": true, "yealink": true,
+}
+
+// slotValue pulls the resolved (slot-type-canonical) value for a named slot
+// from a Lex V2 slots map, falling back to the interpreted value. Returns ""
+// when the slot is absent, null, or empty.
+func slotValue(slots map[string]interface{}, name string) string {
+	raw, ok := slots[name]
+	if !ok || raw == nil {
+		return ""
+	}
+	slot, ok := raw.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	val, ok := slot["value"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	if rvs, ok := val["resolvedValues"].([]interface{}); ok {
+		for _, rv := range rvs {
+			if s, ok := rv.(string); ok && strings.TrimSpace(s) != "" {
+				return strings.ToLower(strings.TrimSpace(s))
+			}
+		}
+	}
+	if iv, ok := val["interpretedValue"].(string); ok {
+		return strings.ToLower(strings.TrimSpace(iv))
+	}
+	return ""
+}
+
+// resolvedSlots reads the B-07 slots from a Lex event (the current intent
+// first, then the top interpretation) and normalizes them to the frozen
+// vocabulary. The Lex slot is named "headset_brand"; it is normalized onto the
+// KB sidecar metadata key "brand".
+func (e LexV2Event) resolvedSlots() triage.Slots {
+	var slots map[string]interface{}
+	if e.SessionState.Intent != nil && len(e.SessionState.Intent.Slots) > 0 {
+		slots = e.SessionState.Intent.Slots
+	} else {
+		for _, in := range e.Interpretations {
+			if len(in.Intent.Slots) > 0 {
+				slots = in.Intent.Slots
+				break
+			}
+		}
+	}
+	if slots == nil {
+		return triage.Slots{}
+	}
+	conn := slotValue(slots, "connection_type")
+	if !allowedConnectionTypes[conn] {
+		conn = ""
+	}
+	brand := slotValue(slots, "headset_brand")
+	if !allowedBrands[brand] {
+		brand = ""
+	}
+	return triage.Slots{
+		ConnectionType: conn,
+		Brand:          brand,
+		IssueType:      slotValue(slots, "issue_type"),
+	}
+}
+
+// mergeSlots persists any non-empty slot value into the session (and mirrors it
+// into the turn attrs so the value survives the next load-merge), then returns
+// the EFFECTIVE slots = this turn's captured value OR the previously stored
+// value. Empty incoming values never clobber a known stored value.
+func mergeSlots(sess *models.Session, attrs map[string]string, in triage.Slots) triage.Slots {
+	if in.ConnectionType != "" {
+		session.SetString(sess, session.KeyConnectionType, in.ConnectionType)
+		attrs[session.KeyConnectionType] = in.ConnectionType
+	}
+	if in.Brand != "" {
+		session.SetString(sess, session.KeyBrand, in.Brand)
+		attrs[session.KeyBrand] = in.Brand
+	}
+	if in.IssueType != "" {
+		session.SetString(sess, session.KeyIssueType, in.IssueType)
+		attrs[session.KeyIssueType] = in.IssueType
+	}
+	return triage.Slots{
+		ConnectionType: session.GetString(sess, session.KeyConnectionType),
+		Brand:          session.GetString(sess, session.KeyBrand),
+		IssueType:      session.GetString(sess, session.KeyIssueType),
+	}
+}
+
+// kbFilters builds the FilterAnyOf metadata constraints from the caller facts
+// known so far. connection_type / brand use IN-with-"any" semantics so that a
+// brand/connection-specific doc AND a generic ("any"-tagged) doc both match —
+// an exact-equals filter would exclude the generic docs (the bulk of the KB)
+// and starve retrieval. Absent facts add no constraint (full recall).
+func kbFilters(sess *models.Session) map[string][]string {
+	f := map[string][]string{}
+	if c := session.GetString(sess, session.KeyConnectionType); c != "" {
+		f["connection_type"] = []string{"any", c}
+	}
+	if b := session.GetString(sess, session.KeyBrand); b != "" {
+		f["brand"] = []string{"any", b}
+	}
+	if len(f) == 0 {
+		return nil
+	}
+	return f
+}
+
 // loadAgentConfig reads agent configuration from SSM Parameter Store
 func loadAgentConfig(ctx context.Context) (agentID, agentAlias string) {
 	agentConfig.RLock()
@@ -426,6 +546,9 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 			ModelID:         modelID,
 			Query:           chatReq.InputTranscript,
 			Persona:         p,
+			// B-07: /chat shares the metadata filter when the front-end has
+			// stored connection_type/brand on the session (parity with voice).
+			FilterAnyOf: kbFilters(sess),
 		})
 		if ragErr != nil || answer == nil || strings.TrimSpace(answer.Text) == "" {
 			if ragErr != nil {
@@ -574,6 +697,19 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 		p = persona.DefaultPersona()
 	}
 
+	// B-07: read this turn's Lex slots, persist them, and compute the effective
+	// slot view (captured this turn OR previously stored). effectiveSlots feeds
+	// the triage classifier; kbFilters(sess) feeds the KB metadata filters.
+	effectiveSlots := mergeSlots(sess, event.SessionState.SessionAttributes, event.resolvedSlots())
+	if effectiveSlots.ConnectionType != "" || effectiveSlots.Brand != "" || effectiveSlots.IssueType != "" {
+		slog.Info("lex slots resolved",
+			slog.String("session_id", event.SessionID),
+			slog.String("connection_type", effectiveSlots.ConnectionType),
+			slog.String("brand", effectiveSlots.Brand),
+			slog.String("issue_type", effectiveSlots.IssueType),
+		)
+	}
+
 	// Check for payment solicitation BEFORE escalation and BEFORE calling Bedrock.
 	// If detected, return a safe refusal without echoing any digits.
 	if handlers.DetectPaymentSolicitation(transcript) {
@@ -644,6 +780,7 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 				ModelID:         modelID,
 				Query:           query,
 				Persona:         p,
+				FilterAnyOf:     kbFilters(sess),
 			})
 			if err != nil {
 				return "", err
@@ -675,6 +812,7 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 		Engine:     triageEngine,
 		Classifier: triageClassifier,
 		FreeForm:   freeForm,
+		Slots:      effectiveSlots,
 	}, sess, transcript, p, event.SessionState.SessionAttributes); handled {
 		saveSession(ctx, sess, event.SessionState.SessionAttributes)
 		return resp, nil
@@ -696,6 +834,7 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 			ModelID:         modelID,
 			Query:           transcript,
 			Persona:         p,
+			FilterAnyOf:     kbFilters(sess),
 		})
 		if ragErr != nil || answer == nil || strings.TrimSpace(answer.Text) == "" {
 			if ragErr != nil {

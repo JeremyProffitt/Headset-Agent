@@ -82,3 +82,4 @@ package-lock.json
 *.tfstate
 *.tfstate.*
 .terraform.lock.hcl
+.continuation-prompt.md

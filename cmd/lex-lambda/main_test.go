@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/headset-support-agent/internal/handlers"
 	"github.com/headset-support-agent/internal/models"
 	"github.com/headset-support-agent/internal/session"
+	"github.com/headset-support-agent/internal/triage"
 )
 
 // ---------------------------------------------------------------------------
@@ -770,5 +772,173 @@ func TestHandleLexRequest_TriageFreeFormUsesKBWhenConfigured(t *testing.T) {
 	stored, _ := store.Load(ctx, sid)
 	if got := session.GetCurrentStep(stored); got != "preflight.s1" {
 		t.Errorf("current_step=%q, want preflight.s1 (free-form must not advance)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// B-07: Lex slots → triage classification + KB metadata filters
+// ---------------------------------------------------------------------------
+
+// makeLexEventWithSlots builds a Lex event whose current intent carries the
+// given slots, shaped exactly as Lex V2 delivers them (value.resolvedValues +
+// interpretedValue). The slot names are the bot's slot names (issue_type,
+// connection_type, headset_brand).
+func makeLexEventWithSlots(sessionID, transcript string, slots map[string]string) LexV2Event {
+	ev := makeLexEvent(sessionID, transcript)
+	slotMap := make(map[string]interface{}, len(slots))
+	for name, val := range slots {
+		slotMap[name] = map[string]interface{}{
+			"value": map[string]interface{}{
+				"originalValue":    val,
+				"interpretedValue": val,
+				"resolvedValues":   []interface{}{val},
+			},
+		}
+	}
+	ev.SessionState.Intent = &IntentResult{Name: "TroubleshootIntent", Slots: slotMap}
+	return ev
+}
+
+func TestResolvedSlots_ReadsAndNormalizes(t *testing.T) {
+	ev := makeLexEventWithSlots("s", "my jabra usb mic is dead", map[string]string{
+		"issue_type":      "mic_not_working",
+		"connection_type": "USB", // upper-cased; normalizer lowercases
+		"headset_brand":   "jabra",
+	})
+	got := ev.resolvedSlots()
+	want := triage.Slots{ConnectionType: "usb", Brand: "jabra", IssueType: "mic_not_working"}
+	if got != want {
+		t.Errorf("resolvedSlots()=%+v, want %+v", got, want)
+	}
+}
+
+func TestResolvedSlots_DropsOutOfVocabValues(t *testing.T) {
+	// A brand/connection outside the frozen vocabulary is dropped (never reaches
+	// the retrieval filter); issue_type is passed through for the classifier.
+	ev := makeLexEventWithSlots("s", "x", map[string]string{
+		"connection_type": "carrier_pigeon",
+		"headset_brand":   "acme",
+		"issue_type":      "no_audio_output",
+	})
+	got := ev.resolvedSlots()
+	if got.ConnectionType != "" {
+		t.Errorf("ConnectionType=%q, want empty (out of vocab)", got.ConnectionType)
+	}
+	if got.Brand != "" {
+		t.Errorf("Brand=%q, want empty (out of vocab)", got.Brand)
+	}
+	if got.IssueType != "no_audio_output" {
+		t.Errorf("IssueType=%q, want no_audio_output", got.IssueType)
+	}
+}
+
+func TestResolvedSlots_FallsBackToInterpretations(t *testing.T) {
+	ev := makeLexEvent("s", "x")
+	ev.Interpretations = []Interpretation{{
+		Intent: IntentResult{Name: "TroubleshootIntent", Slots: map[string]interface{}{
+			"connection_type": map[string]interface{}{
+				"value": map[string]interface{}{"resolvedValues": []interface{}{"bluetooth"}},
+			},
+		}},
+	}}
+	if got := ev.resolvedSlots(); got.ConnectionType != "bluetooth" {
+		t.Errorf("ConnectionType=%q, want bluetooth (from interpretations)", got.ConnectionType)
+	}
+}
+
+func TestMergeSlots_PersistsAndDoesNotClobber(t *testing.T) {
+	sess := &models.Session{SessionID: "s", Attributes: map[string]string{}}
+	attrs := map[string]string{}
+
+	// Turn 1: connection captured.
+	eff := mergeSlots(sess, attrs, triage.Slots{ConnectionType: "usb"})
+	if eff.ConnectionType != "usb" {
+		t.Fatalf("turn1 effective connection=%q, want usb", eff.ConnectionType)
+	}
+	if attrs[session.KeyConnectionType] != "usb" {
+		t.Errorf("turn1 mirror attr=%q, want usb", attrs[session.KeyConnectionType])
+	}
+
+	// Turn 2: brand captured, connection NOT restated — must not be clobbered.
+	eff = mergeSlots(sess, attrs, triage.Slots{Brand: "poly"})
+	if eff.ConnectionType != "usb" {
+		t.Errorf("turn2 effective connection=%q, want usb (sticky)", eff.ConnectionType)
+	}
+	if eff.Brand != "poly" {
+		t.Errorf("turn2 effective brand=%q, want poly", eff.Brand)
+	}
+}
+
+func TestKBFilters_AnyOfWithAny(t *testing.T) {
+	sess := &models.Session{SessionID: "s", Attributes: map[string]string{}}
+	if f := kbFilters(sess); f != nil {
+		t.Errorf("no facts → nil filters, got %v", f)
+	}
+	session.SetString(sess, session.KeyConnectionType, "usb")
+	session.SetString(sess, session.KeyBrand, "jabra")
+	f := kbFilters(sess)
+	if !reflect.DeepEqual(f["connection_type"], []string{"any", "usb"}) {
+		t.Errorf("connection_type filter=%v, want [any usb]", f["connection_type"])
+	}
+	if !reflect.DeepEqual(f["brand"], []string{"any", "jabra"}) {
+		t.Errorf("brand filter=%v, want [any jabra]", f["brand"])
+	}
+}
+
+// TestHandleLexRequest_IssueTypeSlotResolvesSymptom proves the issue_type slot
+// drives deterministic classification even when the free text has no symptom
+// keywords ("please help me" matches nothing).
+func TestHandleLexRequest_IssueTypeSlotResolvesSymptom(t *testing.T) {
+	store := setupMocks(t)
+	ctx := context.Background()
+	sid := "sess-issue-slot"
+
+	ev := makeLexEventWithSlots(sid, "please help me", map[string]string{
+		"issue_type": "not_detected",
+	})
+	if _, err := handleLexRequest(ctx, ev); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	stored, _ := store.Load(ctx, sid)
+	if got := session.GetString(stored, session.KeySymptom); got != "not_detected" {
+		t.Errorf("symptom=%q, want not_detected (resolved from issue_type slot)", got)
+	}
+	if got := session.GetCurrentTree(stored); got != "preflight" {
+		t.Errorf("current_tree=%q, want preflight", got)
+	}
+}
+
+// TestHandleLexRequest_SlotsFlowIntoRetrievalFilters proves connection_type and
+// brand slots are persisted and passed as IN-with-"any" filters on a KB turn.
+func TestHandleLexRequest_SlotsFlowIntoRetrievalFilters(t *testing.T) {
+	store := setupMocks(t)
+	mock := &mockAgentInvoker{ragText: "Some general guidance."}
+	agentClient = mock
+	t.Setenv("KB_ID", "kb-123")
+	ctx := context.Background()
+	sid := "sess-slot-filter"
+
+	// "tell me about my headset" classifies to nothing → generic KB turn fires.
+	ev := makeLexEventWithSlots(sid, "tell me about my headset", map[string]string{
+		"connection_type": "usb",
+		"headset_brand":   "jabra",
+	})
+	if _, err := handleLexRequest(ctx, ev); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.lastRAGRequest == nil {
+		t.Fatal("expected a RetrieveAndGenerate call on the generic KB turn")
+	}
+	f := mock.lastRAGRequest.FilterAnyOf
+	if !reflect.DeepEqual(f["connection_type"], []string{"any", "usb"}) {
+		t.Errorf("connection_type filter=%v, want [any usb]", f["connection_type"])
+	}
+	if !reflect.DeepEqual(f["brand"], []string{"any", "jabra"}) {
+		t.Errorf("brand filter=%v, want [any jabra]", f["brand"])
+	}
+	// Persisted for later turns.
+	stored, _ := store.Load(ctx, sid)
+	if got := session.GetString(stored, session.KeyConnectionType); got != "usb" {
+		t.Errorf("persisted connection_type=%q, want usb", got)
 	}
 }
