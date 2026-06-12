@@ -13,9 +13,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/aws/aws-lambda-go/events"
 	"github.com/headset-support-agent/internal/agents"
 	"github.com/headset-support-agent/internal/handlers"
 	"github.com/headset-support-agent/internal/models"
@@ -66,13 +69,34 @@ func (m *mockSessionStore) Save(_ context.Context, sess *models.Session) error {
 	return nil
 }
 
-// mockAgentInvoker returns a canned success response so Bedrock is never called.
-type mockAgentInvoker struct{}
+// mockAgentInvoker returns canned success responses so Bedrock is never called.
+// ragText/ragErr control the RetrieveAndGenerate (A-08) path; lastRAGRequest
+// captures the most recent request for assertions.
+type mockAgentInvoker struct {
+	ragText        string
+	ragErr         error
+	lastRAGRequest *agents.RetrieveAndGenerateRequest
+}
 
 func (m *mockAgentInvoker) InvokeAgent(_ context.Context, input agents.InvokeAgentInput) (*models.AgentResponse, error) {
 	return &models.AgentResponse{
 		OutputText: "Stub bedrock response",
 		SessionID:  input.SessionID,
+	}, nil
+}
+
+func (m *mockAgentInvoker) RetrieveAndGenerate(_ context.Context, req agents.RetrieveAndGenerateRequest) (*agents.KBAnswer, error) {
+	m.lastRAGRequest = &req
+	if m.ragErr != nil {
+		return nil, m.ragErr
+	}
+	text := m.ragText
+	if text == "" {
+		text = "Stub KB-grounded answer"
+	}
+	return &agents.KBAnswer{
+		Text:      text,
+		Citations: []string{"s3://kb-bucket/trees/preflight-checklist.md"},
 	}, nil
 }
 
@@ -115,6 +139,11 @@ func setupMocks(t *testing.T) *mockSessionStore {
 	sessStore = store
 	agentClient = &mockAgentInvoker{}
 	personaLoader = &mockPersonaLoader{}
+
+	// Default to the legacy (no knowledge base) path; tests that exercise the
+	// A-08 KB retrieval path override KB_ID themselves. t.Setenv restores the
+	// original value on cleanup.
+	t.Setenv("KB_ID", "")
 
 	// Provide a non-empty, non-PLACEHOLDER agent config so the handler
 	// reaches the Bedrock invocation path (or escalation, whichever fires).
@@ -564,5 +593,182 @@ func TestHandleLexRequest_TriageFreeFormQuestionUsesBedrock(t *testing.T) {
 	}
 	if got := session.GetUnclearStreak(stored); got != 0 {
 		t.Errorf("unclear_streak=%d, want 0 (free-form moves no counters)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A-08: /chat answers from the knowledge base via RetrieveAndGenerate
+// ---------------------------------------------------------------------------
+
+// makeChatRequest builds a minimal API Gateway /chat POST request.
+func makeChatRequest(sessionID, transcript string) events.APIGatewayV2HTTPRequest {
+	body, _ := json.Marshal(ChatRequest{
+		SessionID:       sessionID,
+		InputTranscript: transcript,
+	})
+	req := events.APIGatewayV2HTTPRequest{
+		RawPath: "/chat",
+		Body:    string(body),
+	}
+	req.RequestContext.HTTP.Method = "POST"
+	return req
+}
+
+// chatMessages parses the ChatResponse body of a handleAPIRequest result.
+func chatMessages(t *testing.T, resp events.APIGatewayV2HTTPResponse) []ChatMessage {
+	t.Helper()
+	var chatResp ChatResponse
+	if err := json.Unmarshal([]byte(resp.Body), &chatResp); err != nil {
+		t.Fatalf("failed to parse chat response body %q: %v", resp.Body, err)
+	}
+	return chatResp.Messages
+}
+
+// TestHandleAPIRequest_ChatReturnsKBGroundedAnswer is the A-08 acceptance
+// test: with KB_ID set, /chat answers from the knowledge base via
+// RetrieveAndGenerate — NOT the "trouble connecting" fallback and NOT the
+// supervisor agent.
+func TestHandleAPIRequest_ChatReturnsKBGroundedAnswer(t *testing.T) {
+	setupMocks(t)
+	t.Setenv("KB_ID", "KBTEST123")
+	t.Setenv("BEDROCK_MODEL_SUPERVISOR", "us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+
+	mock := &mockAgentInvoker{ragText: "First, check the headset is plugged into a direct USB port — that fixes most no-sound issues."}
+	agentClient = mock
+
+	resp, err := handleAPIRequest(context.Background(), makeChatRequest("sess-chat-kb", "my headset has no sound"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+
+	msgs := chatMessages(t, resp)
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	if !strings.Contains(msgs[0].Content, "direct USB port") {
+		t.Errorf("expected the KB-grounded answer, got %q", msgs[0].Content)
+	}
+	if strings.Contains(msgs[0].Content, "trouble connecting") {
+		t.Errorf("got the fallback message instead of a KB answer: %q", msgs[0].Content)
+	}
+
+	// The RAG request must carry the KB id, model, query, and persona.
+	if mock.lastRAGRequest == nil {
+		t.Fatal("RetrieveAndGenerate was not called")
+	}
+	if mock.lastRAGRequest.KnowledgeBaseID != "KBTEST123" {
+		t.Errorf("kb id=%q, want KBTEST123", mock.lastRAGRequest.KnowledgeBaseID)
+	}
+	if mock.lastRAGRequest.ModelID != "us.anthropic.claude-3-5-sonnet-20241022-v2:0" {
+		t.Errorf("model=%q", mock.lastRAGRequest.ModelID)
+	}
+	if mock.lastRAGRequest.Query != "my headset has no sound" {
+		t.Errorf("query=%q", mock.lastRAGRequest.Query)
+	}
+	if mock.lastRAGRequest.Persona == nil || mock.lastRAGRequest.Persona.DisplayName != "Tangerine Test" {
+		t.Error("expected the loaded persona to be passed to RetrieveAndGenerate")
+	}
+}
+
+// TestHandleAPIRequest_ChatFallsBackGracefullyOnRAGError verifies the
+// guardrail: a RetrieveAndGenerate failure returns the graceful fallback
+// message with HTTP 200 (never a 5xx to the website).
+func TestHandleAPIRequest_ChatFallsBackGracefullyOnRAGError(t *testing.T) {
+	setupMocks(t)
+	t.Setenv("KB_ID", "KBTEST123")
+	agentClient = &mockAgentInvoker{ragErr: errors.New("kb exploded")}
+
+	resp, err := handleAPIRequest(context.Background(), makeChatRequest("sess-chat-kb-err", "no sound"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	msgs := chatMessages(t, resp)
+	if len(msgs) != 1 || !strings.Contains(msgs[0].Content, "trouble connecting") {
+		t.Errorf("expected graceful fallback message, got %v", msgs)
+	}
+}
+
+// TestHandleAPIRequest_ChatPaymentGuardrailStillFires verifies the payment
+// solicitation refusal runs BEFORE any KB retrieval.
+func TestHandleAPIRequest_ChatPaymentGuardrailStillFires(t *testing.T) {
+	setupMocks(t)
+	t.Setenv("KB_ID", "KBTEST123")
+	mock := &mockAgentInvoker{}
+	agentClient = mock
+
+	resp, err := handleAPIRequest(context.Background(),
+		makeChatRequest("sess-chat-pay", "my card number is 4111 1111 1111 1111"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	msgs := chatMessages(t, resp)
+	if len(msgs) != 1 || !strings.Contains(msgs[0].Content, "can't take any payment") {
+		t.Errorf("expected payment refusal, got %v", msgs)
+	}
+	if mock.lastRAGRequest != nil {
+		t.Error("RetrieveAndGenerate must not be called on the payment-refusal path")
+	}
+}
+
+// TestHandleAPIRequest_ChatUsesAgentWhenKBUnset verifies InvokeAgent remains
+// the fallback path only when KB_ID is empty.
+func TestHandleAPIRequest_ChatUsesAgentWhenKBUnset(t *testing.T) {
+	setupMocks(t) // KB_ID set to "" by setupMocks
+	mock := &mockAgentInvoker{}
+	agentClient = mock
+
+	resp, err := handleAPIRequest(context.Background(), makeChatRequest("sess-chat-agent", "hello there"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	msgs := chatMessages(t, resp)
+	if len(msgs) != 1 || !strings.Contains(msgs[0].Content, "Stub bedrock response") {
+		t.Errorf("expected supervisor-agent answer when KB_ID is unset, got %v", msgs)
+	}
+	if mock.lastRAGRequest != nil {
+		t.Error("RetrieveAndGenerate must not be called when KB_ID is empty")
+	}
+}
+
+// TestHandleLexRequest_TriageFreeFormUsesKBWhenConfigured verifies the triage
+// free-form hook answers from the knowledge base when KB_ID is set, and that
+// the step's KB doc is passed as retrieval context.
+func TestHandleLexRequest_TriageFreeFormUsesKBWhenConfigured(t *testing.T) {
+	store := setupMocks(t)
+	t.Setenv("KB_ID", "KBTEST123")
+	mock := &mockAgentInvoker{ragText: "A USB hub is a splitter that adds extra USB ports."}
+	agentClient = mock
+
+	ctx := context.Background()
+	sid := "sess-triage-freeform-kb"
+
+	if _, err := handleLexRequest(ctx, makeLexEvent(sid, "there's no sound in my headset")); err != nil {
+		t.Fatalf("turn 1: %v", err)
+	}
+
+	resp, err := handleLexRequest(ctx, makeLexEvent(sid, "what's a usb hub?"))
+	if err != nil {
+		t.Fatalf("turn 2: %v", err)
+	}
+	if !strings.Contains(resp.Messages[0].Content, "A USB hub is a splitter") {
+		t.Errorf("expected KB-grounded free-form answer, got %q", resp.Messages[0].Content)
+	}
+	if mock.lastRAGRequest == nil {
+		t.Fatal("RetrieveAndGenerate was not called for the free-form question")
+	}
+	if !strings.Contains(mock.lastRAGRequest.Query, "preflight-checklist") {
+		t.Errorf("expected the step's KB doc in the retrieval query, got %q", mock.lastRAGRequest.Query)
+	}
+
+	// Free-form must not advance the flow.
+	stored, _ := store.Load(ctx, sid)
+	if got := session.GetCurrentStep(stored); got != "preflight.s1" {
+		t.Errorf("current_step=%q, want preflight.s1 (free-form must not advance)", got)
 	}
 }

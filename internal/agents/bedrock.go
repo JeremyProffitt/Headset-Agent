@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockagentruntime"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockagentruntime/document"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockagentruntime/types"
 	"github.com/headset-support-agent/internal/logging"
 	"github.com/headset-support-agent/internal/models"
@@ -19,6 +21,7 @@ import (
 // It exists so the real SDK client can be swapped for a test mock.
 type agentRuntimeAPI interface {
 	InvokeAgent(ctx context.Context, params *bedrockagentruntime.InvokeAgentInput, optFns ...func(*bedrockagentruntime.Options)) (*bedrockagentruntime.InvokeAgentOutput, error)
+	RetrieveAndGenerate(ctx context.Context, params *bedrockagentruntime.RetrieveAndGenerateInput, optFns ...func(*bedrockagentruntime.Options)) (*bedrockagentruntime.RetrieveAndGenerateOutput, error)
 }
 
 // BedrockClient wraps the Bedrock Agent Runtime client
@@ -105,6 +108,196 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 		SessionID:  input.SessionID,
 		Metadata:   sessionAttrs,
 	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// A-08: Lambda-side knowledge-base retrieval (RetrieveAndGenerate)
+// ---------------------------------------------------------------------------
+
+// kbNumberOfResults is how many source chunks the vector search returns for
+// generation. The KB docs are retrieval-sized splits (A-01), so a handful of
+// chunks comfortably covers a single question without flooding the prompt.
+const kbNumberOfResults = 6
+
+// RetrieveAndGenerateRequest contains parameters for a KB-grounded answer.
+type RetrieveAndGenerateRequest struct {
+	// KnowledgeBaseID is the Bedrock Knowledge Base to query (required).
+	KnowledgeBaseID string
+	// ModelID is the foundation model ID, inference-profile ID, or full ARN
+	// used for generation (required) — e.g. BEDROCK_MODEL_SUPERVISOR.
+	ModelID string
+	// Query is the user's question (required).
+	Query string
+	// Persona styles the generated answer (optional).
+	Persona *models.Persona
+	// Filters are optional metadata equality filters applied to the vector
+	// search (e.g. tree_id, brand, connection_type — the keys written by the
+	// KB ingestion sidecars). Multiple entries are ANDed. Nil/empty = none.
+	Filters map[string]string
+}
+
+// KBAnswer is a generated, KB-grounded answer plus best-effort citations.
+type KBAnswer struct {
+	// Text is the generated answer.
+	Text string
+	// Citations lists the distinct source URIs the answer was grounded in
+	// (best effort — empty when the service returns no references).
+	Citations []string
+}
+
+// RetrieveAndGenerate queries the knowledge base and generates a grounded
+// answer with the given model. The generation prompt template (see
+// groundedPromptTemplate) enforces that the model answers ONLY from the
+// retrieved results, admits when the KB lacks the answer (offering
+// escalation), and speaks concisely in the caller's persona tone.
+func (c *BedrockClient) RetrieveAndGenerate(ctx context.Context, req RetrieveAndGenerateRequest) (*KBAnswer, error) {
+	if req.KnowledgeBaseID == "" {
+		return nil, fmt.Errorf("knowledge base id is required")
+	}
+	if req.ModelID == "" {
+		return nil, fmt.Errorf("model id is required")
+	}
+	if strings.TrimSpace(req.Query) == "" {
+		return nil, fmt.Errorf("query is required")
+	}
+
+	// Same Lambda-budget timeout policy as InvokeAgent.
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+
+	slog.Info("retrieve-and-generate against knowledge base",
+		slog.String("kb_id", req.KnowledgeBaseID),
+		slog.String("model", req.ModelID),
+		slog.Int("filter_count", len(req.Filters)),
+	)
+	slog.Debug("retrieve-and-generate query",
+		slog.String("query_preview", logging.Truncate(req.Query, 80)),
+	)
+
+	out, err := c.client.RetrieveAndGenerate(ctx, &bedrockagentruntime.RetrieveAndGenerateInput{
+		Input: &types.RetrieveAndGenerateInput{Text: aws.String(req.Query)},
+		RetrieveAndGenerateConfiguration: &types.RetrieveAndGenerateConfiguration{
+			Type: types.RetrieveAndGenerateTypeKnowledgeBase,
+			KnowledgeBaseConfiguration: &types.KnowledgeBaseRetrieveAndGenerateConfiguration{
+				KnowledgeBaseId: aws.String(req.KnowledgeBaseID),
+				ModelArn:        aws.String(req.ModelID),
+				GenerationConfiguration: &types.GenerationConfiguration{
+					PromptTemplate: &types.PromptTemplate{
+						TextPromptTemplate: aws.String(groundedPromptTemplate(req.Persona)),
+					},
+				},
+				RetrievalConfiguration: &types.KnowledgeBaseRetrievalConfiguration{
+					VectorSearchConfiguration: &types.KnowledgeBaseVectorSearchConfiguration{
+						NumberOfResults: aws.Int32(kbNumberOfResults),
+						Filter:          buildRetrievalFilter(req.Filters),
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			slog.Error("retrieve-and-generate timed out", slog.String("kb_id", req.KnowledgeBaseID))
+			return nil, fmt.Errorf("knowledge base retrieval timed out")
+		}
+		slog.Error("error calling retrieve-and-generate",
+			slog.String("kb_id", req.KnowledgeBaseID),
+			slog.String("error", err.Error()),
+		)
+		return nil, err
+	}
+
+	if out == nil || out.Output == nil || out.Output.Text == nil || strings.TrimSpace(*out.Output.Text) == "" {
+		slog.Warn("empty retrieve-and-generate response", slog.String("kb_id", req.KnowledgeBaseID))
+		return nil, fmt.Errorf("empty response from knowledge base retrieval")
+	}
+
+	answer := &KBAnswer{
+		Text:      strings.TrimSpace(*out.Output.Text),
+		Citations: citationURIs(out.Citations),
+	}
+	slog.Debug("retrieve-and-generate answer",
+		slog.String("answer_preview", logging.Truncate(answer.Text, 200)),
+		slog.Int("citation_count", len(answer.Citations)),
+	)
+	return answer, nil
+}
+
+// groundedPromptTemplate builds the generation prompt template for
+// RetrieveAndGenerate. The $search_results$ placeholder is required by the
+// service and is replaced with the retrieved KB chunks; the user's query is
+// supplied separately. The rules pin the model to the retrieved results so it
+// never invents troubleshooting steps.
+func groundedPromptTemplate(p *models.Persona) string {
+	name := "a friendly headset support assistant"
+	style := "warm, patient, and conversational"
+	if p != nil {
+		if p.DisplayName != "" {
+			name = p.DisplayName + ", a friendly headset support assistant"
+		}
+		if p.Personality.SpeechStyle != "" {
+			style = p.Personality.SpeechStyle
+		}
+	}
+	return "You are " + name + " helping a caller troubleshoot their headset. " +
+		"Your speaking style is " + style + ".\n\n" +
+		"Here are the headset support knowledge-base search results:\n" +
+		"$search_results$\n\n" +
+		"Follow these rules strictly when answering the caller's question:\n" +
+		"- Answer ONLY from the search results above. Never invent steps, settings, menu paths, or product details that are not in the results.\n" +
+		"- If the search results do not contain the answer, say plainly that you don't have that information in your guides and offer to connect the caller to a human specialist. Do not guess.\n" +
+		"- Be concise: two to three short sentences, phrased so they can be read aloud naturally.\n" +
+		"- Respond in plain conversational text only — no markdown, bullet lists, headings, or citation markers.\n" +
+		"- Never ask for or accept payment or card details."
+}
+
+// buildRetrievalFilter converts a flat key/value map into a Bedrock metadata
+// retrieval filter: nil for no filters, a single equals condition for one
+// entry, and an andAll of equals conditions for several. Keys are sorted so
+// the constructed filter is deterministic.
+func buildRetrievalFilter(filters map[string]string) types.RetrievalFilter {
+	if len(filters) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(filters))
+	for k := range filters {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	conds := make([]types.RetrievalFilter, 0, len(keys))
+	for _, k := range keys {
+		conds = append(conds, &types.RetrievalFilterMemberEquals{
+			Value: types.FilterAttribute{
+				Key:   aws.String(k),
+				Value: document.NewLazyDocument(filters[k]),
+			},
+		})
+	}
+	if len(conds) == 1 {
+		return conds[0]
+	}
+	return &types.RetrievalFilterMemberAndAll{Value: conds}
+}
+
+// citationURIs extracts the distinct S3 source URIs from the citations of a
+// RetrieveAndGenerate response (best effort — non-S3 locations are skipped).
+func citationURIs(citations []types.Citation) []string {
+	var uris []string
+	seen := make(map[string]bool)
+	for _, c := range citations {
+		for _, ref := range c.RetrievedReferences {
+			if ref.Location == nil || ref.Location.S3Location == nil || ref.Location.S3Location.Uri == nil {
+				continue
+			}
+			u := *ref.Location.S3Location.Uri
+			if u != "" && !seen[u] {
+				seen[u] = true
+				uris = append(uris, u)
+			}
+		}
+	}
+	return uris
 }
 
 // processResponseStream reads all events from a ResponseStreamReader, accumulates

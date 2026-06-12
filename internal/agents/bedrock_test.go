@@ -16,10 +16,28 @@ import (
 // ---------------------------------------------------------------------------
 
 // mockAgentRuntime satisfies agentRuntimeAPI and lets tests control what
-// InvokeAgent returns.
+// InvokeAgent / RetrieveAndGenerate return.
 type mockAgentRuntime struct {
 	// invokeErr is the error (if any) returned by InvokeAgent.
 	invokeErr error
+	// ragOutput / ragErr control RetrieveAndGenerate.
+	ragOutput *bedrockagentruntime.RetrieveAndGenerateOutput
+	ragErr    error
+	// lastRAGInput captures the most recent RetrieveAndGenerate request so
+	// tests can assert on the constructed configuration.
+	lastRAGInput *bedrockagentruntime.RetrieveAndGenerateInput
+}
+
+func (m *mockAgentRuntime) RetrieveAndGenerate(
+	_ context.Context,
+	params *bedrockagentruntime.RetrieveAndGenerateInput,
+	_ ...func(*bedrockagentruntime.Options),
+) (*bedrockagentruntime.RetrieveAndGenerateOutput, error) {
+	m.lastRAGInput = params
+	if m.ragErr != nil {
+		return nil, m.ragErr
+	}
+	return m.ragOutput, nil
 }
 
 func (m *mockAgentRuntime) InvokeAgent(
@@ -395,6 +413,220 @@ func TestInvokeAgent_DeadlineExceededError(t *testing.T) {
 	msg := err.Error()
 	if msg != "agent invocation timed out" && !strings.Contains(msg, "deadline") && !strings.Contains(msg, "DeadlineExceeded") {
 		t.Errorf("unexpected error message: %q", msg)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: RetrieveAndGenerate (A-08)
+// ---------------------------------------------------------------------------
+
+// ragSuccessOutput builds a canned RetrieveAndGenerate response with one
+// S3-cited source.
+func ragSuccessOutput(text, uri string) *bedrockagentruntime.RetrieveAndGenerateOutput {
+	return &bedrockagentruntime.RetrieveAndGenerateOutput{
+		Output:    &types.RetrieveAndGenerateOutput{Text: &text},
+		SessionId: strPtr("rag-session"),
+		Citations: []types.Citation{
+			{
+				RetrievedReferences: []types.RetrievedReference{
+					{Location: &types.RetrievalResultLocation{
+						Type:       types.RetrievalResultLocationTypeS3,
+						S3Location: &types.RetrievalResultS3Location{Uri: &uri},
+					}},
+					// Duplicate URI — must be de-duplicated.
+					{Location: &types.RetrievalResultLocation{
+						Type:       types.RetrievalResultLocationTypeS3,
+						S3Location: &types.RetrievalResultS3Location{Uri: &uri},
+					}},
+					// No location — must be skipped, not panic.
+					{},
+				},
+			},
+		},
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
+func TestRetrieveAndGenerate_Success(t *testing.T) {
+	mock := &mockAgentRuntime{
+		ragOutput: ragSuccessOutput(
+			"  Plug the headset into a direct USB port on the computer.  ",
+			"s3://kb-bucket/trees/preflight-checklist.md",
+		),
+	}
+	c := newTestClient(mock)
+
+	p := &models.Persona{
+		PersonaID:   "tangerine",
+		DisplayName: "Tangerine",
+		Personality: models.Personality{SpeechStyle: "warm and upbeat"},
+	}
+
+	got, err := c.RetrieveAndGenerate(context.Background(), RetrieveAndGenerateRequest{
+		KnowledgeBaseID: "KB123",
+		ModelID:         "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+		Query:           "my headset has no sound",
+		Persona:         p,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Text != "Plug the headset into a direct USB port on the computer." {
+		t.Errorf("unexpected answer text: %q", got.Text)
+	}
+	if len(got.Citations) != 1 || got.Citations[0] != "s3://kb-bucket/trees/preflight-checklist.md" {
+		t.Errorf("unexpected citations (want 1 de-duplicated URI): %v", got.Citations)
+	}
+
+	// Assert the constructed request: KB id, model, KNOWLEDGE_BASE type, and
+	// a grounding prompt template containing the mandatory placeholder plus
+	// the persona name/style and the results-only rule.
+	in := mock.lastRAGInput
+	if in == nil {
+		t.Fatal("RetrieveAndGenerate was not called on the runtime client")
+	}
+	if *in.Input.Text != "my headset has no sound" {
+		t.Errorf("query not passed through: %q", *in.Input.Text)
+	}
+	cfg := in.RetrieveAndGenerateConfiguration
+	if cfg.Type != types.RetrieveAndGenerateTypeKnowledgeBase {
+		t.Errorf("type=%q, want KNOWLEDGE_BASE", cfg.Type)
+	}
+	kb := cfg.KnowledgeBaseConfiguration
+	if *kb.KnowledgeBaseId != "KB123" {
+		t.Errorf("kb id=%q, want KB123", *kb.KnowledgeBaseId)
+	}
+	if *kb.ModelArn != "us.anthropic.claude-3-5-sonnet-20241022-v2:0" {
+		t.Errorf("model=%q", *kb.ModelArn)
+	}
+	tpl := *kb.GenerationConfiguration.PromptTemplate.TextPromptTemplate
+	for _, want := range []string{"$search_results$", "Tangerine", "warm and upbeat", "ONLY from the search results", "human specialist"} {
+		if !strings.Contains(tpl, want) {
+			t.Errorf("prompt template missing %q", want)
+		}
+	}
+	// No filters were passed — the filter must be nil.
+	if kb.RetrievalConfiguration.VectorSearchConfiguration.Filter != nil {
+		t.Error("expected nil retrieval filter when no filters are passed")
+	}
+}
+
+func TestRetrieveAndGenerate_Error(t *testing.T) {
+	sentinel := errors.New("kb unavailable")
+	c := newTestClient(&mockAgentRuntime{ragErr: sentinel})
+
+	_, err := c.RetrieveAndGenerate(context.Background(), RetrieveAndGenerateRequest{
+		KnowledgeBaseID: "KB123",
+		ModelID:         "model-1",
+		Query:           "no sound",
+	})
+	if !errors.Is(err, sentinel) {
+		t.Errorf("expected sentinel error, got: %v", err)
+	}
+}
+
+func TestRetrieveAndGenerate_EmptyOutputIsError(t *testing.T) {
+	// A response with no Output text must be surfaced as an error so callers
+	// fall back to the graceful message instead of speaking an empty string.
+	c := newTestClient(&mockAgentRuntime{
+		ragOutput: &bedrockagentruntime.RetrieveAndGenerateOutput{},
+	})
+
+	_, err := c.RetrieveAndGenerate(context.Background(), RetrieveAndGenerateRequest{
+		KnowledgeBaseID: "KB123",
+		ModelID:         "model-1",
+		Query:           "no sound",
+	})
+	if err == nil {
+		t.Fatal("expected error for empty output, got nil")
+	}
+}
+
+func TestRetrieveAndGenerate_ValidationErrors(t *testing.T) {
+	c := newTestClient(&mockAgentRuntime{})
+	cases := []struct {
+		name string
+		req  RetrieveAndGenerateRequest
+	}{
+		{"missing kb id", RetrieveAndGenerateRequest{ModelID: "m", Query: "q"}},
+		{"missing model", RetrieveAndGenerateRequest{KnowledgeBaseID: "kb", Query: "q"}},
+		{"missing query", RetrieveAndGenerateRequest{KnowledgeBaseID: "kb", ModelID: "m", Query: "  "}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := c.RetrieveAndGenerate(context.Background(), tc.req); err == nil {
+				t.Error("expected validation error, got nil")
+			}
+		})
+	}
+}
+
+func TestRetrieveAndGenerate_SingleFilterIsEquals(t *testing.T) {
+	mock := &mockAgentRuntime{ragOutput: ragSuccessOutput("answer", "s3://kb/doc.md")}
+	c := newTestClient(mock)
+
+	_, err := c.RetrieveAndGenerate(context.Background(), RetrieveAndGenerateRequest{
+		KnowledgeBaseID: "KB123",
+		ModelID:         "model-1",
+		Query:           "mic not working",
+		Filters:         map[string]string{"tree_id": "tree-2"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f := mock.lastRAGInput.RetrieveAndGenerateConfiguration.KnowledgeBaseConfiguration.
+		RetrievalConfiguration.VectorSearchConfiguration.Filter
+	eq, ok := f.(*types.RetrievalFilterMemberEquals)
+	if !ok {
+		t.Fatalf("expected single equals filter, got %T", f)
+	}
+	if *eq.Value.Key != "tree_id" {
+		t.Errorf("filter key=%q, want tree_id", *eq.Value.Key)
+	}
+}
+
+func TestRetrieveAndGenerate_MultipleFiltersAreAndAll(t *testing.T) {
+	mock := &mockAgentRuntime{ragOutput: ragSuccessOutput("answer", "s3://kb/doc.md")}
+	c := newTestClient(mock)
+
+	_, err := c.RetrieveAndGenerate(context.Background(), RetrieveAndGenerateRequest{
+		KnowledgeBaseID: "KB123",
+		ModelID:         "model-1",
+		Query:           "pairing fails",
+		Filters: map[string]string{
+			"connection_type": "bluetooth",
+			"brand":           "jabra",
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	f := mock.lastRAGInput.RetrieveAndGenerateConfiguration.KnowledgeBaseConfiguration.
+		RetrievalConfiguration.VectorSearchConfiguration.Filter
+	andAll, ok := f.(*types.RetrievalFilterMemberAndAll)
+	if !ok {
+		t.Fatalf("expected andAll filter, got %T", f)
+	}
+	if len(andAll.Value) != 2 {
+		t.Fatalf("expected 2 conditions, got %d", len(andAll.Value))
+	}
+	// Keys are sorted for determinism: brand before connection_type.
+	first, ok := andAll.Value[0].(*types.RetrievalFilterMemberEquals)
+	if !ok {
+		t.Fatalf("expected equals condition, got %T", andAll.Value[0])
+	}
+	if *first.Value.Key != "brand" {
+		t.Errorf("first sorted key=%q, want brand", *first.Value.Key)
+	}
+}
+
+func TestGroundedPromptTemplate_NilPersonaHasDefaults(t *testing.T) {
+	tpl := groundedPromptTemplate(nil)
+	for _, want := range []string{"$search_results$", "friendly headset support assistant", "ONLY from the search results"} {
+		if !strings.Contains(tpl, want) {
+			t.Errorf("prompt template missing %q", want)
+		}
 	}
 }
 

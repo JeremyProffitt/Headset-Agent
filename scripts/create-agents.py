@@ -1,87 +1,68 @@
 #!/usr/bin/env python3
 """
-Create Bedrock Agents for Headset Support System
-Supports both Anthropic Claude and AWS native Llama models
+Create the Bedrock supervisor agent for the Headset Support System (A-07).
+
+Single-agent topology: earlier revisions created three additional sub-agents
+(DiagnosticAgent / PlatformAgent / EscalationAgent) that were never wired into
+a collaborator hierarchy — they sat orphaned while the Lambda only ever
+invoked the supervisor. This script now:
+
+  1. deletes those orphaned sub-agents if they still exist,
+  2. creates/updates ONE supervisor agent,
+  3. associates the knowledge base (SSM /headset-agent/<env>/kb-id) with the
+     agent's DRAFT version,
+  4. prepares the agent and points the live alias at a freshly published
+     version (so the KB association is actually served),
+  5. stores supervisor-agent-id / supervisor-agent-alias in SSM (the same
+     parameters the lex-lambda reads), and
+  6. asserts exactly one prepared headset agent exists with the KB associated
+     and that the orphans are gone.
+
+Idempotent: find-before-create everywhere; running twice creates no dupes.
 """
 
 import argparse
 import boto3
-import json
-import time
 import sys
+import time
 from botocore.exceptions import ClientError
 
-# Agent configurations
-AGENTS = {
-    "supervisor": {
-        "name": "TroubleshootingOrchestrator",
-        "description": "Supervisor agent that orchestrates headset troubleshooting conversations using sub-agents",
-        "instruction": """You are a friendly headset troubleshooting supervisor. Your role is to:
+# The single agent this system uses. The Lambda answers primarily via direct
+# knowledge-base RetrieveAndGenerate (A-08); this agent is the legacy/backup
+# conversational path and is grounded in the same knowledge base.
+SUPERVISOR_AGENT = {
+    "name": "TroubleshootingOrchestrator",
+    "description": "Headset troubleshooting agent grounded in the headset support knowledge base",
+    "instruction": """You are a friendly headset troubleshooting agent. Your role is to:
 1. Greet users warmly and identify their headset issue
-2. Route diagnostic questions to the DiagnosticAgent
-3. Route platform/software questions to the PlatformAgent
-4. Detect escalation requests and route to EscalationAgent
-5. Maintain conversation context and persona consistency
+2. Answer questions using ONLY the associated headset support knowledge base — search it before answering
+3. Never invent troubleshooting steps, settings, or menu paths that are not in the knowledge base
+4. If the knowledge base does not cover the question, say so plainly and offer to connect the user to a human specialist
+5. Detect escalation requests and acknowledge them empathetically
+6. Maintain conversation context and persona consistency
 
-Always respond in a helpful, patient manner. Adapt your communication style based on the persona configuration provided in session attributes.""",
-        "model_type": "supervisor"
-    },
-    "diagnostic": {
-        "name": "DiagnosticAgent",
-        "description": "Sub-agent specialized in hardware diagnosis for USB, Bluetooth, and wireless headsets",
-        "instruction": """You are a hardware diagnostic specialist. Your role is to:
-1. Identify the headset connection type (USB, Bluetooth, DECT)
-2. Run through diagnostic steps for hardware issues
-3. Check physical connections and power status
-4. Verify device recognition in the operating system
-5. Test audio input and output functionality
-
-Be thorough but efficient. Ask one question at a time and wait for user response.""",
-        "model_type": "subagent"
-    },
-    "platform": {
-        "name": "PlatformAgent",
-        "description": "Sub-agent specialized in Windows and application configuration for headsets",
-        "instruction": """You are a platform configuration specialist. Your role is to:
-1. Guide users through Windows Sound Settings
-2. Help configure application-specific audio settings (Genesys Cloud, Teams, etc.)
-3. Troubleshoot driver issues in Device Manager
-4. Configure default audio devices
-5. Set up WebRTC and browser permissions
-
-Provide clear, step-by-step instructions. Reference specific Windows menu paths.""",
-        "model_type": "subagent"
-    },
-    "escalation": {
-        "name": "EscalationAgent",
-        "description": "Sub-agent that handles escalation to human agents",
-        "instruction": """You are an escalation coordinator. Your role is to:
-1. Acknowledge the user's request for human assistance
-2. Summarize the troubleshooting steps already attempted
-3. Collect any additional context needed for the human agent
-4. Prepare the handoff with all relevant information
-5. Reassure the user that help is on the way
-
-Be empathetic and efficient. The goal is a smooth transition to human support.""",
-        "model_type": "subagent"
-    }
+Always respond in a helpful, patient manner, in two to three short spoken-style
+sentences. Adapt your communication style based on the persona configuration
+provided in session attributes. Never ask for or accept payment or card details.""",
 }
 
-# Model configurations
+# Orphaned sub-agent base names from the old multi-agent topology. They are
+# deleted if found (idempotent: absent == already done).
+ORPHANED_AGENT_NAMES = ["DiagnosticAgent", "PlatformAgent", "EscalationAgent"]
+
+# Model configurations (supervisor only — sub-agents no longer exist).
 MODELS = {
     "anthropic": {
         "supervisor": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-        "subagent": "us.anthropic.claude-3-5-haiku-20241022-v1:0"
     },
     "llama": {
         "supervisor": "us.meta.llama3-3-70b-instruct-v1:0",
-        "subagent": "us.meta.llama3-2-11b-instruct-v1:0"
-    }
+    },
 }
 
 
 def get_bedrock_client(region):
-    """Create Bedrock client"""
+    """Create Bedrock agent (control plane) client"""
     return boto3.client('bedrock-agent', region_name=region)
 
 
@@ -106,8 +87,23 @@ def get_agent_role_arn(iam_client, environment):
         return None
 
 
+def get_kb_id(ssm_client, environment):
+    """Read the knowledge base ID from SSM (populated by CloudFormation)."""
+    param_name = f"/headset-agent/{environment}/kb-id"
+    try:
+        response = ssm_client.get_parameter(Name=param_name)
+        value = response['Parameter']['Value']
+        if not value or value == 'PLACEHOLDER':
+            print(f"ERROR: SSM parameter {param_name} has no usable value ({value!r})")
+            return None
+        return value
+    except ClientError as e:
+        print(f"ERROR: could not read SSM parameter {param_name}: {e}")
+        return None
+
+
 def check_agent_exists(client, agent_name):
-    """Check if an agent with the given name exists"""
+    """Check if an agent with the given name exists; return its ID or None"""
     try:
         paginator = client.get_paginator('list_agents')
         for page in paginator.paginate():
@@ -119,11 +115,42 @@ def check_agent_exists(client, agent_name):
     return None
 
 
-def create_agent(client, agent_config, role_arn, model_id, environment):
-    """Create or update a Bedrock agent"""
-    agent_name = f"{agent_config['name']}-{environment}"
+def delete_orphaned_agents(client, environment):
+    """Delete the legacy sub-agents from the old multi-agent topology.
 
-    # Check if agent already exists
+    Idempotent: agents that are already gone are skipped. Returns the list of
+    orphan names that still exist after the deletion attempts (empty = clean).
+    """
+    remaining = []
+    for base_name in ORPHANED_AGENT_NAMES:
+        agent_name = f"{base_name}-{environment}"
+        agent_id = check_agent_exists(client, agent_name)
+        if not agent_id:
+            print(f"Orphaned agent {agent_name}: not found (already deleted)")
+            continue
+        print(f"Deleting orphaned agent {agent_name} (ID: {agent_id})...")
+        try:
+            client.delete_agent(agentId=agent_id, skipResourceInUseCheck=True)
+        except ClientError as e:
+            print(f"  Error deleting {agent_name}: {e}")
+            remaining.append(agent_name)
+            continue
+        # Wait for the deletion to complete so the final assertion is accurate.
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if check_agent_exists(client, agent_name) is None:
+                print(f"  Deleted {agent_name}")
+                break
+            time.sleep(5)
+        else:
+            print(f"  Timeout waiting for {agent_name} deletion")
+            remaining.append(agent_name)
+    return remaining
+
+
+def create_or_update_agent(client, agent_config, role_arn, model_id, environment):
+    """Create the supervisor agent, or update it in place if it exists."""
+    agent_name = f"{agent_config['name']}-{environment}"
     existing_id = check_agent_exists(client, agent_name)
 
     if existing_id:
@@ -138,10 +165,9 @@ def create_agent(client, agent_config, role_arn, model_id, environment):
                 foundationModel=model_id,
                 idleSessionTTLInSeconds=600
             )
-            return existing_id
         except ClientError as e:
             print(f"Error updating agent: {e}")
-            return existing_id
+        return existing_id
 
     print(f"Creating agent: {agent_name}")
     try:
@@ -185,63 +211,143 @@ def wait_for_agent_ready(client, agent_id, target_states, timeout=120):
     return None
 
 
-def wait_for_agent(client, agent_id, timeout=120):
-    """Wait for agent to be in PREPARED or NOT_PREPARED state (legacy wrapper)"""
-    return wait_for_agent_ready(client, agent_id, ['PREPARED', 'NOT_PREPARED'], timeout)
+def kb_association_state(client, agent_id, kb_id):
+    """Return the knowledgeBaseState of the DRAFT association, or None."""
+    try:
+        paginator = client.get_paginator('list_agent_knowledge_bases')
+        for page in paginator.paginate(agentId=agent_id, agentVersion='DRAFT'):
+            for kb in page.get('agentKnowledgeBaseSummaries', []):
+                if kb['knowledgeBaseId'] == kb_id:
+                    return kb.get('knowledgeBaseState', 'ENABLED')
+    except ClientError as e:
+        print(f"Error listing agent knowledge bases: {e}")
+    return None
+
+
+def associate_knowledge_base(client, agent_id, kb_id):
+    """Associate (or re-enable) the knowledge base on the agent's DRAFT version.
+
+    Idempotent: an existing ENABLED association is left alone; a DISABLED one
+    is re-enabled; otherwise a new association is created. Returns True on
+    success.
+    """
+    description = ("Headset troubleshooting knowledge base — decision trees, "
+                   "brand guides, and platform/app configuration docs. "
+                   "Search it before answering any troubleshooting question.")
+    state = kb_association_state(client, agent_id, kb_id)
+    if state == 'ENABLED':
+        print(f"Knowledge base {kb_id} already associated and ENABLED")
+        return True
+    if state is not None:
+        print(f"Knowledge base {kb_id} associated but {state}; re-enabling...")
+        try:
+            client.update_agent_knowledge_base(
+                agentId=agent_id,
+                agentVersion='DRAFT',
+                knowledgeBaseId=kb_id,
+                description=description,
+                knowledgeBaseState='ENABLED'
+            )
+            return True
+        except ClientError as e:
+            print(f"Error re-enabling knowledge base association: {e}")
+            return False
+
+    print(f"Associating knowledge base {kb_id} with agent {agent_id}...")
+    try:
+        client.associate_agent_knowledge_base(
+            agentId=agent_id,
+            agentVersion='DRAFT',
+            knowledgeBaseId=kb_id,
+            description=description,
+            knowledgeBaseState='ENABLED'
+        )
+        return True
+    except ClientError as e:
+        print(f"Error associating knowledge base: {e}")
+        return False
 
 
 def prepare_agent(client, agent_id):
-    """Prepare an agent for deployment"""
-    # First wait for agent to exit Creating state
+    """Prepare the agent so the DRAFT changes (instruction + KB) take effect."""
     print(f"Waiting for agent {agent_id} to finish creating...")
-    ready_status = wait_for_agent_ready(client, agent_id, ['NOT_PREPARED', 'PREPARED', 'FAILED'], timeout=120)
+    ready_status = wait_for_agent_ready(
+        client, agent_id, ['NOT_PREPARED', 'PREPARED', 'FAILED'], timeout=120)
 
     if ready_status == 'FAILED':
         print(f"Agent {agent_id} is in FAILED state, cannot prepare")
         return 'FAILED'
-
-    if ready_status == 'PREPARED':
-        print(f"Agent {agent_id} is already prepared")
-        return 'PREPARED'
-
     if ready_status is None:
         print(f"Timeout waiting for agent {agent_id} to finish creating")
         return None
 
-    # Now prepare the agent
+    # Always (re-)prepare: the instruction and/or KB association may have
+    # changed on DRAFT even when the status still says PREPARED.
     print(f"Preparing agent {agent_id}...")
     try:
         client.prepare_agent(agentId=agent_id)
-        return wait_for_agent(client, agent_id)
+        return wait_for_agent_ready(client, agent_id, ['PREPARED'], timeout=120)
     except ClientError as e:
         print(f"Error preparing agent: {e}")
         return None
 
 
-def create_agent_alias(client, agent_id, alias_name, environment):
-    """Create or update an agent alias"""
+def ensure_agent_alias(client, agent_id, alias_name, environment):
+    """Create the live alias, or update it so a new version is published from
+    the freshly prepared DRAFT (update_agent_alias without an explicit routing
+    configuration publishes a new version). Returns the alias ID or None."""
     full_alias_name = f"{alias_name}-{environment}"
 
-    # Check for existing aliases
+    alias_id = None
     try:
         response = client.list_agent_aliases(agentId=agent_id)
         for alias in response.get('agentAliasSummaries', []):
             if alias['agentAliasName'] == full_alias_name:
-                print(f"Alias {full_alias_name} already exists")
-                return alias['agentAliasId']
-    except ClientError:
-        pass
-
-    print(f"Creating alias: {full_alias_name}")
-    try:
-        response = client.create_agent_alias(
-            agentId=agent_id,
-            agentAliasName=full_alias_name
-        )
-        return response['agentAlias']['agentAliasId']
+                alias_id = alias['agentAliasId']
+                break
     except ClientError as e:
-        print(f"Error creating alias: {e}")
-        return None
+        print(f"Error listing aliases: {e}")
+
+    if alias_id:
+        print(f"Alias {full_alias_name} exists ({alias_id}); publishing new version...")
+        try:
+            client.update_agent_alias(
+                agentId=agent_id,
+                agentAliasId=alias_id,
+                agentAliasName=full_alias_name
+            )
+        except ClientError as e:
+            print(f"Error updating alias {full_alias_name}: {e}")
+    else:
+        print(f"Creating alias: {full_alias_name}")
+        try:
+            response = client.create_agent_alias(
+                agentId=agent_id,
+                agentAliasName=full_alias_name
+            )
+            alias_id = response['agentAlias']['agentAliasId']
+        except ClientError as e:
+            print(f"Error creating alias: {e}")
+            return None
+
+    # Wait for the alias to finish updating/creating.
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        try:
+            response = client.get_agent_alias(agentId=agent_id, agentAliasId=alias_id)
+            status = response['agentAlias']['agentAliasStatus']
+            print(f"  Alias status: {status}")
+            if status == 'PREPARED':
+                return alias_id
+            if status == 'FAILED':
+                print(f"  Alias failed: {response['agentAlias'].get('failureReasons', 'Unknown')}")
+                return alias_id
+        except ClientError as e:
+            print(f"  Error checking alias status: {e}")
+        time.sleep(5)
+
+    print(f"Timeout waiting for alias {alias_id}")
+    return alias_id
 
 
 def store_ssm_parameter(ssm_client, name, value, description):
@@ -259,8 +365,46 @@ def store_ssm_parameter(ssm_client, name, value, description):
         print(f"Error storing SSM parameter {name}: {e}")
 
 
+def assert_single_prepared_agent(client, agent_id, kb_id, environment, orphans_remaining):
+    """Final invariant check: exactly one prepared headset agent, KB attached,
+    orphans gone. Returns True when everything holds."""
+    ok = True
+
+    try:
+        status = client.get_agent(agentId=agent_id)['agent']['agentStatus']
+    except ClientError as e:
+        print(f"ASSERT FAIL: could not read supervisor agent {agent_id}: {e}")
+        return False
+    if status != 'PREPARED':
+        print(f"ASSERT FAIL: supervisor agent status is {status}, want PREPARED")
+        ok = False
+    else:
+        print(f"ASSERT OK: supervisor agent {agent_id} is PREPARED")
+
+    state = kb_association_state(client, agent_id, kb_id)
+    if state != 'ENABLED':
+        print(f"ASSERT FAIL: knowledge base {kb_id} association state is {state}, want ENABLED")
+        ok = False
+    else:
+        print(f"ASSERT OK: knowledge base {kb_id} is associated and ENABLED")
+
+    if orphans_remaining:
+        print(f"ASSERT FAIL: orphaned sub-agents still present: {orphans_remaining}")
+        ok = False
+    else:
+        for base_name in ORPHANED_AGENT_NAMES:
+            agent_name = f"{base_name}-{environment}"
+            if check_agent_exists(client, agent_name):
+                print(f"ASSERT FAIL: orphaned agent {agent_name} still exists")
+                ok = False
+        if ok:
+            print("ASSERT OK: no orphaned sub-agents remain")
+
+    return ok
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Create Bedrock agents for Headset Support')
+    parser = argparse.ArgumentParser(description='Create the Bedrock supervisor agent for Headset Support')
     parser.add_argument('--environment', '-e', default='prod', choices=['prod'],
                         help='Deployment environment')
     parser.add_argument('--region', '-r', default='us-east-1', help='AWS region')
@@ -270,18 +414,21 @@ def main():
 
     args = parser.parse_args()
 
-    print(f"Creating Bedrock agents for environment: {args.environment}")
+    model_id = MODELS[args.model_provider]['supervisor']
+
+    print(f"Configuring Bedrock supervisor agent for environment: {args.environment}")
     print(f"Region: {args.region}")
-    print(f"Model provider: {args.model_provider}")
+    print(f"Model provider: {args.model_provider} ({model_id})")
 
     if args.dry_run:
         print("\n*** DRY RUN - No changes will be made ***\n")
-        for agent_key, agent_config in AGENTS.items():
-            model_type = agent_config['model_type']
-            model_id = MODELS[args.model_provider][model_type if model_type == 'supervisor' else 'subagent']
-            print(f"Would create agent: {agent_config['name']}-{args.environment}")
-            print(f"  Model: {model_id}")
-            print(f"  Description: {agent_config['description'][:50]}...")
+        print(f"Would delete orphaned sub-agents (if present): "
+              f"{[f'{n}-{args.environment}' for n in ORPHANED_AGENT_NAMES]}")
+        print(f"Would create/update agent: {SUPERVISOR_AGENT['name']}-{args.environment}")
+        print(f"  Model: {model_id}")
+        print(f"  Description: {SUPERVISOR_AGENT['description'][:60]}...")
+        print(f"Would associate knowledge base from SSM /headset-agent/{args.environment}/kb-id")
+        print("Would prepare the agent, publish the live alias, and update SSM parameters")
         return
 
     # Initialize clients
@@ -296,46 +443,70 @@ def main():
         sys.exit(1)
     print(f"Using role: {role_arn}")
 
-    # Create agents
-    agent_ids = {}
-    for agent_key, agent_config in AGENTS.items():
-        model_type = agent_config['model_type']
-        model_id = MODELS[args.model_provider][model_type if model_type == 'supervisor' else 'subagent']
+    # Knowledge base ID is mandatory: the agent must be KB-grounded (A-07).
+    kb_id = get_kb_id(ssm_client, args.environment)
+    if not kb_id:
+        print("ERROR: Knowledge base ID not available. Deploy infrastructure (KB stack) first.")
+        sys.exit(1)
+    print(f"Using knowledge base: {kb_id}")
 
-        agent_id = create_agent(bedrock_client, agent_config, role_arn, model_id, args.environment)
-        if agent_id:
-            agent_ids[agent_key] = agent_id
+    # 1. Remove the orphaned sub-agents from the old multi-agent topology.
+    orphans_remaining = delete_orphaned_agents(bedrock_client, args.environment)
 
-            # Prepare the agent
-            status = prepare_agent(bedrock_client, agent_id)
-            if status != 'PREPARED':
-                print(f"Warning: Agent {agent_key} is not prepared (status: {status})")
+    # 2. Create/update the single supervisor agent.
+    agent_id = create_or_update_agent(
+        bedrock_client, SUPERVISOR_AGENT, role_arn, model_id, args.environment)
+    if not agent_id:
+        print("ERROR: Could not create or update the supervisor agent.")
+        sys.exit(1)
 
-    # Create aliases and store in SSM
-    for agent_key, agent_id in agent_ids.items():
-        alias_id = create_agent_alias(bedrock_client, agent_id, "live", args.environment)
+    # The agent must exist (not CREATING) before the KB can be associated.
+    if wait_for_agent_ready(bedrock_client, agent_id,
+                            ['NOT_PREPARED', 'PREPARED'], timeout=120) is None:
+        print("ERROR: Supervisor agent never became ready for configuration.")
+        sys.exit(1)
 
-        if agent_key == "supervisor":
-            # Store supervisor agent info in SSM
-            store_ssm_parameter(
-                ssm_client,
-                f"/headset-agent/{args.environment}/supervisor-agent-id",
-                agent_id,
-                "Bedrock Supervisor Agent ID"
-            )
-            if alias_id:
-                store_ssm_parameter(
-                    ssm_client,
-                    f"/headset-agent/{args.environment}/supervisor-agent-alias",
-                    alias_id,
-                    "Bedrock Supervisor Agent Alias ID"
-                )
-            else:
-                print("Warning: Skipping alias SSM parameter - alias was not created")
+    # 3. Associate the knowledge base with DRAFT before preparing so the
+    #    prepared version serves it.
+    if not associate_knowledge_base(bedrock_client, agent_id, kb_id):
+        print("ERROR: Could not associate the knowledge base with the agent.")
+        sys.exit(1)
 
-    print("\n=== Agent Creation Complete ===")
-    for agent_key, agent_id in agent_ids.items():
-        print(f"  {agent_key}: {agent_id}")
+    # 4. Prepare and publish via the live alias.
+    status = prepare_agent(bedrock_client, agent_id)
+    if status != 'PREPARED':
+        print(f"ERROR: Supervisor agent is not prepared (status: {status})")
+        sys.exit(1)
+
+    alias_id = ensure_agent_alias(bedrock_client, agent_id, "live", args.environment)
+
+    # 5. Store the parameters the lex-lambda reads.
+    store_ssm_parameter(
+        ssm_client,
+        f"/headset-agent/{args.environment}/supervisor-agent-id",
+        agent_id,
+        "Bedrock Supervisor Agent ID"
+    )
+    if alias_id:
+        store_ssm_parameter(
+            ssm_client,
+            f"/headset-agent/{args.environment}/supervisor-agent-alias",
+            alias_id,
+            "Bedrock Supervisor Agent Alias ID"
+        )
+    else:
+        print("ERROR: Alias was not created — SSM alias parameter left untouched.")
+        sys.exit(1)
+
+    # 6. Assert the final topology: one prepared agent, KB attached, no orphans.
+    print("\n=== Verifying final topology ===")
+    if not assert_single_prepared_agent(bedrock_client, agent_id, kb_id,
+                                        args.environment, orphans_remaining):
+        print("ERROR: Final topology assertion failed.")
+        sys.exit(1)
+
+    print("\n=== Agent Configuration Complete ===")
+    print(f"  supervisor: {agent_id} (alias: {alias_id}, knowledge base: {kb_id})")
 
 
 if __name__ == '__main__':

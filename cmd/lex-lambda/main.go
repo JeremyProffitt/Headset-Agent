@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -28,10 +29,13 @@ type sessionStorer interface {
 	Save(ctx context.Context, sess *models.Session) error
 }
 
-// agentInvoker is the interface the handler uses to call the Bedrock agent.
-// The real *agents.BedrockClient satisfies it; tests inject a stub.
+// agentInvoker is the interface the handler uses to call Bedrock: InvokeAgent
+// for the legacy supervisor-agent path, RetrieveAndGenerate for the A-08
+// Lambda-side knowledge-base retrieval path. The real *agents.BedrockClient
+// satisfies it; tests inject a stub.
 type agentInvoker interface {
 	InvokeAgent(ctx context.Context, input agents.InvokeAgentInput) (*models.AgentResponse, error)
+	RetrieveAndGenerate(ctx context.Context, req agents.RetrieveAndGenerateRequest) (*agents.KBAnswer, error)
 }
 
 // personaLoaderI is the interface the handler uses to load a persona.
@@ -162,6 +166,20 @@ func init() {
 		sessionTableName = "HeadsetSupportSessions"
 	}
 	sessStore = session.NewStore(cfg, sessionTableName)
+}
+
+// kbConfig returns the knowledge-base ID and generation model from the
+// environment (template.yaml sets both on the function). An empty KB_ID
+// disables the A-08 Lambda-side retrieval path and the handlers fall back to
+// the legacy supervisor agent (InvokeAgent).
+func kbConfig() (kbID, modelID string) {
+	kbID = os.Getenv("KB_ID")
+	modelID = os.Getenv("BEDROCK_MODEL_SUPERVISOR")
+	if modelID == "" {
+		// Mirror the template.yaml BedrockModelSupervisor default.
+		modelID = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+	}
+	return kbID, modelID
 }
 
 // loadAgentConfig reads agent configuration from SSM Parameter Store
@@ -399,18 +417,38 @@ func handleAPIRequest(ctx context.Context, request events.APIGatewayV2HTTPReques
 		}, nil
 	}
 
-	// Load supervisor agent configuration from SSM
-	agentID, agentAlias := loadAgentConfig(ctx)
-
 	var responseMessage string
-	if agentID == "" || agentID == "PLACEHOLDER" || agentAlias == "" || agentAlias == "PLACEHOLDER" {
+	if kbID, modelID := kbConfig(); kbID != "" {
+		// A-08: Lambda-side retrieval — answer directly from the knowledge
+		// base instead of depending on the supervisor agent.
+		answer, ragErr := agentClient.RetrieveAndGenerate(ctx, agents.RetrieveAndGenerateRequest{
+			KnowledgeBaseID: kbID,
+			ModelID:         modelID,
+			Query:           chatReq.InputTranscript,
+			Persona:         p,
+		})
+		if ragErr != nil || answer == nil || strings.TrimSpace(answer.Text) == "" {
+			if ragErr != nil {
+				slog.Error("error retrieving KB-grounded answer",
+					slog.String("session_id", chatReq.SessionID),
+					slog.String("error", ragErr.Error()),
+				)
+			} else {
+				slog.Warn("empty KB-grounded answer", slog.String("session_id", chatReq.SessionID))
+			}
+			responseMessage = "I'm having a bit of trouble connecting. Let me try that again."
+		} else {
+			responseMessage = answer.Text
+		}
+	} else if agentID, agentAlias := loadAgentConfig(ctx); agentID == "" || agentID == "PLACEHOLDER" || agentAlias == "" || agentAlias == "PLACEHOLDER" {
+		// No KB and no supervisor agent configured yet.
 		slog.Warn("supervisor agent not configured",
 			slog.String("agent_id", agentID),
 			slog.String("alias_id", agentAlias),
 		)
 		responseMessage = "Hello! I'm setting up right now. The system is being configured. Please try again in a few minutes."
 	} else {
-		// Invoke Bedrock supervisor agent
+		// Legacy fallback (KB_ID unset): invoke the Bedrock supervisor agent.
 		response, err := agentClient.InvokeAgent(ctx, agents.InvokeAgentInput{
 			AgentID:      agentID,
 			AgentAliasID: agentAlias,
@@ -592,6 +630,27 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 	// unavailable. Falls through to the generic agent path when the turn is
 	// not a triage turn (no symptom classified yet, or the flow ended).
 	freeForm := func(ffCtx context.Context, sessionID, question string, kbDoc triage.KBDocRef) (string, error) {
+		// A-08: prefer Lambda-side KB retrieval — grounded, and independent of
+		// the supervisor agent's availability.
+		if kbID, modelID := kbConfig(); kbID != "" {
+			query := question
+			if kbDoc != "" {
+				// Bias retrieval toward the current step's KB doc; the
+				// grounding template still enforces results-only answers.
+				query = question + " (context: currently troubleshooting using " + string(kbDoc) + ")"
+			}
+			answer, err := agentClient.RetrieveAndGenerate(ffCtx, agents.RetrieveAndGenerateRequest{
+				KnowledgeBaseID: kbID,
+				ModelID:         modelID,
+				Query:           query,
+				Persona:         p,
+			})
+			if err != nil {
+				return "", err
+			}
+			return answer.Text, nil
+		}
+		// Legacy fallback (KB_ID unset): ask the supervisor agent.
 		aID, aAlias := loadAgentConfig(ffCtx)
 		if aID == "" || aID == "PLACEHOLDER" || aAlias == "" || aAlias == "PLACEHOLDER" {
 			return "", errors.New("supervisor agent not configured")
@@ -621,7 +680,42 @@ func handleLexRequest(ctx context.Context, event LexV2Event) (handlers.LexV2Resp
 		return resp, nil
 	}
 
-	// Load supervisor agent configuration from SSM
+	// A-08: generic (non-triage) voice turns are KB-grounded too when the
+	// knowledge base is configured. InvokeAgent remains the fallback only
+	// when KB_ID is empty.
+	if kbID, modelID := kbConfig(); kbID != "" {
+		slog.Info("retrieving KB-grounded answer for lex turn",
+			slog.String("session_id", event.SessionID),
+		)
+		slog.Debug("lex turn transcript",
+			slog.String("session_id", event.SessionID),
+			slog.String("transcript", logging.Truncate(transcript, 80)),
+		)
+		answer, ragErr := agentClient.RetrieveAndGenerate(ctx, agents.RetrieveAndGenerateRequest{
+			KnowledgeBaseID: kbID,
+			ModelID:         modelID,
+			Query:           transcript,
+			Persona:         p,
+		})
+		if ragErr != nil || answer == nil || strings.TrimSpace(answer.Text) == "" {
+			if ragErr != nil {
+				slog.Error("error retrieving KB-grounded answer",
+					slog.String("session_id", event.SessionID),
+					slog.String("error", ragErr.Error()),
+				)
+			} else {
+				slog.Warn("empty KB-grounded answer", slog.String("session_id", event.SessionID))
+			}
+			resp := handlers.BuildErrorResponse(p, "I'm having a bit of trouble connecting. Let me try that again.")
+			saveSession(ctx, sess, event.SessionState.SessionAttributes)
+			return resp, nil
+		}
+		resp := handlers.BuildSuccessResponse(p, answer.Text, event.SessionState.SessionAttributes)
+		saveSession(ctx, sess, event.SessionState.SessionAttributes)
+		return resp, nil
+	}
+
+	// Legacy fallback (KB_ID unset): load supervisor agent configuration from SSM
 	agentID, agentAlias := loadAgentConfig(ctx)
 
 	if agentID == "" || agentID == "PLACEHOLDER" || agentAlias == "" || agentAlias == "PLACEHOLDER" {
