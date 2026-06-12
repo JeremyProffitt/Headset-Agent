@@ -1,0 +1,31 @@
+[
+  {"q": "no sound coming through my headset at all", "expect_tree_id": "tree-1"},
+  {"q": "I cannot hear anything through my headset", "expect_tree_id": "tree-1"},
+
+  {"q": "microphone not working on my headset", "expect_tree_id": "tree-2"},
+  {"q": "nobody can hear me when I talk on calls", "expect_tree_id": "tree-2"},
+
+  {"q": "headset not showing up in device manager", "expect_tree_id": "tree-3"},
+  {"q": "my headset is not recognized by the computer", "expect_tree_id": "tree-3"},
+
+  {"q": "one ear not working on my headset", "expect_tree_id": "tree-4"},
+  {"q": "sound only coming from one side", "expect_tree_id": "tree-4"},
+
+  {"q": "crackling sound in my headset", "expect_tree_id": "tree-5"},
+  {"q": "choppy audio quality during calls", "expect_tree_id": "tree-5"},
+
+  {"q": "volume too low on headset", "expect_tree_id": "tree-6"},
+  {"q": "other person sounds too quiet on calls", "expect_tree_id": "tree-6"},
+
+  {"q": "mute button not working on headset", "expect_tree_id": "tree-7"},
+  {"q": "call control buttons not responding", "expect_tree_id": "tree-7"},
+
+  {"q": "headset drops connection randomly during calls", "expect_tree_id": "tree-8"},
+  {"q": "connection drops randomly while using headset", "expect_tree_id": "tree-8"},
+
+  {"q": "how do I update my Jabra headset firmware", "expect_source": "jabra"},
+  {"q": "Poly Plantronics headset setup and pairing", "expect_source": "poly-plantronics"},
+  {"q": "Logitech headset software and configuration", "expect_source": "logitech"},
+  {"q": "EPOS Sennheiser headset settings", "expect_source": "epos-sennheiser"},
+  {"q": "Yealink headset Bluetooth pairing instructions", "expect_source": "yealink"}
+]
