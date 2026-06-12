@@ -53,7 +53,10 @@ ORPHANED_AGENT_NAMES = ["DiagnosticAgent", "PlatformAgent", "EscalationAgent"]
 # Model configurations (supervisor only — sub-agents no longer exist).
 MODELS = {
     "anthropic": {
-        "supervisor": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        # claude-3-5-sonnet-20241022-v2:0 is END-OF-LIFE (retired) — every invoke
+        # returned ResourceNotFoundException. Use the current Sonnet 4.6 profile
+        # (verified invokable in this account/region).
+        "supervisor": "us.anthropic.claude-sonnet-4-6",
     },
     "llama": {
         "supervisor": "us.meta.llama3-3-70b-instruct-v1:0",

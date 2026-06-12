@@ -1,8 +1,12 @@
 # AWS Deployment Policy
 **CRITICAL: All AWS infrastructure and code changes MUST be deployed via GitHub Actions pipelines.**
 
-### Local AWS CLI Warning
-**IMPORTANT: The AWS CLI on this computer is configured for a DIFFERENT AWS account than the GitHub Actions pipeline deploys to.** Do not use local AWS CLI queries to check deployment status or resource state - the results will be from the wrong account.
+### Local AWS CLI — ALWAYS use `--profile paul`
+**IMPORTANT: For EVERY local AWS CLI call, pass `--profile paul`.** The `paul` profile targets the deployment account (`231545823618`, the account the GitHub Actions pipeline deploys to). The **default** profile is a DIFFERENT account (`759775734231`) and will give wrong/empty results — never use it for this project.
+
+- Read-only diagnostics against the deploy account are fine and encouraged with `--profile paul` (e.g. `aws connect ... --profile paul --region us-east-1`, CloudWatch logs, `describe-stack-events`, Bedrock model checks).
+- On Git Bash (Windows), prefix commands with `export MSYS_NO_PATHCONV=1` so `/aws/...` log-group names and ARNs aren't mangled into Windows paths.
+- This does NOT change the deploy policy below: infrastructure changes still go through the GitHub Actions pipeline, never `sam deploy`/`aws cloudformation deploy` from local. `--profile paul` is for **inspection/diagnostics** and explicitly-authorized operational one-offs (e.g. the user asked you to claim/release a phone number).
 
 ### Prohibited Actions
 - **NEVER** use AWS CLI directly to deploy, update, or modify infrastructure

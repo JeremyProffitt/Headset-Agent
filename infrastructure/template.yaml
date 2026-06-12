@@ -42,12 +42,12 @@ Parameters:
 
   BedrockModelSupervisor:
     Type: String
-    Default: us.anthropic.claude-3-5-sonnet-20241022-v2:0
+    Default: us.anthropic.claude-sonnet-4-6
     Description: Inference profile for supervisor agent
 
   BedrockModelSubagent:
     Type: String
-    Default: us.anthropic.claude-3-5-haiku-20241022-v1:0
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
     Description: Inference profile for sub-agents (cost optimized)
 
   LogLevel:
@@ -1437,7 +1437,7 @@ Resources:
       MetricName: InvocationServerErrors
       Dimensions:
         - Name: ModelId
-          Value: anthropic.claude-3-5-sonnet-20241022-v2:0
+          Value: anthropic.claude-sonnet-4-6
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -1456,7 +1456,7 @@ Resources:
       MetricName: InvocationThrottles
       Dimensions:
         - Name: ModelId
-          Value: anthropic.claude-3-5-sonnet-20241022-v2:0
+          Value: anthropic.claude-sonnet-4-6
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
