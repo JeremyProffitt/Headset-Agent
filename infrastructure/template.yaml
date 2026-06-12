@@ -1136,7 +1136,7 @@ Resources:
     Type: AWS::Connect::Instance
     Condition: CreateConnectInstance
     Properties:
-      InstanceAlias: "headset"
+      InstanceAlias: !Sub "headset-${AWS::AccountId}"
       IdentityManagementType: CONNECT_MANAGED
       Attributes:
         InboundCalls: true

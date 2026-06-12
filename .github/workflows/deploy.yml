@@ -248,8 +248,8 @@ jobs:
           echo "Listing all Connect instances in this account..."
           aws connect list-instances --output table || echo "No instances found or error listing"
 
-          # Look for Connect instance with alias "headset"
-          CONNECT_ALIAS="headset"
+          # Look for Connect instance with account-unique alias (Connect aliases are global)
+          CONNECT_ALIAS="headset-${ACCOUNT_ID}"
           echo ""
           echo "Looking for Connect instance with alias: $CONNECT_ALIAS"
 
