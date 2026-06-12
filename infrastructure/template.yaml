@@ -405,6 +405,10 @@ Resources:
                 - bedrock:InvokeModelWithResponseStream
                 - bedrock:RetrieveAndGenerate
                 - bedrock:Retrieve
+                # RetrieveAndGenerate with an inference profile needs these to
+                # resolve the profile -> foundation models (else 403 GetInferenceProfile).
+                - bedrock:GetInferenceProfile
+                - bedrock:GetFoundationModel
                 - bedrock-agent-runtime:InvokeAgent
                 - bedrock-agent-runtime:RetrieveAndGenerate
                 - bedrock-agent-runtime:Retrieve

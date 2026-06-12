@@ -412,6 +412,11 @@ jobs:
           PARAMS="$PARAMS KBBucketName=headset-kb-${{ needs.validate.outputs.aws_account_id }}"
           PARAMS="$PARAMS DeployLexPath=${{ needs.setup.outputs.deploy_lex }}"
           PARAMS="$PARAMS DeployNovaSonicPath=${{ needs.setup.outputs.deploy_nova_sonic }}"
+          # Force the current Bedrock models explicitly — relying on the template
+          # Default doesn't override a previously-deployed parameter value on update
+          # (the stack kept the now-EOL claude-3-5-sonnet otherwise).
+          PARAMS="$PARAMS BedrockModelSupervisor=us.anthropic.claude-sonnet-4-6"
+          PARAMS="$PARAMS BedrockModelSubagent=us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
           # Add existing Connect instance ID if found
           if [ -n "$EXISTING_CONNECT" ]; then
