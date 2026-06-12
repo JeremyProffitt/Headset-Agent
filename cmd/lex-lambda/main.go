@@ -30,15 +30,15 @@ var (
 
 // LexV2Event represents the incoming Lex V2 event
 type LexV2Event struct {
-	MessageVersion   string            `json:"messageVersion"`
-	InvocationSource string            `json:"invocationSource"`
-	InputMode        string            `json:"inputMode"`
-	SessionID        string            `json:"sessionId"`
-	InputTranscript  string            `json:"inputTranscript"`
-	Bot              LexBot            `json:"bot"`
-	SessionState     SessionState      `json:"sessionState"`
-	Transcriptions   []Transcription   `json:"transcriptions"`
-	Interpretations  []Interpretation  `json:"interpretations"`
+	MessageVersion   string           `json:"messageVersion"`
+	InvocationSource string           `json:"invocationSource"`
+	InputMode        string           `json:"inputMode"`
+	SessionID        string           `json:"sessionId"`
+	InputTranscript  string           `json:"inputTranscript"`
+	Bot              LexBot           `json:"bot"`
+	SessionState     SessionState     `json:"sessionState"`
+	Transcriptions   []Transcription  `json:"transcriptions"`
+	Interpretations  []Interpretation `json:"interpretations"`
 }
 
 // LexBot contains bot information

@@ -11,9 +11,16 @@ import (
 	"github.com/headset-support-agent/internal/models"
 )
 
+// dynamoAPI is the subset of the DynamoDB client used by Loader.
+// Introducing this interface allows tests to inject a mock without hitting AWS.
+type dynamoAPI interface {
+	GetItem(ctx context.Context, params *dynamodb.GetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
+	PutItem(ctx context.Context, params *dynamodb.PutItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
+}
+
 // Loader handles persona loading from DynamoDB
 type Loader struct {
-	client    *dynamodb.Client
+	client    dynamoAPI
 	tableName string
 }
 
@@ -97,7 +104,7 @@ func DefaultPersona() *models.Persona {
 			Empathy:       []string{"I understand that can be frustrating.", "Let's get this sorted out for you."},
 			Escalation:    []string{"Let me connect you with a specialist who can help further."},
 		},
-		SystemPrompt: `You are a helpful headset troubleshooting assistant. Your role is to help users diagnose and fix issues with their headsets, including USB, Bluetooth, and wireless devices. Be patient, clear, and guide users step-by-step through troubleshooting procedures.`,
+		SystemPrompt:  `You are a helpful headset troubleshooting assistant. Your role is to help users diagnose and fix issues with their headsets, including USB, Bluetooth, and wireless devices. Be patient, clear, and guide users step-by-step through troubleshooting procedures.`,
 		FillerPhrases: []string{"Let me check that for you.", "One moment please."},
 	}
 }

@@ -72,14 +72,14 @@ type Session struct {
 
 // NovaSonicConfig contains Nova Sonic specific configuration
 type NovaSonicConfig struct {
-	ModelID         string `json:"model_id"`
-	VoiceID         string `json:"voice_id"`
-	SampleRate      int    `json:"sample_rate"`
-	SampleSizeBits  int    `json:"sample_size_bits"`
-	ChannelCount    int    `json:"channel_count"`
-	MaxTokens       int    `json:"max_tokens"`
-	Temperature     float64 `json:"temperature"`
-	TopP            float64 `json:"top_p"`
+	ModelID        string  `json:"model_id"`
+	VoiceID        string  `json:"voice_id"`
+	SampleRate     int     `json:"sample_rate"`
+	SampleSizeBits int     `json:"sample_size_bits"`
+	ChannelCount   int     `json:"channel_count"`
+	MaxTokens      int     `json:"max_tokens"`
+	Temperature    float64 `json:"temperature"`
+	TopP           float64 `json:"top_p"`
 }
 
 // AudioChunk represents a chunk of audio data for streaming

@@ -116,6 +116,17 @@ jobs:
           go test -v -race -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out
 
+      - name: Enforce coverage threshold (internal packages)
+        run: |
+          # Honest gate (WS-G-05/06): fail the deploy if business-logic coverage
+          # drops below the threshold. cmd/* entrypoints are smoke/integration
+          # tested, not unit tested, so they are excluded here.
+          go test ./internal/... -coverprofile=coverage-internal.out -covermode=atomic
+          COV=$(go tool cover -func=coverage-internal.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          MIN=60.0
+          echo "Internal package coverage: ${COV}% (minimum: ${MIN}%)"
+          awk -v c="$COV" -v m="$MIN" 'BEGIN { if (c+0 < m+0) { printf "FAIL: coverage %.1f%% below %.1f%% gate\n", c+0, m+0; exit 1 } printf "PASS: coverage %.1f%% meets %.1f%% gate\n", c+0, m+0 }'
+
       - name: Build Lex Lambda (Path A)
         if: needs.setup.outputs.deploy_lex == 'true'
         run: |
@@ -504,7 +515,6 @@ jobs:
     name: Integration Tests
     runs-on: ubuntu-latest
     needs: [setup, deploy-sam, deploy-personas, create-agents]
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -524,10 +534,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Run integration tests
+      - name: Run integration tests (blocking — real deployed-Lambda smoke)
         run: |
           export ENVIRONMENT="${{ needs.setup.outputs.environment }}"
-          pytest tests/integration/ -v --tb=short || true
+          export AWS_REGION="${{ env.AWS_REGION }}"
+          pytest tests/integration/ -v --tb=short
 
   setup-connect:
     name: Setup Amazon Connect
@@ -690,15 +701,21 @@ jobs:
         run: |
           ENV="${{ needs.setup.outputs.environment }}"
 
-          # Test Lex Lambda
+          # Test Lex Lambda (WS-G-10 smoke): the health-check path does not
+          # depend on the Bedrock agent, so this is a deterministic deploy gate.
           if [ "${{ needs.setup.outputs.deploy_lex }}" == "true" ]; then
-            echo "Testing Lex Lambda..."
+            echo "Smoke-testing Lex Lambda health check..."
             aws lambda invoke \
               --function-name "headset-lex-orchestrator-${ENV}" \
               --payload '{"sessionState":{"sessionAttributes":{"test":"true"}}}' \
               --cli-binary-format raw-in-base64-out \
-              response.json || echo "Lex Lambda test failed"
+              response.json
             cat response.json
+            if ! grep -q "Health check successful" response.json; then
+              echo "::error::Lex Lambda smoke test failed — health-check response missing"
+              exit 1
+            fi
+            echo "Lex Lambda smoke test passed"
           fi
 
           # Test Nova Sonic Lambda

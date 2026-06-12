@@ -14,9 +14,15 @@ import (
 	"github.com/headset-support-agent/internal/models"
 )
 
+// agentRuntimeAPI is the subset of bedrockagentruntime.Client used by BedrockClient.
+// It exists so the real SDK client can be swapped for a test mock.
+type agentRuntimeAPI interface {
+	InvokeAgent(ctx context.Context, params *bedrockagentruntime.InvokeAgentInput, optFns ...func(*bedrockagentruntime.Options)) (*bedrockagentruntime.InvokeAgentOutput, error)
+}
+
 // BedrockClient wraps the Bedrock Agent Runtime client
 type BedrockClient struct {
-	client *bedrockagentruntime.Client
+	client agentRuntimeAPI
 }
 
 // NewBedrockClient creates a new Bedrock client
@@ -57,11 +63,11 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 		input.AgentID, input.AgentAliasID, input.SessionID)
 
 	result, err := c.client.InvokeAgent(ctx, &bedrockagentruntime.InvokeAgentInput{
-		AgentId:        aws.String(input.AgentID),
-		AgentAliasId:   aws.String(input.AgentAliasID),
-		SessionId:      aws.String(input.SessionID),
-		InputText:      aws.String(enhancedInput),
-		EnableTrace:    aws.Bool(true),
+		AgentId:      aws.String(input.AgentID),
+		AgentAliasId: aws.String(input.AgentAliasID),
+		SessionId:    aws.String(input.SessionID),
+		InputText:    aws.String(enhancedInput),
+		EnableTrace:  aws.Bool(true),
 		SessionState: &types.SessionState{
 			PromptSessionAttributes: sessionAttrs,
 		},
@@ -77,10 +83,28 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 	}
 
 	// Process the streaming response
-	var outputText strings.Builder
-	stream := result.GetStream()
+	responseText, err := processResponseStream(result.GetStream().Reader)
+	if err != nil {
+		return nil, err
+	}
 
-	for event := range stream.Events() {
+	log.Printf("Agent response: %s", truncateString(responseText, 200))
+
+	return &models.AgentResponse{
+		OutputText: responseText,
+		SessionID:  input.SessionID,
+		Metadata:   sessionAttrs,
+	}, nil
+}
+
+// processResponseStream reads all events from a ResponseStreamReader, accumulates
+// the text chunks, and returns the cleaned response string.
+// Extracted as a standalone function so it can be unit-tested independently of
+// the live SDK event-stream machinery.
+func processResponseStream(reader bedrockagentruntime.ResponseStreamReader) (string, error) {
+	var outputText strings.Builder
+
+	for event := range reader.Events() {
 		switch v := event.(type) {
 		case *types.ResponseStreamMemberChunk:
 			chunk := string(v.Value.Bytes)
@@ -96,19 +120,12 @@ func (c *BedrockClient) InvokeAgent(ctx context.Context, input InvokeAgentInput)
 		}
 	}
 
-	if err := stream.Err(); err != nil {
+	if err := reader.Err(); err != nil {
 		log.Printf("Stream error: %v", err)
-		return nil, err
+		return "", err
 	}
 
-	responseText := cleanResponse(outputText.String())
-	log.Printf("Agent response: %s", truncateString(responseText, 200))
-
-	return &models.AgentResponse{
-		OutputText: responseText,
-		SessionID:  input.SessionID,
-		Metadata:   sessionAttrs,
-	}, nil
+	return cleanResponse(outputText.String()), nil
 }
 
 // buildSystemContext creates an enhanced prompt with persona and troubleshooting context

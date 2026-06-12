@@ -24,39 +24,39 @@ var (
 
 // NovaSonicRequest represents an incoming Nova Sonic streaming request
 type NovaSonicRequest struct {
-	SessionID   string               `json:"sessionId"`
-	PersonaID   string               `json:"personaId"`
-	AudioChunk  *models.AudioChunk   `json:"audioChunk,omitempty"`
-	TextInput   string               `json:"textInput,omitempty"`
-	Action      string               `json:"action"` // "start", "audio", "text", "end"
-	Config      *models.NovaSonicConfig `json:"config,omitempty"`
+	SessionID  string                  `json:"sessionId"`
+	PersonaID  string                  `json:"personaId"`
+	AudioChunk *models.AudioChunk      `json:"audioChunk,omitempty"`
+	TextInput  string                  `json:"textInput,omitempty"`
+	Action     string                  `json:"action"` // "start", "audio", "text", "end"
+	Config     *models.NovaSonicConfig `json:"config,omitempty"`
 }
 
 // ConnectContactFlowEvent represents an Amazon Connect contact flow Lambda invocation
 type ConnectContactFlowEvent struct {
-	Name    string                       `json:"Name"`
-	Details ConnectContactFlowDetails    `json:"Details"`
+	Name    string                    `json:"Name"`
+	Details ConnectContactFlowDetails `json:"Details"`
 }
 
 // ConnectContactFlowDetails contains the contact details from Connect
 type ConnectContactFlowDetails struct {
-	ContactData ConnectContactData       `json:"ContactData"`
-	Parameters  map[string]string        `json:"Parameters"`
+	ContactData ConnectContactData `json:"ContactData"`
+	Parameters  map[string]string  `json:"Parameters"`
 }
 
 // ConnectContactData contains contact information
 type ConnectContactData struct {
-	Attributes          map[string]string `json:"Attributes"`
-	Channel             string            `json:"Channel"`
-	ContactID           string            `json:"ContactId"`
-	CustomerEndpoint    *ConnectEndpoint  `json:"CustomerEndpoint"`
-	InitialContactID    string            `json:"InitialContactId"`
-	InitiationMethod    string            `json:"InitiationMethod"`
-	InstanceARN         string            `json:"InstanceARN"`
-	MediaStreams        *MediaStreams     `json:"MediaStreams"`
-	PreviousContactID   string            `json:"PreviousContactId"`
-	Queue               *ConnectQueue     `json:"Queue"`
-	SystemEndpoint      *ConnectEndpoint  `json:"SystemEndpoint"`
+	Attributes        map[string]string `json:"Attributes"`
+	Channel           string            `json:"Channel"`
+	ContactID         string            `json:"ContactId"`
+	CustomerEndpoint  *ConnectEndpoint  `json:"CustomerEndpoint"`
+	InitialContactID  string            `json:"InitialContactId"`
+	InitiationMethod  string            `json:"InitiationMethod"`
+	InstanceARN       string            `json:"InstanceARN"`
+	MediaStreams      *MediaStreams     `json:"MediaStreams"`
+	PreviousContactID string            `json:"PreviousContactId"`
+	Queue             *ConnectQueue     `json:"Queue"`
+	SystemEndpoint    *ConnectEndpoint  `json:"SystemEndpoint"`
 }
 
 // ConnectEndpoint represents a phone endpoint
@@ -97,12 +97,12 @@ type ConnectLambdaResponse struct {
 
 // NovaSonicResponse represents the streaming response
 type NovaSonicResponse struct {
-	SessionID    string             `json:"sessionId"`
-	AudioChunk   *models.AudioChunk `json:"audioChunk,omitempty"`
-	TextOutput   string             `json:"textOutput,omitempty"`
-	Transcript   string             `json:"transcript,omitempty"`
-	Status       string             `json:"status"` // "processing", "speaking", "complete", "error"
-	Error        string             `json:"error,omitempty"`
+	SessionID  string             `json:"sessionId"`
+	AudioChunk *models.AudioChunk `json:"audioChunk,omitempty"`
+	TextOutput string             `json:"textOutput,omitempty"`
+	Transcript string             `json:"transcript,omitempty"`
+	Status     string             `json:"status"` // "processing", "speaking", "complete", "error"
+	Error      string             `json:"error,omitempty"`
 }
 
 func init() {

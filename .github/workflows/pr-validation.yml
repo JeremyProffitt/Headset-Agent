@@ -62,6 +62,17 @@ jobs:
           go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
           go tool cover -func=coverage.out
 
+      - name: Enforce coverage threshold (internal packages)
+        run: |
+          # Business logic lives in ./internal/...; cmd/* entrypoints are covered
+          # by the post-deploy smoke + integration tests, not unit tests, so they
+          # are excluded from the unit-coverage gate. Threshold ratchets UP only.
+          go test ./internal/... -coverprofile=coverage-internal.out -covermode=atomic
+          COV=$(go tool cover -func=coverage-internal.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          MIN=60.0
+          echo "Internal package coverage: ${COV}% (minimum: ${MIN}%)"
+          awk -v c="$COV" -v m="$MIN" 'BEGIN { if (c+0 < m+0) { printf "FAIL: coverage %.1f%% is below the %.1f%% gate\n", c+0, m+0; exit 1 } printf "PASS: coverage %.1f%% meets the %.1f%% gate\n", c+0, m+0 }'
+
       - name: Upload coverage
         uses: actions/upload-artifact@v4
         with:
@@ -172,17 +183,37 @@ jobs:
     name: PR Summary
     runs-on: ubuntu-latest
     needs: [lint, test, build, validate-template, security, validate-personas, validate-contact-flows]
+    if: always()
     steps:
-      - name: Generate summary
+      - name: Generate summary from real job results
+        env:
+          R_LINT: ${{ needs.lint.result }}
+          R_TEST: ${{ needs.test.result }}
+          R_BUILD: ${{ needs.build.result }}
+          R_TEMPLATE: ${{ needs.validate-template.result }}
+          R_SECURITY: ${{ needs.security.result }}
+          R_PERSONAS: ${{ needs.validate-personas.result }}
+          R_FLOWS: ${{ needs.validate-contact-flows.result }}
         run: |
-          echo "## PR Validation Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Lint & Format | :white_check_mark: Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| Unit Tests | :white_check_mark: Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| Build | :white_check_mark: Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| SAM Template | :white_check_mark: Valid |" >> $GITHUB_STEP_SUMMARY
-          echo "| Security Scan | :white_check_mark: Passed |" >> $GITHUB_STEP_SUMMARY
-          echo "| Personas | :white_check_mark: Valid |" >> $GITHUB_STEP_SUMMARY
-          echo "| Contact Flows | :white_check_mark: Valid |" >> $GITHUB_STEP_SUMMARY
+          icon() { [ "$1" = "success" ] && echo ":white_check_mark: $1" || echo ":x: $1"; }
+          {
+            echo "## PR Validation Summary"
+            echo ""
+            echo "| Check | Status |"
+            echo "|-------|--------|"
+            echo "| Lint & Format | $(icon "$R_LINT") |"
+            echo "| Unit Tests + Coverage Gate | $(icon "$R_TEST") |"
+            echo "| Build | $(icon "$R_BUILD") |"
+            echo "| SAM Template | $(icon "$R_TEMPLATE") |"
+            echo "| Security Scan | $(icon "$R_SECURITY") |"
+            echo "| Personas | $(icon "$R_PERSONAS") |"
+            echo "| Contact Flows | $(icon "$R_FLOWS") |"
+          } >> $GITHUB_STEP_SUMMARY
+
+          # Fail the summary (and the PR check) if any required job did not succeed.
+          for r in "$R_LINT" "$R_TEST" "$R_BUILD" "$R_TEMPLATE" "$R_SECURITY" "$R_PERSONAS" "$R_FLOWS"; do
+            if [ "$r" != "success" ]; then
+              echo "::error::One or more validation jobs failed (see table above)."
+              exit 1
+            fi
+          done
