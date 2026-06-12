@@ -127,6 +127,19 @@ jobs:
           echo "Internal package coverage: ${COV}% (minimum: ${MIN}%)"
           awk -v c="$COV" -v m="$MIN" 'BEGIN { if (c+0 < m+0) { printf "FAIL: coverage %.1f%% below %.1f%% gate\n", c+0, m+0; exit 1 } printf "PASS: coverage %.1f%% meets %.1f%% gate\n", c+0, m+0 }'
 
+      - name: Lint CloudFormation template (fail fast on property errors)
+        run: |
+          pip install cfn-lint
+          # Fail the deploy ONLY on E-level (error) findings before the slow SAM
+          # build/deploy. Warnings (W) are informational and do not block.
+          OUT=$(cfn-lint infrastructure/template.yaml || true)
+          echo "$OUT"
+          if echo "$OUT" | grep -qE '^E[0-9]'; then
+            echo "::error::cfn-lint found E-level errors in template.yaml"
+            exit 1
+          fi
+          echo "cfn-lint: no E-level errors"
+
       - name: Build Lex Lambda (Path A)
         if: needs.setup.outputs.deploy_lex == 'true'
         run: |

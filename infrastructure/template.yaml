@@ -814,8 +814,11 @@ Resources:
       Username: headset.agent
       Password: !Ref ConnectAgentPassword
       RoutingProfileArn: !GetAtt HeadsetRoutingProfile.RoutingProfileArn
-      SecurityProfileIds:
-        - !Ref AgentSecurityProfileId
+      SecurityProfileArns:
+        - !Sub
+          - "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${Inst}/security-profile/${Sp}"
+          - Inst: !If [CreateConnectInstance, !Ref ConnectInstance, !Ref ExistingConnectInstanceId]
+            Sp: !Ref AgentSecurityProfileId
       IdentityInfo:
         FirstName: Headset
         LastName: Agent
