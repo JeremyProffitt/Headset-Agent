@@ -305,6 +305,41 @@ def kb_association_state(client, agent_id, kb_id):
     return None
 
 
+def list_associated_kb_ids(client, agent_id):
+    """Return the list of knowledgeBaseIds currently associated with DRAFT."""
+    ids = []
+    try:
+        paginator = client.get_paginator('list_agent_knowledge_bases')
+        for page in paginator.paginate(agentId=agent_id, agentVersion='DRAFT'):
+            for kb in page.get('agentKnowledgeBaseSummaries', []):
+                ids.append(kb['knowledgeBaseId'])
+    except ClientError as e:
+        print(f"Error listing agent knowledge bases: {e}")
+    return ids
+
+
+def disassociate_stale_knowledge_bases(client, agent_id, kb_id):
+    """Remove any DRAFT association whose KB id is not the current kb_id.
+
+    When the knowledge base is recreated with a new id, the agent keeps a
+    stale association under the same display name. Bedrock then rejects a new
+    AssociateAgentKnowledgeBase with a name-conflict ConflictException, so the
+    stale association must be removed before associating the current KB.
+    """
+    for stale_id in list_associated_kb_ids(client, agent_id):
+        if stale_id == kb_id:
+            continue
+        print(f"Disassociating stale knowledge base {stale_id} from agent {agent_id}...")
+        try:
+            client.disassociate_agent_knowledge_base(
+                agentId=agent_id,
+                agentVersion='DRAFT',
+                knowledgeBaseId=stale_id,
+            )
+        except ClientError as e:
+            print(f"Warning: could not disassociate stale knowledge base {stale_id}: {e}")
+
+
 def associate_knowledge_base(client, agent_id, kb_id):
     """Associate (or re-enable) the knowledge base on the agent's DRAFT version.
 
@@ -315,6 +350,9 @@ def associate_knowledge_base(client, agent_id, kb_id):
     description = ("Headset troubleshooting knowledge base — decision trees, "
                    "brand guides, and platform/app configuration docs. "
                    "Search it before answering any troubleshooting question.")
+    # Drop associations to any other (stale/recreated) KB first, otherwise the
+    # associate call below fails with a name-conflict ConflictException.
+    disassociate_stale_knowledge_bases(client, agent_id, kb_id)
     state = kb_association_state(client, agent_id, kb_id)
     if state == 'ENABLED':
         print(f"Knowledge base {kb_id} already associated and ENABLED")
@@ -345,6 +383,11 @@ def associate_knowledge_base(client, agent_id, kb_id):
         )
         return True
     except ClientError as e:
+        # An association already exists for this KB (e.g. created concurrently or
+        # left over under the same name) — that is the desired end state.
+        if e.response.get('Error', {}).get('Code') == 'ConflictException':
+            print(f"Knowledge base {kb_id} already associated (conflict treated as success)")
+            return True
         print(f"Error associating knowledge base: {e}")
         return False
 
