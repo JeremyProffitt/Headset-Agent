@@ -584,7 +584,18 @@ def resolve_phone_for_path(
         print(f"  [{path_name}] All claimed numbers have UNKNOWN status - cannot assign safely, skipping claim")
         return None
 
-    print(f"  [{path_name}] No claimed numbers exist in instance - claiming a new one")
+    # OPT-IN CLAIMING (user directive: "ONLY CLAIM numbers you need"). Auto-claiming
+    # is DISABLED by default — set ALLOW_PHONE_CLAIM=true to permit one claim per path.
+    # This stops the runaway-claim problem: numbers orphaned at the ACCOUNT level are
+    # invisible to the instance-scoped list yet still consume the claim limit, so blind
+    # claiming just fails repeatedly. Reuse (steps 1-3 above) still works automatically.
+    if os.environ.get("ALLOW_PHONE_CLAIM", "false").lower() != "true":
+        print(f"  [{path_name}] No reusable number found and ALLOW_PHONE_CLAIM is not set "
+              f"- skipping claim. Associate a number to flow {flow_id} manually, or "
+              f"re-run with ALLOW_PHONE_CLAIM=true once the account is under its claim limit.")
+        return None
+
+    print(f"  [{path_name}] No claimed numbers exist in instance - claiming a new one (ALLOW_PHONE_CLAIM=true)")
     new_phone = claim_phone_number(
         client, instance_id,
         phone_type='TOLL_FREE',
